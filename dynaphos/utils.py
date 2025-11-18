@@ -205,3 +205,6 @@ def print_stats(stat_name: str, stat: torch.Tensor, verbose=False):
             mean:   {stat.mean():.2E}
             std:    {stat.std():.2E}"""
         logging.debug(msg)
+
+
+

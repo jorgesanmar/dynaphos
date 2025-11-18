@@ -74,3 +74,18 @@ default_stim:
 gabor:
   gabor_filtering: False
   gamma: 1.5
+
+#Safety measures
+safety:
+  enable_charge_guard: true
+  cumulative_charge_limit_uC:  300000  # total session budget per electrode (microC)
+  charge_warn_only: true                 # true=warn; false=raise RuntimeError
+  charge_log_every: 30  # log every n frames
+
+# Raster
+raster:
+    enabled: True
+    pattern: checkerboard
+    num_groups: 5
+    rate_hz: 4.5
+    reshuffle_interval: 5  # in frames

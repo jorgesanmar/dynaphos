@@ -11,3 +11,4 @@ clips/
 *.avi
 /scratch/
 *.pickle
+.aider*
