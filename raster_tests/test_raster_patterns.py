@@ -30,7 +30,6 @@ import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 import torch
 
-# Import dynaphos modules
 import dynaphos
 from dynaphos import utils, cortex_models
 from dynaphos.cortex_models import Map
@@ -283,9 +282,12 @@ class RasterPatternTester:
             
             # Record charge status
             charge_status = simulator.get_charge_status()
+
             charge_history.append({
                 'frame': frame_nr,
                 'max_charge_uC': charge_status['max_charge_uC'],
+                'min_charge_uC': charge_status['min_charge_uC'],      
+                'total_charge_uC': charge_status['total_charge_uC'],  
                 'max_electrode_idx': charge_status['max_electrode_idx'],
                 'mean_charge_uC': charge_status['cumulative_charge_uC'].mean().item(),
                 'cumulative_charge': charge_status['cumulative_charge_uC'].clone()
@@ -348,6 +350,8 @@ class RasterPatternTester:
         
         logger.info(f"\nFinal charge statistics for {pattern}:")
         logger.info(f"  Max charge: {final_charge_status['max_charge_uC']:.2f} µC")
+        logger.info(f"  Min charge: {final_charge_status['min_charge_uC']:.2f} µC")     
+        logger.info(f"  Total charge: {final_charge_status['total_charge_uC']:.2f} µC") 
         logger.info(f"  Max electrode: {final_charge_status['max_electrode_idx']}")
         logger.info(f"  Mean charge: {final_cumulative.mean():.2f} µC")
         logger.info(f"  Charge limit: {final_charge_status['limit_uC']} µC")
@@ -358,8 +362,10 @@ class RasterPatternTester:
             'frames_processed': frame_nr,
             'final_cumulative_charge': final_cumulative,
             'mean_cumulative_charge': final_cumulative.mean(),
+            'min_cumulative_charge': final_charge_status['min_charge_uC'],
             'max_cumulative_charge': final_charge_status['max_charge_uC'],
             'max_electrode_idx': final_charge_status['max_electrode_idx'],
+            'total_cumulative_charge': final_charge_status['total_charge_uC'],
             'charge_limit': final_charge_status['limit_uC'],
             'charge_history': charge_history,
             'sample_frames': sample_frames,
@@ -462,10 +468,16 @@ class RasterPatternTester:
         frames = [h['frame'] for h in charge_history]
         max_charges = [h['max_charge_uC'] for h in charge_history]
         mean_charges = [h['mean_charge_uC'] for h in charge_history]
+        min_charges = [h['min_charge_uC'] for h in charge_history]
+        total_charges = [h['total_charge_uC'] for h in charge_history]        
         
         fig, ax = plt.subplots(figsize=(12, 6))
         ax.plot(frames, max_charges, label='Max Charge', linewidth=2)
         ax.plot(frames, mean_charges, label='Mean Charge', linewidth=2, linestyle='--')
+        ax.plot(frames, min_charges, label='Min Charge', linewidth=2, linestyle=':')      
+        ax.plot(frames, total_charges, label='Total Charge', linewidth=2, linestyle='-.') 
+
+
         ax.axhline(
             y=results['charge_limit'],
             color='r',
@@ -737,6 +749,8 @@ class RasterPatternTester:
                 f.write(f"Mean cumulative charge: {r['mean_cumulative_charge']:.2f} µC\n")
                 f.write(f"Max cumulative charge: {r['max_cumulative_charge']:.2f} µC\n")
                 f.write(f"Max electrode index: {r['max_electrode_idx']}\n")
+                f.write(f"Min cumulative charge: {r['min_cumulative_charge']:.2f} µC\n")    
+                f.write(f"Total cumulative charge: {r['total_cumulative_charge']:.2f} µC\n")
                 f.write(f"Charge limit: {r['charge_limit']:.2f} µC\n")
                 
                 if r['raster_enabled']:
@@ -767,6 +781,15 @@ class RasterPatternTester:
             f.write("\nPatterns ranked by max cumulative charge (lowest to highest):\n")
             for i, (pattern, r) in enumerate(ranked_max, 1):
                 f.write(f"  {i}. {pattern.upper()}: {r['max_cumulative_charge']:.2f} µC\n")
+            
+            #Rank by total charge
+            ranked_total = sorted(
+                self.results.items(),
+                key=lambda x: x[1]['total_cumulative_charge']
+            )
+            f.write("\nPatterns ranked by total cumulative charge (lowest to highest):\n")
+            for i, (pattern, r) in enumerate(ranked_total, 1):
+                f.write(f"  {i}. {pattern.upper()}: {r['total_cumulative_charge']:.2f} µC\n")
         
         logger.info(f"Summary report saved to: {summary_path}")
 

@@ -393,12 +393,16 @@ class GaussianSimulator:
     
     def get_charge_status(self):
         """Return current cumulative charge status for monitoring."""
-        max_charge = self.cumulative_charge_uC.max().item() # max cumulative charge value
-        max_electrode_idx = self.cumulative_charge_uC.argmax().item() # index of electrode with max cumulative charge
+        max_charge = self.cumulative_charge_uC.max().item()
+        min_charge = self.cumulative_charge_uC.min().item()
+        total_charge = self.cumulative_charge_uC.sum().item()
+        max_electrode_idx = self.cumulative_charge_uC.argmax().item()
         
         return {
-            'cumulative_charge_uC': self.cumulative_charge_uC,
+            'cumulative_charge_uC': self.cumulative_charge_uC, 
             'max_charge_uC': max_charge,
+            'min_charge_uC': min_charge,
+            'total_charge_uC': total_charge,
             'max_electrode_idx': max_electrode_idx,
             'limit_uC': self.charge_limit_uC
         }

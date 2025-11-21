@@ -1,0 +1,92 @@
+================================================================================
+RASTER PATTERN COMPARISON SUMMARY
+================================================================================
+
+
+HORIZONTAL
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 4.73 µC
+Max cumulative charge: 26.23 µC
+Max electrode index: 529
+Min cumulative charge: 0.00 µC
+Total cumulative charge: 4844.20 µC
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 0.5 Hz
+Output video: ..\results\1024 electrodes\sobel\0.5 Hz\horizontal_phosphenes.avi
+
+VERTICAL
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 5.46 µC
+Max cumulative charge: 26.73 µC
+Max electrode index: 921
+Min cumulative charge: 0.00 µC
+Total cumulative charge: 5595.65 µC
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 0.5 Hz
+Output video: ..\results\1024 electrodes\sobel\0.5 Hz\vertical_phosphenes.avi
+
+CHECKERBOARD
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 5.34 µC
+Max cumulative charge: 26.13 µC
+Max electrode index: 33
+Min cumulative charge: 0.00 µC
+Total cumulative charge: 5463.42 µC
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 0.5 Hz
+Output video: ..\results\1024 electrodes\sobel\0.5 Hz\checkerboard_phosphenes.avi
+
+RANDOM
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 5.05 µC
+Max cumulative charge: 27.35 µC
+Max electrode index: 55
+Min cumulative charge: 0.00 µC
+Total cumulative charge: 5173.28 µC
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 0.5 Hz
+Output video: ..\results\1024 electrodes\sobel\0.5 Hz\random_phosphenes.avi
+
+NO_RASTER
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 25.43 µC
+Max cumulative charge: 130.52 µC
+Max electrode index: 360
+Min cumulative charge: 0.00 µC
+Total cumulative charge: 26039.16 µC
+Charge limit: 300.00 µC
+Output video: ..\results\1024 electrodes\sobel\0.5 Hz\no_raster_phosphenes.avi
+
+================================================================================
+COMPARISON
+================================================================================
+
+Patterns ranked by mean cumulative charge (lowest to highest):
+  1. HORIZONTAL: 4.73 µC
+  2. RANDOM: 5.05 µC
+  3. CHECKERBOARD: 5.34 µC
+  4. VERTICAL: 5.46 µC
+  5. NO_RASTER: 25.43 µC
+
+Patterns ranked by max cumulative charge (lowest to highest):
+  1. CHECKERBOARD: 26.13 µC
+  2. HORIZONTAL: 26.23 µC
+  3. VERTICAL: 26.73 µC
+  4. RANDOM: 27.35 µC
+  5. NO_RASTER: 130.52 µC
+
+Patterns ranked by total cumulative charge (lowest to highest):
+  1. HORIZONTAL: 4844.20 µC
+  2. RANDOM: 5173.28 µC
+  3. CHECKERBOARD: 5463.42 µC
+  4. VERTICAL: 5595.65 µC
+  5. NO_RASTER: 26039.16 µC
