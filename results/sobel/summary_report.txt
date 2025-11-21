@@ -3,13 +3,46 @@ RASTER PATTERN COMPARISON SUMMARY
 ================================================================================
 
 
+HORIZONTAL
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 5.48 µC
+Max cumulative charge: 26.00 µC
+Max electrode index: 659
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 4.5 Hz
+Output video: ..\results\sobel\horizontal_phosphenes.avi
+
+VERTICAL
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 5.04 µC
+Max cumulative charge: 25.45 µC
+Max electrode index: 130
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 4.5 Hz
+Output video: ..\results\sobel\vertical_phosphenes.avi
+
+CHECKERBOARD
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 5.43 µC
+Max cumulative charge: 25.43 µC
+Max electrode index: 287
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 4.5 Hz
+Output video: ..\results\sobel\checkerboard_phosphenes.avi
+
 RANDOM
 ----------------------------------------
 Frames processed: 334
-Mean cumulative charge: 0.48 µC
-Max cumulative charge: 2.84 µC
-Max electrode index: 42
-Charge limit: 300000.00 µC
+Mean cumulative charge: 4.80 µC
+Max cumulative charge: 27.36 µC
+Max electrode index: 967
+Charge limit: 300.00 µC
 Number of groups: 5
 Raster rate: 4.5 Hz
 Output video: ..\results\sobel\random_phosphenes.avi
@@ -17,10 +50,10 @@ Output video: ..\results\sobel\random_phosphenes.avi
 NO_RASTER
 ----------------------------------------
 Frames processed: 334
-Mean cumulative charge: 0.87 µC
-Max cumulative charge: 4.73 µC
-Max electrode index: 76
-Charge limit: 300000.00 µC
+Mean cumulative charge: 26.96 µC
+Max cumulative charge: 129.84 µC
+Max electrode index: 498
+Charge limit: 300.00 µC
 Output video: ..\results\sobel\no_raster_phosphenes.avi
 
 ================================================================================
@@ -28,9 +61,15 @@ COMPARISON
 ================================================================================
 
 Patterns ranked by mean cumulative charge (lowest to highest):
-  1. RANDOM: 0.48 µC
-  2. NO_RASTER: 0.87 µC
+  1. RANDOM: 4.80 µC
+  2. VERTICAL: 5.04 µC
+  3. CHECKERBOARD: 5.43 µC
+  4. HORIZONTAL: 5.48 µC
+  5. NO_RASTER: 26.96 µC
 
 Patterns ranked by max cumulative charge (lowest to highest):
-  1. RANDOM: 2.84 µC
-  2. NO_RASTER: 4.73 µC
+  1. CHECKERBOARD: 25.43 µC
+  2. VERTICAL: 25.45 µC
+  3. HORIZONTAL: 26.00 µC
+  4. RANDOM: 27.36 µC
+  5. NO_RASTER: 129.84 µC

@@ -16,26 +16,16 @@ def create_raster_groups(
     array_shape: Tuple[int, int],
     num_groups: int,
     pattern: str = 'checkerboard',
-    seed: Optional[int] = None
-) -> np.ndarray:
+    seed: Optional[int] = None,
+    device: str = 'cpu'
+) -> torch.Tensor:
     """
-    Divide an electrode array into groups for sequential activation (rastering).
-    
-    Parameters
-    ----------
-    array_shape : Tuple[int, int]
-        Shape of the electrode array (rows, cols). E.g., (10, 10) for a 10x10 grid.
-    num_groups : int
-        Number of raster groups to create.
-    pattern : str
-        Type of raster pattern: 'horizontal', 'vertical', 'checkerboard', 'random'
-    seed : int, optional
-        Random seed for reproducible random patterns.
+    Create raster groups as PyTorch tensor.
     
     Returns
     -------
-    raster_groups : np.ndarray
-        Array where each element indicates the group number (0 to num_groups-1).
+    raster_groups : torch.Tensor
+        Integer tensor where each element indicates group number of each electrode (0 to num_groups-1).
     """
     rows, cols = array_shape
     total_electrodes = rows * cols
@@ -45,12 +35,15 @@ def create_raster_groups(
     if num_groups > total_electrodes:
         raise ValueError(f"num_groups ({num_groups}) cannot exceed total electrodes ({total_electrodes})")
     
-    raster_groups = np.zeros(array_shape, dtype=int)
+    if seed is not None:
+        torch.manual_seed(seed)
+    
+    raster_groups = torch.zeros(array_shape, dtype=torch.long, device=device) # Initialize group assignment torch tensor
     
     if pattern == 'horizontal':
         rows_per_group = rows / num_groups
         for i in range(rows):
-            group_idx = min(int(i / rows_per_group), num_groups - 1)
+            group_idx = min(int(i / rows_per_group), num_groups - 1) 
             raster_groups[i, :] = group_idx
             
     elif pattern == 'vertical':
@@ -60,33 +53,26 @@ def create_raster_groups(
             raster_groups[:, j] = group_idx
             
     elif pattern == 'checkerboard':
-        # Checkerboard pattern with maximal spatial separation
         if num_groups >= 4:
             for i in range(rows):
                 for j in range(cols):
-                    offset = (i % 2) * (num_groups // 2) 
-                    group_idx = ((j % num_groups) + offset) % num_groups 
-                    raster_groups[i, j] = group_idx # assign group index
+                    offset = (i % 2) * (num_groups // 2)
+                    group_idx = ((j % num_groups) + offset) % num_groups
+                    raster_groups[i, j] = group_idx
         else:
-            # Simple checkerboard for fewer groups
             for i in range(rows):
                 for j in range(cols):
                     group_idx = (i * cols + j) % num_groups
                     raster_groups[i, j] = group_idx
                     
     elif pattern == 'random':
-        if seed is not None:
-            rng = np.random.default_rng(seed)
-        else:
-            rng = np.random.default_rng()
-        
-        flat_groups = np.arange(total_electrodes) % num_groups
-        rng.shuffle(flat_groups)
+        flat_groups = torch.arange(total_electrodes, device=device) % num_groups
+        perm = torch.randperm(total_electrodes, device=device)
+        flat_groups = flat_groups[perm]
         raster_groups = flat_groups.reshape(array_shape)
         
     else:
-        raise ValueError(f"Unknown pattern type: {pattern}. "
-                        f"Choose from 'horizontal', 'vertical', 'checkerboard', or 'random'")
+        raise ValueError(f"Unknown pattern type: {pattern}")
     
     return raster_groups
 class State:
@@ -330,25 +316,25 @@ class GaussianSimulator:
             self.electrode_array_shape = (grid_size, grid_size)
         
         # Create raster groups
+        
         if self.raster_enabled:
-            self.raster_groups = create_raster_groups(
-                self.electrode_array_shape,
-                self.raster_num_groups,
+            raster_groups_2d = create_raster_groups(
+                array_shape=self.electrode_array_shape,
+                num_groups=self.raster_num_groups,
                 pattern=self.raster_pattern,
-                seed=self.params['run']['seed']
+                seed=self.params['run']['seed'],
+                device=self.data_kwargs['device']  # Create on GPU
             )
             
             # Flatten raster groups to match phosphene indexing
-            self.raster_groups_flat = self.raster_groups.flatten()[:num_electrodes]
+            self.raster_groups_flat = raster_groups_2d.flatten()[:num_electrodes]  # Already a tensor
             
-            # Create schedule masks (one per group)
+            # Create schedule masks (one per group) - all operations on GPU
             self.raster_schedule = []
             for group_idx in range(self.raster_num_groups):
-                mask = (self.raster_groups_flat == group_idx)
-                # Convert to tensor with appropriate shape
-                mask_tensor = self.to_tensor(mask.astype(np.float32))
-                mask_tensor = mask_tensor.reshape(self.shape[-3:])
-                self.raster_schedule.append(mask_tensor)
+                mask = (self.raster_groups_flat == group_idx).float()
+                mask = mask.reshape(self.shape[-3:])
+                self.raster_schedule.append(mask)
             
             # Initialize raster state
             self.current_raster_group = 0
@@ -751,20 +737,20 @@ class GaussianSimulator:
                         self._reshuffle_random_pattern()
     
     def _reshuffle_random_pattern(self):
-        """Reshuffle the random raster pattern (every 5 frames as per paper)."""
+        """Reshuffle using pure PyTorch."""
         num_electrodes = len(self.raster_groups_flat)
         
-        # Create new random assignment
-        new_groups = np.arange(num_electrodes) % self.raster_num_groups
-        np.random.shuffle(new_groups)
+        # Create new random assignment on device
+        new_groups = torch.arange(num_electrodes, device=self.raster_groups_flat.device) % self.raster_num_groups
+        perm = torch.randperm(num_electrodes, device=self.raster_groups_flat.device)
+        new_groups = new_groups[perm]
         self.raster_groups_flat = new_groups
         
-        # Update schedule masks
+        # Update schedule masks (all on GPU)
         for group_idx in range(self.raster_num_groups):
-            mask = (self.raster_groups_flat == group_idx)
-            mask_tensor = self.to_tensor(mask.astype(np.float32))
-            mask_tensor = mask_tensor.reshape(self.shape[-3:])
-            self.raster_schedule[group_idx] = mask_tensor
+            mask = (self.raster_groups_flat == group_idx).float()
+            mask = mask.reshape(self.shape[-3:])
+            self.raster_schedule[group_idx] = mask
 
     def get_current_raster_mask(self) -> torch.Tensor:
         """

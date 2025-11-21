@@ -80,6 +80,12 @@ class RasterPatternTester:
         self.params = utils.load_params(params_path)
         self.framerate = self.params['run']['fps']
         
+        # Disable temporal dynamics and thresholding for static image demonstration
+        self.params['temporal_dynamics']['trace_increase_rate'] = 0.0  # No trace increase
+        self.params['temporal_dynamics']['trace_decay_per_second'] = 0.9999999  # Almost no trace decay
+        self.params['temporal_dynamics']['activation_decay_per_second'] = 0.999999  # Very slow activation decay
+
+
         # Test configurations
         self.raster_patterns = ['horizontal', 'vertical', 'checkerboard', 'random', 'no_raster']
         self.results = {}
@@ -183,12 +189,16 @@ class RasterPatternTester:
         raster_config = self.params.get('raster', {})
         num_groups = raster_config.get('num_groups', 5)
         rate_hz = raster_config.get('rate_hz', 4.5)
-        
-        # Create simulator
+
+       
+       
+
+        # Use probabilistic scatter for random and no_raster
         n_phosphenes = 1024
         phosphene_coords = cortex_models.get_visual_field_coordinates_probabilistically(
             self.params, n_phosphenes
         )
+        logger.info(f"  Total electrodes: {n_phosphenes}")
         
         simulator = PhospheneSimulator(
             self.params,
@@ -239,6 +249,9 @@ class RasterPatternTester:
         sample_frame_numbers = []
         active_electrode_frames = []
         
+        # Track which raster groups we've captured
+        captured_groups = set()
+        
         # Process frames
         frame_nr = 0
         while frame_nr < max_frames:
@@ -263,6 +276,7 @@ class RasterPatternTester:
             # Apply preprocessing (resize, blur, optional edge detection)
             processed_img = self.preprocess_frame(frame)
             stim_pattern = simulator.sample_stimulus(processed_img, rescale=True)
+            stim_pattern = stim_pattern*3.0
             # Generate phosphenes
             phs = simulator(stim_pattern).clamp(0, 1)
             phs_np = to_numpy(phs) * 255
@@ -277,22 +291,29 @@ class RasterPatternTester:
                 'cumulative_charge': charge_status['cumulative_charge_uC'].clone()
             })
             
-            # Save sample frames (one per raster group cycle if enabled)
+            # Save sample frames (one per unique raster group)
             if raster_enabled:
-                # Save one frame per group
-                if frame_nr <= num_groups:
+                current_group = simulator.current_raster_group
+                
+                # Save frame if we haven't captured this group yet
+                if current_group not in captured_groups:
                     sample_frames.append({
                         'input': processed_img.copy(),
                         'output': phs_np.copy(),
-                        'raster_group': simulator.current_raster_group
+                        'raster_group': current_group
                     })
                     sample_frame_numbers.append(frame_nr)
+                    captured_groups.add(current_group)
                     
                     # Create visualization of active electrodes
                     active_viz = self.visualize_active_electrodes(
                         simulator, stim_pattern
                     )
                     active_electrode_frames.append(active_viz)
+                    
+                    # Stop collecting once we have all groups
+                    if len(captured_groups) >= num_groups:
+                        logger.info(f"Captured all {num_groups} raster groups by frame {frame_nr}")
             else:
                 # For no-raster, just save first 5 frames
                 if frame_nr <= 5:
@@ -527,9 +548,18 @@ class RasterPatternTester:
         """Plot sample frames showing input, output, and active electrodes."""
         sample_frames = results['sample_frames']
         active_frames = results.get('active_electrode_frames', [])
+        frame_numbers = results['sample_frame_numbers']
         
         if not sample_frames:
             return
+        
+        # Sort by raster group number if available
+        if sample_frames and sample_frames[0]['raster_group'] is not None:
+            # Create tuples of (frame, active, number) and sort by group
+            combined = list(zip(sample_frames, active_frames or [None]*len(sample_frames), frame_numbers))
+            combined.sort(key=lambda x: x[0]['raster_group'])
+            sample_frames, active_frames, frame_numbers = zip(*combined)
+            active_frames = [a for a in active_frames if a is not None]
         
         n_samples = len(sample_frames)
         has_active = len(active_frames) == n_samples
@@ -539,7 +569,7 @@ class RasterPatternTester:
         gs = GridSpec(n_samples, cols, figure=fig)
         
         for i, (frame_data, frame_num) in enumerate(
-            zip(sample_frames, results['sample_frame_numbers'])
+            zip(sample_frames, frame_numbers)
         ):
             # Input frame
             ax = fig.add_subplot(gs[i, 0])
