@@ -64,9 +64,9 @@ def create_raster_groups(
         if num_groups >= 4:
             for i in range(rows):
                 for j in range(cols):
-                    offset = (i % 2) * (num_groups // 2)
-                    group_idx = ((j % num_groups) + offset) % num_groups
-                    raster_groups[i, j] = group_idx
+                    offset = (i % 2) * (num_groups // 2) 
+                    group_idx = ((j % num_groups) + offset) % num_groups 
+                    raster_groups[i, j] = group_idx # assign group index
         else:
             # Simple checkerboard for fewer groups
             for i in range(rows):
@@ -244,28 +244,22 @@ class GaussianSimulator:
     def __init__(self, params: dict, coordinates: Map,
                  rng: Optional[np.random.Generator] = None, 
                  theta: Optional[np.ndarray] = None,
-                 # NEW PARAMETERS FOR RASTER PATTERNS
                  raster_enabled: bool = False,
                  raster_pattern: str = 'checkerboard',
                  raster_num_groups: int = 5,
                  raster_rate_hz: float = 4.5):
         """
-        Initialize a simulator with raster pattern support.
-        
-        New Parameters
-        --------------
-        raster_enabled : bool, optional
-            Whether to enable raster pattern activation. Default is False.
-        raster_pattern : str, optional
-            Type of raster pattern. Options: 'horizontal', 'vertical', 
-            'checkerboard', 'random'. Default is 'checkerboard'.
-        raster_num_groups : int, optional
-            Number of raster groups to create. Default is 5.
-        raster_rate_hz : float, optional
-            Raster cycle frequency in Hz (full array refresh rate).
-            Default is 4.5 Hz (as in Kasowski et al. 2025).
+        Initialize a simulator
+        :param params: Dictionary of simulation parameters.
+        :param coordinates: Coordinates of phosphenes.
+        :param rng: Random number generator.
+        :param theta: Orientations for gabor filtering (if 'gabor_filtering' set to True)
+        :param raster_enabled: Whether to enable raster pattern stimulation.
+        :param raster_pattern: Raster pattern type ('horizontal', 'vertical', 'checkerboard', 'random').
+        :param raster_num_groups: Number of raster groups.
+        :param raster_rate_hz: Overall raster rate in Hz.
         """
-        
+
         self.params = params
         self.data_kwargs = get_data_kwargs(self.params)
 
@@ -323,7 +317,7 @@ class GaussianSimulator:
         self.raster_group_interval_s = 1.0 / (raster_num_groups * raster_rate_hz)
         
         # Infer electrode array shape from coordinates
-        # Assume square grid for now - you may need to adjust this
+        # Assume square grid for now (approximate if necessary)
         num_electrodes = self.num_phosphenes
         grid_size = int(np.sqrt(num_electrodes))
         if grid_size * grid_size != num_electrodes:
@@ -407,7 +401,7 @@ class GaussianSimulator:
                 self.raster_frame_counter = 0
     
     def reset_cumulative_charge(self):
-        """Reset cumulative charge accounting (µC) for all electrodes."""
+        """Reset cumulative charge accounting for all electrodes."""
         self.cumulative_charge_uC.zero_()
         self._charge_guard_step = 0 
     
@@ -722,7 +716,6 @@ class GaussianSimulator:
             'group_interval_s': self.raster_group_interval_s,
             'current_group': self.current_raster_group,
             'array_shape': self.electrode_array_shape,
-            'electrodes_per_group': np.bincount(self.raster_groups_flat).tolist()
         }
     
     def _update_raster_state(self, dt: Optional[float] = None):

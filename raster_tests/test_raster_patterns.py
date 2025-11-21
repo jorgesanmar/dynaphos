@@ -139,7 +139,7 @@ class RasterPatternTester:
         """
         # Resize and blur
         frame = cv2.resize(frame, (256, 256))
-        frame = cv2.GaussianBlur(frame, (9, 9), 3)
+        frame = cv2.GaussianBlur(frame, (9, 9), 5)
 
         
         # Apply edge detection if requested
@@ -185,7 +185,7 @@ class RasterPatternTester:
         rate_hz = raster_config.get('rate_hz', 4.5)
         
         # Create simulator
-        n_phosphenes = 100
+        n_phosphenes = 1024
         phosphene_coords = cortex_models.get_visual_field_coordinates_probabilistically(
             self.params, n_phosphenes
         )
@@ -263,7 +263,6 @@ class RasterPatternTester:
             # Apply preprocessing (resize, blur, optional edge detection)
             processed_img = self.preprocess_frame(frame)
             stim_pattern = simulator.sample_stimulus(processed_img, rescale=True)
-            
             # Generate phosphenes
             phs = simulator(stim_pattern).clamp(0, 1)
             phs_np = to_numpy(phs) * 255

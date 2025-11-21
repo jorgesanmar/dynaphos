@@ -78,7 +78,7 @@ gabor:
 #Safety measures
 safety:
   enable_charge_guard: true
-  cumulative_charge_limit_uC:  300000  # total session budget per electrode (microC)
+  cumulative_charge_limit_uC:  300  # total session budget per electrode (microC)
   charge_warn_only: true                 # true=warn; false=raise RuntimeError
   charge_log_every: 30  # log every n frames
 

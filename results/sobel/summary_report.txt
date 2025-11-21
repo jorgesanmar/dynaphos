@@ -1,0 +1,36 @@
+================================================================================
+RASTER PATTERN COMPARISON SUMMARY
+================================================================================
+
+
+RANDOM
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 0.48 µC
+Max cumulative charge: 2.84 µC
+Max electrode index: 42
+Charge limit: 300000.00 µC
+Number of groups: 5
+Raster rate: 4.5 Hz
+Output video: ..\results\sobel\random_phosphenes.avi
+
+NO_RASTER
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 0.87 µC
+Max cumulative charge: 4.73 µC
+Max electrode index: 76
+Charge limit: 300000.00 µC
+Output video: ..\results\sobel\no_raster_phosphenes.avi
+
+================================================================================
+COMPARISON
+================================================================================
+
+Patterns ranked by mean cumulative charge (lowest to highest):
+  1. RANDOM: 0.48 µC
+  2. NO_RASTER: 0.87 µC
+
+Patterns ranked by max cumulative charge (lowest to highest):
+  1. RANDOM: 2.84 µC
+  2. NO_RASTER: 4.73 µC

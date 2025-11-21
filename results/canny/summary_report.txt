@@ -6,10 +6,10 @@ RASTER PATTERN COMPARISON SUMMARY
 HORIZONTAL
 ----------------------------------------
 Frames processed: 334
-Mean cumulative charge: 4595.45 µC
-Max cumulative charge: 53622.55 µC
-Max electrode index: 62
-Charge limit: 30.00 µC
+Mean cumulative charge: 0.45 µC
+Max cumulative charge: 4.08 µC
+Max electrode index: 78
+Charge limit: 300.00 µC
 Number of groups: 5
 Raster rate: 4.5 Hz
 Output video: ..\results\canny\horizontal_phosphenes.avi
@@ -17,10 +17,10 @@ Output video: ..\results\canny\horizontal_phosphenes.avi
 VERTICAL
 ----------------------------------------
 Frames processed: 334
-Mean cumulative charge: 6728.89 µC
-Max cumulative charge: 53622.55 µC
-Max electrode index: 67
-Charge limit: 30.00 µC
+Mean cumulative charge: 0.42 µC
+Max cumulative charge: 4.08 µC
+Max electrode index: 65
+Charge limit: 300.00 µC
 Number of groups: 5
 Raster rate: 4.5 Hz
 Output video: ..\results\canny\vertical_phosphenes.avi
@@ -28,10 +28,10 @@ Output video: ..\results\canny\vertical_phosphenes.avi
 CHECKERBOARD
 ----------------------------------------
 Frames processed: 334
-Mean cumulative charge: 6986.74 µC
-Max cumulative charge: 53622.55 µC
-Max electrode index: 51
-Charge limit: 30.00 µC
+Mean cumulative charge: 0.58 µC
+Max cumulative charge: 3.96 µC
+Max electrode index: 14
+Charge limit: 300.00 µC
 Number of groups: 5
 Raster rate: 4.5 Hz
 Output video: ..\results\canny\checkerboard_phosphenes.avi
@@ -39,10 +39,10 @@ Output video: ..\results\canny\checkerboard_phosphenes.avi
 RANDOM
 ----------------------------------------
 Frames processed: 334
-Mean cumulative charge: 5690.77 µC
-Max cumulative charge: 53991.56 µC
-Max electrode index: 60
-Charge limit: 30.00 µC
+Mean cumulative charge: 0.63 µC
+Max cumulative charge: 4.16 µC
+Max electrode index: 98
+Charge limit: 300.00 µC
 Number of groups: 5
 Raster rate: 4.5 Hz
 Output video: ..\results\canny\random_phosphenes.avi
@@ -50,10 +50,10 @@ Output video: ..\results\canny\random_phosphenes.avi
 NO_RASTER
 ----------------------------------------
 Frames processed: 334
-Mean cumulative charge: 12059.86 µC
-Max cumulative charge: 71826.25 µC
-Max electrode index: 17
-Charge limit: 30.00 µC
+Mean cumulative charge: 0.86 µC
+Max cumulative charge: 5.47 µC
+Max electrode index: 25
+Charge limit: 300.00 µC
 Output video: ..\results\canny\no_raster_phosphenes.avi
 
 ================================================================================
@@ -61,15 +61,15 @@ COMPARISON
 ================================================================================
 
 Patterns ranked by mean cumulative charge (lowest to highest):
-  1. HORIZONTAL: 4595.45 µC
-  2. RANDOM: 5690.77 µC
-  3. VERTICAL: 6728.89 µC
-  4. CHECKERBOARD: 6986.74 µC
-  5. NO_RASTER: 12059.86 µC
+  1. VERTICAL: 0.42 µC
+  2. HORIZONTAL: 0.45 µC
+  3. CHECKERBOARD: 0.58 µC
+  4. RANDOM: 0.63 µC
+  5. NO_RASTER: 0.86 µC
 
 Patterns ranked by max cumulative charge (lowest to highest):
-  1. HORIZONTAL: 53622.55 µC
-  2. VERTICAL: 53622.55 µC
-  3. CHECKERBOARD: 53622.55 µC
-  4. RANDOM: 53991.56 µC
-  5. NO_RASTER: 71826.25 µC
+  1. CHECKERBOARD: 3.96 µC
+  2. VERTICAL: 4.08 µC
+  3. HORIZONTAL: 4.08 µC
+  4. RANDOM: 4.16 µC
+  5. NO_RASTER: 5.47 µC
