@@ -78,11 +78,6 @@ class RasterPatternTester:
         # Load parameters
         self.params = utils.load_params(params_path)
         self.framerate = self.params['run']['fps']
-        
-        # Disable temporal dynamics and thresholding for static image demonstration
-        self.params['temporal_dynamics']['trace_increase_rate'] = 0.0  # No trace increase
-        self.params['temporal_dynamics']['trace_decay_per_second'] = 0.9999999  # Almost no trace decay
-        self.params['temporal_dynamics']['activation_decay_per_second'] = 0.999999  # Very slow activation decay
 
 
         # Test configurations

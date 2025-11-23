@@ -1,0 +1,92 @@
+================================================================================
+RASTER PATTERN COMPARISON SUMMARY
+================================================================================
+
+
+HORIZONTAL
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 2.88 µC
+Max cumulative charge: 14.50 µC
+Max electrode index: 387
+Min cumulative charge: 0.00 µC
+Total cumulative charge: 2951.62 µC
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 0.1 Hz
+Output video: C:\Users\jorge\OneDrive - Radboud Universiteit\CNS\Year 2\Thesis\dynaphos\results\1024 electrodes\sobel\0.1 Hz\horizontal_phosphenes.avi
+
+VERTICAL
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 3.08 µC
+Max cumulative charge: 15.05 µC
+Max electrode index: 111
+Min cumulative charge: 0.00 µC
+Total cumulative charge: 3155.44 µC
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 0.1 Hz
+Output video: C:\Users\jorge\OneDrive - Radboud Universiteit\CNS\Year 2\Thesis\dynaphos\results\1024 electrodes\sobel\0.1 Hz\vertical_phosphenes.avi
+
+CHECKERBOARD
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 2.71 µC
+Max cumulative charge: 13.99 µC
+Max electrode index: 622
+Min cumulative charge: 0.00 µC
+Total cumulative charge: 2771.19 µC
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 0.1 Hz
+Output video: C:\Users\jorge\OneDrive - Radboud Universiteit\CNS\Year 2\Thesis\dynaphos\results\1024 electrodes\sobel\0.1 Hz\checkerboard_phosphenes.avi
+
+RANDOM
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 2.73 µC
+Max cumulative charge: 14.45 µC
+Max electrode index: 806
+Min cumulative charge: 0.00 µC
+Total cumulative charge: 2796.15 µC
+Charge limit: 300.00 µC
+Number of groups: 5
+Raster rate: 0.1 Hz
+Output video: C:\Users\jorge\OneDrive - Radboud Universiteit\CNS\Year 2\Thesis\dynaphos\results\1024 electrodes\sobel\0.1 Hz\random_phosphenes.avi
+
+NO_RASTER
+----------------------------------------
+Frames processed: 334
+Mean cumulative charge: 4.64 µC
+Max cumulative charge: 19.48 µC
+Max electrode index: 95
+Min cumulative charge: 0.00 µC
+Total cumulative charge: 4752.55 µC
+Charge limit: 300.00 µC
+Output video: C:\Users\jorge\OneDrive - Radboud Universiteit\CNS\Year 2\Thesis\dynaphos\results\1024 electrodes\sobel\0.1 Hz\no_raster_phosphenes.avi
+
+================================================================================
+COMPARISON
+================================================================================
+
+Patterns ranked by mean cumulative charge (lowest to highest):
+  1. CHECKERBOARD: 2.71 µC
+  2. RANDOM: 2.73 µC
+  3. HORIZONTAL: 2.88 µC
+  4. VERTICAL: 3.08 µC
+  5. NO_RASTER: 4.64 µC
+
+Patterns ranked by max cumulative charge (lowest to highest):
+  1. CHECKERBOARD: 13.99 µC
+  2. RANDOM: 14.45 µC
+  3. HORIZONTAL: 14.50 µC
+  4. VERTICAL: 15.05 µC
+  5. NO_RASTER: 19.48 µC
+
+Patterns ranked by total cumulative charge (lowest to highest):
+  1. CHECKERBOARD: 2771.19 µC
+  2. RANDOM: 2796.15 µC
+  3. HORIZONTAL: 2951.62 µC
+  4. VERTICAL: 3155.44 µC
+  5. NO_RASTER: 4752.55 µC

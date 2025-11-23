@@ -315,19 +315,61 @@ class GaussianSimulator:
         else:
             self.electrode_array_shape = (grid_size, grid_size)
         
-        # Create raster groups
         
+        # Create raster groups based on PHYSICAL COORDINATES
         if self.raster_enabled:
-            raster_groups_2d = create_raster_groups(
-                array_shape=self.electrode_array_shape,
-                num_groups=self.raster_num_groups,
-                pattern=self.raster_pattern,
-                seed=self.params['run']['seed'],
-                device=self.data_kwargs['device']  # Create on GPU
-            )
+            # 1. Get Cartesian coordinates of all electrodes
+            x_coords, y_coords = coordinates.cartesian
+            # Normalize coordinates to 0-1 range for binning
+            x_min, x_max = x_coords.min(), x_coords.max()
+            y_min, y_max = y_coords.min(), y_coords.max()
             
-            # Flatten raster groups to match phosphene indexing
-            self.raster_groups_flat = raster_groups_2d.flatten()[:num_electrodes]  # Already a tensor
+            # Avoid division by zero if all points are identical
+            w = (x_max - x_min) if x_max != x_min else 1.0
+            h = (y_max - y_min) if y_max != y_min else 1.0
+            
+            x_norm = (x_coords - x_min) / w
+            y_norm = (y_coords - y_min) / h
+            
+            # Initialize groups array
+            groups_np = np.zeros(self.num_phosphenes, dtype=int)
+            
+            if self.raster_pattern == 'horizontal':
+                # Group based on Y position (Top to Bottom)
+                # We invert y because typically y is positive up, but raster scans top-down
+                # Check your coordinate system. Assuming standard Cartesian:
+                groups_np = np.floor((1.0 - y_norm) * self.raster_num_groups).astype(int)
+                
+            elif self.raster_pattern == 'vertical':
+                # Group based on X position (Left to Right)
+                groups_np = np.floor(x_norm * self.raster_num_groups).astype(int)
+                
+            elif self.raster_pattern == 'checkerboard':
+                # Create a virtual grid for checkerboard assignment
+                # We use sqrt(num_groups) to approximate the grid density
+                grid_dim = int(np.sqrt(self.num_phosphenes)) 
+                
+                # Determine row and col indices for each point
+                row_idx = np.floor((1.0 - y_norm) * grid_dim).astype(int)
+                col_idx = np.floor(x_norm * grid_dim).astype(int)
+                
+                if self.raster_num_groups >= 4:
+                    # Complex checkerboard logic
+                    offset = (row_idx % 2) * (self.raster_num_groups // 2)
+                    groups_np = ((col_idx % self.raster_num_groups) + offset) % self.raster_num_groups
+                else:
+                    # Simple interleave
+                    groups_np = (row_idx + col_idx) % self.raster_num_groups
+                    
+            elif self.raster_pattern == 'random':
+                rng_local = np.random.default_rng(self.params['run']['seed'])
+                groups_np = rng_local.integers(0, self.raster_num_groups, size=self.num_phosphenes)
+
+            # Clamp to ensure no index goes out of bounds (e.g. 1.0 maps to num_groups)
+            groups_np = np.clip(groups_np, 0, self.raster_num_groups - 1)
+            
+            # Convert to Tensor
+            self.raster_groups_flat = self.to_tensor(groups_np).long()
             
             # Create schedule masks (one per group) - all operations on GPU
             self.raster_schedule = []
@@ -594,30 +636,19 @@ class GaussianSimulator:
                 self.effective_charge_per_second}
         return state
 
-    def __call__(self, amplitude: torch.Tensor,
-                 pulse_width: Optional[torch.Tensor] = None,
-                 frequency: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Generate simulated phosphene representation based on the
-        electrical stimulation parameters and the previous state.
-
-        :param amplitude: Stimulation amplitudes for each electrode.
-        :param pulse_width: Stimulation pulse widths for each electrode.
-        :param frequency: Stimulation frequencies for each electrode.
-
-        :return: image with simulated phosphene representation
-        """
-
-        # Update phosphene state.
+    def __call__(self, amplitude, pulse_width=None, frequency=None):
         self.update(amplitude, pulse_width, frequency)
-
-        # Generate phosphene map.
         activation = self.gaussian_activation()
-
-        # Thresholding: Set phosphene intensity to zero if tissue activation is lower than threshold.
         supra_threshold = torch.greater(self.activation.get(), self.threshold.get())
         intensity = torch.where(supra_threshold, self.brightness.get(), self._zero)
-
-        # Return phosphene image.
+        
+        # Apply raster mask to zero out inactive electrodes
+        if self.raster_enabled:
+            raster_mask = self.get_current_raster_mask()
+            # Expand mask to match activation shape (add spatial dimensions)
+            # mask shape: (n_electrodes, 1, 1)
+            intensity = intensity * raster_mask
+        
         return torch.sum(intensity * activation, dim=self._electrode_dimension).clamp(0, 1)
 
     @property
@@ -629,7 +660,6 @@ class GaussianSimulator:
 
     def sample_centers(self, x: torch.Tensor) -> torch.Tensor:
         """Extracts the value of the activation mask at the center pixel of each phosphene"""
-        # instead of multiplying with sampling mask, values are retrieved using the indices of the center pixels
         return x.flatten(-2)[..., self.phosphene_centers]
 
     def sample_receptive_fields(self, x: torch.Tensor) -> torch.Tensor:

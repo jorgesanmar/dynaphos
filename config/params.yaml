@@ -87,5 +87,5 @@ raster:
     enabled: True
     pattern: checkerboard
     num_groups: 5
-    rate_hz: 0.5
+    rate_hz: 9
     reshuffle_interval: 5  # in frames
