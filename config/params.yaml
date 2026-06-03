@@ -1,10 +1,11 @@
 # run settings
 run:
   resolution: [256,256] #[width,height] in pixels
-  view_angle: 16 #in degrees, horizontal view angle
+  view_angle: 2 #in degrees, horizontal view angle
   origin: [0,0]
   min_angle: 0.001 #in degrees, minimal eccentricity
-  fps: 35
+  fps: 15
+
   gpu: 0 #if using cuda, enter gpu nr here (e.g. 0)
   print_stats: False #print simulator values for sanity check
   seed: 42
@@ -15,16 +16,16 @@ run:
 
 # display specs to accurately diplay sizes in dva
 display:
-  screen_resolution: [1920,1080] #width & height in pixels
+  screen_resolution: [2500,1600] #width & height in pixels
   #screen_size: [294,166] #width & height in mm
-  screen_diagonal: 13.3 #inches
+  screen_diagonal: 15.1 #inches
   dist_to_screen: 600 # eyes to screen in mm
 
 # for sampling from images/video
 sampling:
   sampling_method: receptive_fields #receptive_fields or center
   RF_size: 0.5 # millimeters of cortical surface (when sampling receptive fields)
-  stimulus_scale: 1.e-4 # Only used when the sample_stimulus method is called with 'rescale=True'. The default behaviour
+  stimulus_scale: 0.6e-4 # Only used when the sample_stimulus method is called with 'rescale=True'. The default behaviour
                        # is no scaling (i.e., the stim amplitude equals the intensity of the sampled image).
 
 # settings for electrode coords to visual field coords
@@ -34,8 +35,8 @@ cortex_model:
   a: 0.75
   b: 120
   alpha: 0.95
-  dropout_rate: 0.2
-  noise_scale: 0.4
+  dropout_rate: 0.0
+  noise_scale: 0.2
 
 # habituation and other temporal dynamics
 temporal_dynamics:
@@ -54,8 +55,8 @@ size:
 
 # sigmoid on activation
 brightness_saturation:
-  cps_half: 1.057631326853325e-07 # calibrated on fig. 6A Fernández et al., (2021)
-  slope_brightness: 19152642.500946816 # calibrated on fig. 6A/B Fernández et al., (2021)
+  cps_half: 1.057631326853325e-07 # calibrated on fig. 6A FernÃ¡ndez et al., (2021)
+  slope_brightness: 19152642.500946816 # calibrated on fig. 6A/B FernÃ¡ndez et al., (2021)
 
 # Stimulation threshold
 thresholding:
@@ -77,15 +78,66 @@ gabor:
 
 #Safety measures
 safety:
-  enable_charge_guard: true
-  cumulative_charge_limit_uC:  300  # total session budget per electrode (microC)
-  charge_warn_only: true                 # true=warn; false=raise RuntimeError
-  charge_log_every: 30  # log every n frames
+  enable_charge_guard: false
+  cumulative_charge_limit_uC:  10000  # total session budget per electrode (microC)
+  charge_warn_only: true               # true=warn; false=raise RuntimeError
+  charge_log_every: 60  # log every n frames
+  metrics_save_every_n_frames: 5  # persist heavy electrode-wise outputs every N frames
+  electrode_surface_area_cm2: 3.5e-5
+  charge_window_s: 5.0
+
+# Impedance settings for power calculation
+impedance:
+  Rtis: 9900.0
+  Cdl: 113.4e-9
+  Rct: 2.2e6
+  sigma_w: 2.5e6
 
 # Raster
 raster:
     enabled: True
-    pattern: checkerboard
+    pattern: random
     num_groups: 5
-    rate_hz: 9
-    reshuffle_interval: 5  # in frames
+    rate_hz: 4
+    reshuffle_interval_s: 5.0  # in seconds
+
+# Bioheat parameters for thermal effects
+bioheat:
+  model: 2d_pennes
+  domain_xy_mm: 60.0
+  brain_depth_mm: 15.0
+  skull_thickness_mm: 5.0
+  scalp_thickness_mm: 3.0
+  voxel_size_mm: 0.5
+  # Separate source depths keep electrode Joule heat local while letting IC heat
+  # represent package-scale 3D heat spreading in this 2D approximation.
+  electrode_source_thickness_mm: 0.08
+  ic_source_thickness_mm: 1.7
+  device_constant_power_mw: 0.0
+  driver_efficiency: 0.5
+  source_area_mode: convex_hull
+  ic_source_area_mode: convex_hull
+  top_heat_transfer_W_m2_K: 5.0
+  T_b: 37.0
+
+  brain:
+    rho: 1041.0
+    c: 3640.0
+    k: 0.528
+    perfusion: 0.0097
+    q_met: 10383.0
+  skull:
+    rho: 1990.0
+    c: 1300.0
+    k: 0.650
+    perfusion: 0.00099
+    q_met: 26.0
+  scalp:
+    rho: 1100.0
+    c: 3150.0
+    k: 0.342
+    perfusion: 0.0022
+    q_met: 1100.0
+  blood:
+    rho: 1060.0
+    c: 3840.0

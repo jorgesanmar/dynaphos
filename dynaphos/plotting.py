@@ -1,8 +1,16 @@
 from typing import Optional
 
+import numpy as np
 from matplotlib import pyplot as plt
 
 from dynaphos.cortex_models import get_cortex_coordinates_default, get_cortex_coordinates_grid
+from dynaphos.safety.visualize import (
+    collect_metrics as collect_safety_metrics,
+    discover_records as discover_safety_records,
+    plot_all_block_summaries,
+    plot_overall_safety,
+    plot_ratio_breakdown,
+)
 
 
 def plot_coordinates(params: dict, n_electrodes_x: int, n_electrodes_y: int,

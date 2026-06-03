@@ -1,0 +1,243 @@
+# ----------------------------------------------
+# Safety Thresholds Configuration - Coords Grid
+# ----------------------------------------------
+# Derived from Utah-array limits by scaling total/global stimulation limits
+# by implant/grid area.
+#
+# Area conversion:
+#   Utah array area      = 16 mm^2
+#   Coords grid area     = 200 mm^2
+#   Conversion factor    = 200 / 16 = 12.5
+#
+# Total accepted charge per second:
+#   Utah array limit     = 8 uC/s
+#   Coords grid limit    = 8 * 12.5 = 100 uC/s
+#
+# Important:
+#   Per-electrode limits are NOT scaled by array area.
+#   Only total/global limits across the array are scaled.
+# ----------------------------------------------
+
+scaling:
+  source_array: Utah array
+  source_area_mm2: 16.0
+  target_array: coords_grid
+  target_area_mm2: 300.0
+  area_conversion_factor: 12.5
+
+geometry:
+  electrode_surface_area_cm2: 3.0e-5
+  microelectrode_area_threshold_cm2: 2.0e-5
+  microelectrode_charge_limit_nc: 4.0
+
+thresholds:
+  # --------------------------------------------
+  # Amplitude limits
+  # --------------------------------------------
+  amplitude_min_ua: 1.0
+  amplitude_max_ua: 120.0
+  amplitude_step_ua: 1.0
+
+  # --------------------------------------------
+  # Pulse width limits
+  # --------------------------------------------
+  pulse_width_min_us: 50.0
+  pulse_width_max_us: 800.0
+
+  # --------------------------------------------
+  # Frequency limits
+  # --------------------------------------------
+  frequency_min_hz: 0.5
+  frequency_max_hz: 300.0
+
+  # --------------------------------------------
+  # Number of pulses per train
+  # --------------------------------------------
+  num_pulses_min: 1
+  num_pulses_max: 1000
+
+  # --------------------------------------------
+  # Interphase delay limits
+  # --------------------------------------------
+  interphase_min_us: 0.0
+  interphase_max_us: 1000.0
+
+  # --------------------------------------------
+  # Offset / pre-stimulation delay limits
+  # --------------------------------------------
+  offset_min_us: 0.0
+  offset_max_us: 1000000000000.0
+
+  # --------------------------------------------
+  # Charge per phase limit
+  # Q = I * PW
+  # Unit: nC / phase
+  #
+  # This is a per-electrode limit and is NOT scaled
+  # by the total array area.
+  # --------------------------------------------
+  charge_per_phase_max_nc: 100.0
+
+  # --------------------------------------------
+  # Charge density limit
+  # D = Q / A_g
+  # Unit: uC / cm^2
+  #
+  # This is a per-electrode / electrode-interface limit
+  # and is NOT scaled by the total array area.
+  # --------------------------------------------
+  charge_density_max_uc_per_cm2: 4000.0
+
+  # --------------------------------------------
+  # Shannon k limit
+  # k = log10(Q_uC) + log10(D_uC_per_cm2)
+  #
+  # Treated as a reference / warning metric, not an
+  # absolute hard safety boundary for microelectrodes.
+  # --------------------------------------------
+  shannon_k_limit: 1.85
+
+  # --------------------------------------------
+  # Current density limit
+  # J = I / A_g
+  # Unit: A / cm^2
+  # --------------------------------------------
+  current_density_max_a_per_cm2: 4.0
+
+  # --------------------------------------------
+  # Accumulated charge limits
+  # --------------------------------------------
+  accumulated_charge_window_ms: 1000.0
+
+  # Per-electrode accumulated charge rate limit.
+  # This is NOT scaled by total array area.
+  accumulated_charge_per_electrode_nc_per_s: 2000.0
+
+  # Total accumulated charge rate across the full FOV grid.
+  #
+  # Scaled from Utah-array total limit:
+  #   8 uC/s * 12.5 = 100 uC/s
+  #   100 uC/s = 1.0e-4 C/s
+  accumulated_charge_limit_uc_per_second: 100.0
+  accumulated_charge_limit_coulombs_per_second: 1.0e-4
+
+  # --------------------------------------------
+  # Thermal / power limits
+  # --------------------------------------------
+  thermal_power_limit_per_electrode_mw: 0.5
+
+  # Scaled total power budget:
+  #   Utah total power = 5.0 mW
+  #   Full FOV total power = 5.0 * 93.75 = 468.75 mW
+  thermal_power_limit_total_mw: 468.75
+
+  # Sustained accumulated power per electrode.
+  # This is NOT scaled by total array area.
+  accumulated_power_per_electrode_mw: 0.3
+
+chronic:
+  # Maximum total charge delivered in a session.
+  #
+  # Scaled from Utah-array session limit:
+  #   0.05 C * 93.75 = 4.6875 C
+  session_charge_limit_c: 0.625
+
+  session_max_duration_s: 3600.0
+  warning_threshold_fraction: 0.8
+
+thermal:
+  tissue_time_constant: 10.0
+  tissue_heat_capacity: 4.0
+  baseline_temp: 37.0
+
+  # Maximum allowed temperature rise above baseline.
+  max_temp_rise: 2.0
+
+  # Cumulative equivalent minutes at 43 C.
+  cem43_limit_min: 2.0
+
+hardware:
+  compliance_voltage_limit_v: 8.0
+  max_electrode_impedance_ohm: 100000.0
+
+electrode_materials:
+  smooth_pt_charge_density_limit_uc_per_cm2: 30.0
+  porous_pt_charge_density_limit_uc_per_cm2: 125.0
+  irox_charge_density_limit_uc_per_cm2: 600.0
+  tin_charge_density_limit_uc_per_cm2: 90.0
+
+stimulation_safety_guidelines:
+  charge_per_phase:
+    value: 100.0
+    unit: nC
+    description: Per-electrode charge-per-phase limit; unchanged from Utah-array limits.
+
+  charge_density:
+    value: 4000.0
+    unit: uC/cm2
+    description: Per-electrode charge-density limit; unchanged from Utah-array limits.
+
+  shannon_k:
+    value: 1.85
+    unit: dimensionless
+    description: Reference Shannon k warning threshold.
+
+  amplitude:
+    min:
+      value: 1.0
+      unit: uA
+    max:
+      value: 120.0
+      unit: uA
+    step:
+      value: 1.0
+      unit: uA
+
+  pulse_width:
+    min:
+      value: 50.0
+      unit: us
+    max:
+      value: 800.0
+      unit: us
+
+  frequency:
+    min:
+      value: 0.5
+      unit: Hz
+    max:
+      value: 300.0
+      unit: Hz
+
+  accumulated_charge:
+    time_window:
+      value: 1.0
+      unit: s
+    limits:
+      per_electrode:
+        value: 2000.0
+        unit: nC/s
+        description: Per-electrode accumulated charge rate; unchanged.
+      total_all_electrodes:
+        value: 100.0
+        unit: uC/s
+        equivalent_value_coulombs_per_second: 1e-4
+        description: Scaled from 8 uC/s using area factor 12.5.
+
+  simultaneous_activation:
+    max_percentage_of_electrodes:
+      value: 20.0
+      unit: "%"
+
+  temperature:
+    cem43:
+      value: 2.0
+      unit: min
+    temperature_increase:
+      absolute_max_temperature_increase:
+        value: 2.0
+        unit: C
+        rule: Must never be reached.
+      max_continuous_duration_above_1_c:
+        value: 90.0
+        unit: s

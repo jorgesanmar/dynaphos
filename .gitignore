@@ -1,6 +1,11 @@
 .ipynb_checkpoints
 __pycache__
 
+.venv/
+.vscode/
+/results/
+/videos/
+
 clips/
 **[Aa]rchived
 .idea/
@@ -12,3 +17,5 @@ clips/
 /scratch/
 *.pickle
 .aider*
+
+test results/

@@ -12,6 +12,168 @@ from dynaphos.utils import (to_tensor, get_data_kwargs, get_truncated_normal,
                             get_deg2pix_coeff, set_deterministic,
                             print_stats, sigmoid, to_numpy, Map)
 
+
+_PSEUDO_RANDOM_RASTER_ALIASES = {
+    "random",
+    "pseudo_random",
+    "pseudo-random",
+    "pseudorandom",
+}
+
+
+def _normalize_raster_pattern(pattern: str) -> str:
+    normalized = str(pattern).strip().lower().replace(" ", "_")
+    if normalized in _PSEUDO_RANDOM_RASTER_ALIASES:
+        return "random"
+    return normalized
+
+
+def normalize_raster_mode(mode: str) -> str:
+    """Normalize user-facing raster mode aliases."""
+    normalized = str(mode).strip().lower().replace(" ", "_")
+    if normalized in _PSEUDO_RANDOM_RASTER_ALIASES:
+        return "random"
+    return normalized
+
+
+def apply_appearance_threshold(stim_raw: torch.Tensor, threshold_a: float) -> torch.Tensor:
+    """Gate stimulation amplitudes below the appearance threshold."""
+    return torch.where(stim_raw >= float(threshold_a), stim_raw, torch.zeros_like(stim_raw))
+
+
+def compute_raster_timing(video_fps: float, groups: int, raster_enabled: bool) -> dict[str, float]:
+    """Return raster cycle and group stepping rates synchronized to video FPS."""
+    if float(video_fps) <= 0:
+        raise ValueError(f"Video FPS must be > 0, got {video_fps}.")
+    if int(groups) <= 0:
+        raise ValueError(f"Raster groups must be > 0, got {groups}.")
+
+    if not raster_enabled:
+        return {
+            "video_fps": float(video_fps),
+            "cycle_rate_hz": 0.0,
+            "group_step_rate_hz": 0.0,
+            "group_interval_s": 0.0,
+        }
+    return {
+        "video_fps": float(video_fps),
+        "cycle_rate_hz": float(video_fps) / float(groups),
+        "group_step_rate_hz": float(video_fps),
+        "group_interval_s": 1.0 / float(video_fps),
+    }
+
+
+def _rng_permutation(size: int, rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    if rng is None:
+        return np.random.permutation(size)
+    return rng.permutation(size)
+
+
+def _rng_random(rng: Optional[np.random.Generator] = None) -> float:
+    if rng is None:
+        return float(np.random.random())
+    return float(rng.random())
+
+
+def _balanced_group_targets(num_points: int, num_groups: int,
+                            rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    target_counts = np.full(num_groups, num_points // num_groups, dtype=np.int64)
+    remainder = num_points % num_groups
+    if remainder > 0:
+        target_counts[_rng_permutation(num_groups, rng)[:remainder]] += 1
+    return target_counts
+
+
+def _normalize_raster_points(points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    mins = points.min(axis=0)
+    spans = np.ptp(points, axis=0)
+    spans[spans <= 1e-12] = 1.0
+    return (points - mins) / spans
+
+
+def _estimate_local_spacing(points: np.ndarray) -> float:
+    spacings = []
+    for dim in range(points.shape[1]):
+        levels = np.unique(np.round(points[:, dim], decimals=12))
+        diffs = np.diff(np.sort(levels))
+        positive_diffs = diffs[diffs > 1e-12]
+        if positive_diffs.size > 0:
+            spacings.append(float(np.median(positive_diffs)))
+
+    if spacings:
+        return max(float(np.median(spacings)), 1e-12)
+    if len(points) <= 1:
+        return 1.0
+
+    max_sample = 1024
+    if len(points) > max_sample:
+        sample_idx = np.linspace(0, len(points) - 1, max_sample, dtype=np.int64)
+        sample = points[sample_idx]
+    else:
+        sample = points
+    delta = sample[:, None, :] - points[None, :, :]
+    dist2 = np.sum(delta * delta, axis=2)
+    dist2[dist2 <= 1e-24] = np.inf
+    nearest = np.sqrt(np.min(dist2, axis=1))
+    nearest = nearest[np.isfinite(nearest)]
+    if nearest.size == 0:
+        return 1.0
+    return max(float(np.median(nearest)), 1e-12)
+
+
+def _pseudo_random_spaced_groups(points: np.ndarray, num_groups: int,
+                                 rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    """Balanced pseudo-random grouping with a penalty for local same-group clusters."""
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("points must be a 2D array with x/y coordinates.")
+    if num_groups <= 0:
+        raise ValueError("num_groups must be positive.")
+
+    num_points = len(points)
+    if num_points == 0:
+        raise ValueError("At least one coordinate is required for raster grouping.")
+
+    points_norm = _normalize_raster_points(points)
+    spacing = _estimate_local_spacing(points_norm)
+    hard_radius2 = (spacing * 1.05) ** 2
+    soft_radius2 = max((spacing * 2.0) ** 2, 1e-12)
+
+    groups = np.full(num_points, -1, dtype=np.int64)
+    target_counts = _balanced_group_targets(num_points, num_groups, rng)
+    counts = np.zeros(num_groups, dtype=np.int64)
+    assigned_indices = [[] for _ in range(num_groups)]
+
+    for point_idx in _rng_permutation(num_points, rng):
+        available_groups = np.flatnonzero(counts < target_counts)
+        if available_groups.size == 0:
+            available_groups = np.arange(num_groups, dtype=np.int64)
+
+        point = points_norm[point_idx]
+        group_costs = []
+        for group_idx in available_groups:
+            if assigned_indices[group_idx]:
+                same_group = points_norm[np.asarray(assigned_indices[group_idx], dtype=np.int64)]
+                delta = same_group - point
+                dist2 = np.sum(delta * delta, axis=1)
+                hard_conflicts = np.count_nonzero(dist2 <= hard_radius2)
+                local_heat = hard_conflicts * 1000.0 + float(np.exp(-dist2 / soft_radius2).sum())
+            else:
+                local_heat = 0.0
+
+            target = max(int(target_counts[group_idx]), 1)
+            fill_ratio = float(counts[group_idx]) / target
+            group_costs.append(local_heat + fill_ratio * 1e-3 + _rng_random(rng) * 1e-9)
+
+        chosen_group = int(available_groups[int(np.argmin(group_costs))])
+        groups[point_idx] = chosen_group
+        counts[chosen_group] += 1
+        assigned_indices[chosen_group].append(int(point_idx))
+
+    return groups
+
+
 def create_raster_groups(
     array_shape: Tuple[int, int],
     num_groups: int,
@@ -21,7 +183,7 @@ def create_raster_groups(
 ) -> torch.Tensor:
     """
     Create raster groups as PyTorch tensor.
-    
+
     Returns
     -------
     raster_groups : torch.Tensor
@@ -29,29 +191,29 @@ def create_raster_groups(
     """
     rows, cols = array_shape
     total_electrodes = rows * cols
-    
+
     if num_groups <= 0:
         raise ValueError("num_groups must be positive")
     if num_groups > total_electrodes:
         raise ValueError(f"num_groups ({num_groups}) cannot exceed total electrodes ({total_electrodes})")
-    
-    if seed is not None:
-        torch.manual_seed(seed)
-    
+
+    pattern = _normalize_raster_pattern(pattern)
+    rng = np.random.default_rng(seed) if seed is not None else None
+
     raster_groups = torch.zeros(array_shape, dtype=torch.long, device=device) # Initialize group assignment torch tensor
-    
+
     if pattern == 'horizontal':
         rows_per_group = rows / num_groups
         for i in range(rows):
-            group_idx = min(int(i / rows_per_group), num_groups - 1) 
+            group_idx = min(int(i / rows_per_group), num_groups - 1)
             raster_groups[i, :] = group_idx
-            
+
     elif pattern == 'vertical':
         cols_per_group = cols / num_groups
         for j in range(cols):
             group_idx = min(int(j / cols_per_group), num_groups - 1)
             raster_groups[:, j] = group_idx
-            
+
     elif pattern == 'checkerboard':
         if num_groups >= 4:
             for i in range(rows):
@@ -64,17 +226,103 @@ def create_raster_groups(
                 for j in range(cols):
                     group_idx = (i * cols + j) % num_groups
                     raster_groups[i, j] = group_idx
-                    
+
     elif pattern == 'random':
-        flat_groups = torch.arange(total_electrodes, device=device) % num_groups
-        perm = torch.randperm(total_electrodes, device=device)
-        flat_groups = flat_groups[perm]
-        raster_groups = flat_groups.reshape(array_shape)
-        
+        yy, xx = np.indices(array_shape)
+        points = np.column_stack([xx.ravel(), yy.ravel()])
+        flat_groups = _pseudo_random_spaced_groups(points, num_groups, rng=rng)
+        raster_groups = torch.as_tensor(flat_groups, dtype=torch.long, device=device).reshape(array_shape)
+
     else:
         raise ValueError(f"Unknown pattern type: {pattern}")
-    
+
     return raster_groups
+
+
+def _cluster_coordinate_levels(values: np.ndarray) -> np.ndarray:
+    """Map 1D coordinates to discrete level indices using data-driven clustering."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1:
+        raise ValueError("Expected a 1D array of coordinates.")
+    if values.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    if values.size == 1:
+        return np.zeros(1, dtype=np.int64)
+
+    order = np.argsort(values)
+    sorted_values = values[order]
+    diffs = np.diff(sorted_values)
+    positive_diffs = diffs[diffs > 1e-9]
+
+    if positive_diffs.size == 0:
+        labels_sorted = np.zeros(values.size, dtype=np.int64)
+    else:
+        tol = max(float(np.median(positive_diffs)) * 0.5, 1e-9)
+        labels_sorted = np.zeros(values.size, dtype=np.int64)
+        level = 0
+        for idx, diff in enumerate(diffs, start=1):
+            if diff > tol:
+                level += 1
+            labels_sorted[idx] = level
+
+    labels = np.empty_like(labels_sorted)
+    labels[order] = labels_sorted
+    return labels
+
+
+def _coordinate_based_raster_groups(x_coords: np.ndarray, y_coords: np.ndarray,
+                                    pattern: str, num_groups: int,
+                                    device: Union[str, torch.device],
+                                    rng: Optional[np.random.Generator] = None) -> torch.Tensor:
+    """Assign raster groups from Cartesian electrode coordinates."""
+    x_coords = np.asarray(x_coords, dtype=np.float64)
+    y_coords = np.asarray(y_coords, dtype=np.float64)
+    pattern = _normalize_raster_pattern(pattern)
+
+    if x_coords.shape != y_coords.shape:
+        raise ValueError("x_coords and y_coords must have the same shape.")
+    if x_coords.ndim != 1:
+        raise ValueError("Raster coordinates must be 1D.")
+    if num_groups <= 0:
+        raise ValueError("num_groups must be positive.")
+
+    num_points = x_coords.size
+    if num_points == 0:
+        raise ValueError("At least one coordinate is required for raster grouping.")
+
+    col_idx = _cluster_coordinate_levels(x_coords)
+    row_idx = _cluster_coordinate_levels(-y_coords)  # highest y is top row
+
+    if pattern == 'horizontal':
+        n_rows = int(row_idx.max()) + 1
+        rows_per_group = max(n_rows / num_groups, 1.0)
+        groups = np.floor(row_idx / rows_per_group).astype(np.int64)
+    elif pattern == 'vertical':
+        n_cols = int(col_idx.max()) + 1
+        cols_per_group = max(n_cols / num_groups, 1.0)
+        groups = np.floor(col_idx / cols_per_group).astype(np.int64)
+    elif pattern == 'checkerboard':
+        if num_groups >= 4:
+            offset = (row_idx % 2) * max(num_groups // 2, 1)
+            groups = (col_idx + offset) % num_groups
+        else:
+            groups = (row_idx + col_idx) % num_groups
+    elif pattern == 'random':
+        points = np.column_stack([x_coords, y_coords])
+        groups = _pseudo_random_spaced_groups(points, num_groups, rng=rng)
+    else:
+        raise ValueError(f"Unknown pattern type: {pattern}")
+
+    groups = np.clip(groups, 0, num_groups - 1)
+    return torch.as_tensor(groups, dtype=torch.long, device=device)
+
+
+
+
+
+
+
+
 class State:
     def __init__(self, params: dict, shape: Tuple[int, ...],
                  verbose: Optional[bool] = False):
@@ -200,6 +448,15 @@ class Brightness(State):
         print_stats('sigmoided activation', self.state, self.verbose)
 
 
+
+import numpy as np
+import torch
+
+
+
+
+
+
 class Sigma(State):
     def __init__(self, params: dict, shape: Tuple[int, ...],
                  magnification: torch.Tensor, verbose: Optional[bool] = False):
@@ -228,34 +485,55 @@ class Sigma(State):
 
 class GaussianSimulator:
     def __init__(self, params: dict, coordinates: Map,
-                 rng: Optional[np.random.Generator] = None, 
+                 rng: Optional[np.random.Generator] = None,
                  theta: Optional[np.ndarray] = None,
+                 raster_coordinates: Optional[Map] = None,
                  raster_enabled: bool = False,
                  raster_pattern: str = 'checkerboard',
                  raster_num_groups: int = 5,
-                 raster_rate_hz: float = 4.5):
+                 raster_rate_hz: float = 4.5,
+                 phosphene_mode: str = 'visual'):
         """
         Initialize a simulator
         :param params: Dictionary of simulation parameters.
         :param coordinates: Coordinates of phosphenes.
         :param rng: Random number generator.
         :param theta: Orientations for gabor filtering (if 'gabor_filtering' set to True)
+        :param raster_coordinates: Electrode-space coordinates used for raster grouping.
+            If None, the simulator falls back to `coordinates`.
         :param raster_enabled: Whether to enable raster pattern stimulation.
         :param raster_pattern: Raster pattern type ('horizontal', 'vertical', 'checkerboard', 'random').
         :param raster_num_groups: Number of raster groups.
         :param raster_rate_hz: Overall raster rate in Hz.
+        :param phosphene_mode: 'visual' builds full phosphene distance maps for
+            rendering. 'safety_centers' skips those maps and samples only at
+            phosphene center pixels for lower-memory safety analysis.
         """
 
         self.params = params
         self.data_kwargs = get_data_kwargs(self.params)
+        self.phosphene_mode = str(phosphene_mode).strip().lower()
+        if self.phosphene_mode not in {'visual', 'safety_centers'}:
+            raise ValueError("phosphene_mode must be 'visual' or 'safety_centers'.")
 
         rng = np.random.default_rng() if rng is None else rng
         set_deterministic(self.params['run']['seed'])
 
         self.deg2pix_coeff = get_deg2pix_coeff(self.params['run'])
 
-        self.phosphene_maps = \
-            self.generate_phosphene_maps(coordinates, theta=theta)
+        if self.phosphene_mode == 'visual':
+            self.phosphene_maps = self.generate_phosphene_maps(
+                coordinates,
+                theta=theta,
+                raster_coordinates=raster_coordinates,
+            )
+        else:
+            self.phosphene_maps = None
+            self._initialize_lightweight_phosphene_geometry(
+                coordinates,
+                raster_coordinates=raster_coordinates,
+            )
+        self._num_phosphenes = int(len(self.electrode_tags))
 
         batch_size = self.params['run']['batch_size']
         if batch_size != 0:
@@ -265,7 +543,8 @@ class GaussianSimulator:
             self.shape = (self.num_phosphenes, 1, 1)
             self._electrode_dimension = 0
 
-        r, phi = coordinates.polar
+        x_sorted, y_sorted = self._sorted_cartesian_coords
+        r, _ = Map(x=x_sorted, y=y_sorted).polar
         r = torch.reshape(self.to_tensor(r), self.shape[-3:])
         self.magnification = get_cortical_magnification(
             r, self.params['cortex_model'])
@@ -276,11 +555,17 @@ class GaussianSimulator:
         self.sigma = Sigma(params, self.shape, self.magnification)
         self.brightness = Brightness(params, self.shape)
         self.threshold = ActivationThreshold(params, self.shape, rng)
+
         self.effective_charge_per_second = None
+        self.delivered_amplitude = torch.zeros(self.shape, **self.data_kwargs)
+        self.delivered_charge_per_second = torch.zeros(self.shape, **self.data_kwargs)
+        self.current_pulse_width = torch.zeros(self.shape, **self.data_kwargs)
+        self.current_frequency = torch.zeros(self.shape, **self.data_kwargs)
 
         # Pre-allocate some helper variables
         self._sampling_mask = None
         self._phosphene_centers = None
+        self._warned_lightweight_receptive_fields = False
         params_sampling = self.params['sampling']
         self._sampling_method = params_sampling['sampling_method']
         self._sqrt_pi_inv = 1 / torch.sqrt(self.to_tensor(torch.pi))
@@ -288,20 +573,29 @@ class GaussianSimulator:
                              torch.ones(self.shape, **self.data_kwargs))
         self._frequency = (self.params['default_stim']['freq_default'] *
                            torch.ones(self.shape, **self.data_kwargs))
-        
+
         self._zero = self.to_tensor(0)
         self._inf = self.to_tensor(torch.inf)
 
         # ===== RASTER PATTERN INITIALIZATION =====
         self.raster_enabled = raster_enabled
-        self.raster_pattern = raster_pattern
+        self.raster_pattern = _normalize_raster_pattern(raster_pattern)
         self.raster_num_groups = raster_num_groups
         self.raster_rate_hz = raster_rate_hz
-        
+
         # Calculate per-group activation rate
         fps = self.params['run']['fps']
-        self.raster_group_interval_s = 1.0 / (raster_num_groups * raster_rate_hz)
-        
+        if self.raster_enabled:
+        # Only calculate interval if we are actually rastering
+            if raster_rate_hz > 0:
+                self.raster_group_interval_s = 1.0 / (raster_num_groups * raster_rate_hz)
+            else:
+                self.raster_group_interval_s = float('inf') # Prevent division by zero if rate is 0
+        else:
+            self.raster_group_interval_s = None # Or 0.0, since it won't be used
+
+        self.raster_last_update_time = 0.0
+
         # Infer electrode array shape from coordinates
         # Assume square grid for now (approximate if necessary)
         num_electrodes = self.num_phosphenes
@@ -314,140 +608,132 @@ class GaussianSimulator:
             self.electrode_array_shape = (rows, cols)
         else:
             self.electrode_array_shape = (grid_size, grid_size)
-        
-        
-        # Create raster groups based on PHYSICAL COORDINATES
-        if self.raster_enabled:
-            # 1. Get Cartesian coordinates of all electrodes
-            x_coords, y_coords = coordinates.cartesian
-            # Normalize coordinates to 0-1 range for binning
-            x_min, x_max = x_coords.min(), x_coords.max()
-            y_min, y_max = y_coords.min(), y_coords.max()
-            
-            # Avoid division by zero if all points are identical
-            w = (x_max - x_min) if x_max != x_min else 1.0
-            h = (y_max - y_min) if y_max != y_min else 1.0
-            
-            x_norm = (x_coords - x_min) / w
-            y_norm = (y_coords - y_min) / h
-            
-            # Initialize groups array
-            groups_np = np.zeros(self.num_phosphenes, dtype=int)
-            
-            if self.raster_pattern == 'horizontal':
-                # Group based on Y position (Top to Bottom)
-                # We invert y because typically y is positive up, but raster scans top-down
-                # Check your coordinate system. Assuming standard Cartesian:
-                groups_np = np.floor((1.0 - y_norm) * self.raster_num_groups).astype(int)
-                
-            elif self.raster_pattern == 'vertical':
-                # Group based on X position (Left to Right)
-                groups_np = np.floor(x_norm * self.raster_num_groups).astype(int)
-                
-            elif self.raster_pattern == 'checkerboard':
-                # Create a virtual grid for checkerboard assignment
-                # We use sqrt(num_groups) to approximate the grid density
-                grid_dim = int(np.sqrt(self.num_phosphenes)) 
-                
-                # Determine row and col indices for each point
-                row_idx = np.floor((1.0 - y_norm) * grid_dim).astype(int)
-                col_idx = np.floor(x_norm * grid_dim).astype(int)
-                
-                if self.raster_num_groups >= 4:
-                    # Complex checkerboard logic
-                    offset = (row_idx % 2) * (self.raster_num_groups // 2)
-                    groups_np = ((col_idx % self.raster_num_groups) + offset) % self.raster_num_groups
-                else:
-                    # Simple interleave
-                    groups_np = (row_idx + col_idx) % self.raster_num_groups
-                    
-            elif self.raster_pattern == 'random':
-                rng_local = np.random.default_rng(self.params['run']['seed'])
-                groups_np = rng_local.integers(0, self.raster_num_groups, size=self.num_phosphenes)
 
-            # Clamp to ensure no index goes out of bounds (e.g. 1.0 maps to num_groups)
-            groups_np = np.clip(groups_np, 0, self.raster_num_groups - 1)
-            
-            # Convert to Tensor
-            self.raster_groups_flat = self.to_tensor(groups_np).long()
-            
-            # Create schedule masks (one per group) - all operations on GPU
+
+        self._sorted_cartesian_coords = getattr(self, "_sorted_cartesian_coords", None)
+        self._sorted_raster_coords = getattr(self, "_sorted_raster_coords", None)
+
+        # Create raster groups based on physical coordinates
+        if self.raster_enabled:
+            if self._sorted_raster_coords is not None:
+                x_np, y_np = self._sorted_raster_coords
+            elif self._sorted_cartesian_coords is not None:
+                x_np, y_np = self._sorted_cartesian_coords
+            else:
+                x_np, y_np = coordinates.cartesian
+
+            groups_tensor = _coordinate_based_raster_groups(
+                x_np,
+                y_np,
+                pattern=self.raster_pattern,
+                num_groups=self.raster_num_groups,
+                device=self.data_kwargs['device'],
+            )
+
+            # Assign to self
+            self.raster_groups_flat = groups_tensor
+
+            self._raster_group_pool = None
+            self._raster_group_pool_index = 0
+            if self.raster_pattern == 'random':
+                raster_cfg = self.params.get('raster', {}) or {}
+                pool_size = max(1, int(raster_cfg.get('pseudo_random_pool_size', 4)))
+                self._raster_group_pool = [groups_tensor.detach().cpu()]
+                for _ in range(pool_size - 1):
+                    pooled_groups = _coordinate_based_raster_groups(
+                        x_np,
+                        y_np,
+                        pattern=self.raster_pattern,
+                        num_groups=self.raster_num_groups,
+                        device='cpu',
+                    )
+                    self._raster_group_pool.append(pooled_groups.detach().cpu())
+
+            # Create schedule masks (one per group) - operations on GPU
             self.raster_schedule = []
             for group_idx in range(self.raster_num_groups):
                 mask = (self.raster_groups_flat == group_idx).float()
+                # Reshape to match the spatial dimensions (Channels, Height, Width)
                 mask = mask.reshape(self.shape[-3:])
                 self.raster_schedule.append(mask)
-            
+
             # Initialize raster state
             self.current_raster_group = 0
             self.raster_time_accumulator = 0.0
-            
-            # For random pattern, store when to reshuffle
+
+            # For pseudo-random pattern, store when to reshuffle.
             if self.raster_pattern == 'random':
-                self.raster_reshuffle_interval = 5  # frames
+                self.raster_reshuffle_interval_s = max(
+                    1e-9,
+                    float(raster_cfg.get('reshuffle_interval_s', raster_cfg.get('reshuffle_interval', 5.0))),
+                )
+                self.raster_reshuffle_time_accumulator = 0.0
                 self.raster_frame_counter = 0
         else:
             self.raster_groups = None
             self.raster_groups_flat = None
             self.raster_schedule = None
+            self._raster_group_pool = None
+            self._raster_group_pool_index = 0
             self.current_raster_group = 0
             self.raster_time_accumulator = 0.0
-
-        # Cumulative charge guard
-        safety = self.params.get('safety', {}) or {}
-        self.enable_charge_guard = bool(safety.get('enable_charge_guard', True))
-        self.charge_limit_uC = float(safety.get('cumulative_charge_limit_uC', 30.0))
-        self.charge_warn_only = bool(safety.get('charge_warn_only', True))
-        self.cumulative_charge_uC = torch.zeros(self.num_phosphenes, **self.data_kwargs)
-        self._charge_guard_step = 0  
-        self._log_every_steps = int(safety.get('charge_log_every', 30))
-        
-        rel_stim_duration = float(self.params['default_stim']['relative_stim_duration'])
-        self._dt_s = rel_stim_duration / fps
 
         self.reset()
 
     @property
     def num_phosphenes(self):
+        if hasattr(self, "_num_phosphenes"):
+            return self._num_phosphenes
         return len(self.phosphene_maps)
 
     def to_tensor(self, x: Union[int, float, np.ndarray]) -> torch.Tensor:
         return to_tensor(x, **self.data_kwargs)
+
+    def _initialize_lightweight_phosphene_geometry(
+            self,
+            coordinates: Map,
+            raster_coordinates: Optional[Map] = None,
+    ) -> None:
+        """Initialize sorted coordinates without allocating full distance maps."""
+        x_coords, y_coords = coordinates.cartesian
+        x_coords = np.asarray(x_coords)
+        y_coords = np.asarray(y_coords)
+        if raster_coordinates is None:
+            raster_x, raster_y = x_coords.copy(), y_coords.copy()
+        else:
+            raster_x, raster_y = raster_coordinates.cartesian
+            raster_x = np.asarray(raster_x)
+            raster_y = np.asarray(raster_y)
+            if len(raster_x) != len(x_coords) or len(raster_y) != len(y_coords):
+                raise ValueError("raster_coordinates must match the number of phosphene coordinates.")
+
+        indices = np.arange(len(x_coords))
+        sort_idx = np.lexsort((x_coords, -y_coords))
+        x_coords = x_coords[sort_idx]
+        y_coords = y_coords[sort_idx]
+        raster_x = raster_x[sort_idx]
+        raster_y = raster_y[sort_idx]
+        self._sorted_cartesian_coords = (x_coords.copy(), y_coords.copy())
+        self._sorted_raster_coords = (raster_x.copy(), raster_y.copy())
+        self.electrode_tags = indices[sort_idx]
 
     def reset(self):
         """Reset memory of previous timestep and raster state."""
         self.activation.reset()
         self.trace.reset()
         self.sigma.reset()
-        self.reset_cumulative_charge()
-        
+        self.delivered_amplitude = torch.zeros(self.shape, **self.data_kwargs)
+        self.delivered_charge_per_second = torch.zeros(self.shape, **self.data_kwargs)
+        self.current_pulse_width = torch.zeros(self.shape, **self.data_kwargs)
+        self.current_frequency = torch.zeros(self.shape, **self.data_kwargs)
+
         # Reset raster state
         if self.raster_enabled:
             self.current_raster_group = 0
             self.raster_time_accumulator = 0.0
             if self.raster_pattern == 'random':
+                self.raster_reshuffle_time_accumulator = 0.0
                 self.raster_frame_counter = 0
-    
-    def reset_cumulative_charge(self):
-        """Reset cumulative charge accounting for all electrodes."""
-        self.cumulative_charge_uC.zero_()
-        self._charge_guard_step = 0 
-    
-    def get_charge_status(self):
-        """Return current cumulative charge status for monitoring."""
-        max_charge = self.cumulative_charge_uC.max().item()
-        min_charge = self.cumulative_charge_uC.min().item()
-        total_charge = self.cumulative_charge_uC.sum().item()
-        max_electrode_idx = self.cumulative_charge_uC.argmax().item()
-        
-        return {
-            'cumulative_charge_uC': self.cumulative_charge_uC, 
-            'max_charge_uC': max_charge,
-            'min_charge_uC': min_charge,
-            'total_charge_uC': total_charge,
-            'max_electrode_idx': max_electrode_idx,
-            'limit_uC': self.charge_limit_uC
-        }
 
     def gabor_rotation(self, x, y, theta=None) -> torch.Tensor:
         """Rotation of ellipsis."""
@@ -463,8 +749,9 @@ class GaussianSimulator:
         return phosphene_maps
 
     def generate_phosphene_maps(self, coordinates: Map,
-                                remove_invalid: Optional[bool] = True,
+                                remove_invalid: Optional[bool] = False,
                                 theta: Optional[np.ndarray] = None,
+                                raster_coordinates: Optional[Map] = None,
                                 ) -> torch.Tensor:
         """Generate phosphene maps (for each phosphene distance to each pixel).
 
@@ -477,6 +764,26 @@ class GaussianSimulator:
 
         # Phosphene coordinates
         x_coords, y_coords = coordinates.cartesian
+        if raster_coordinates is None:
+            raster_x, raster_y = x_coords.copy(), y_coords.copy()
+        else:
+            raster_x, raster_y = raster_coordinates.cartesian
+            raster_x = np.asarray(raster_x)
+            raster_y = np.asarray(raster_y)
+            if len(raster_x) != len(x_coords) or len(raster_y) != len(y_coords):
+                raise ValueError("raster_coordinates must match the number of phosphene coordinates.")
+
+        # Implementation of spatial tagging and sorting
+        indices = np.arange(len(x_coords))
+        sort_idx = np.lexsort((x_coords, -y_coords))
+        x_coords = x_coords[sort_idx]
+        y_coords = y_coords[sort_idx]
+        raster_x = raster_x[sort_idx]
+        raster_y = raster_y[sort_idx]
+        self._sorted_cartesian_coords = (x_coords.copy(), y_coords.copy())
+        self._sorted_raster_coords = (raster_x.copy(), raster_y.copy())
+        self.electrode_tags = indices[sort_idx]
+
         x_coords = torch.reshape(self.to_tensor(x_coords), (-1, 1, 1))
         y_coords = torch.reshape(self.to_tensor(y_coords), (-1, 1, 1))
 
@@ -486,7 +793,7 @@ class GaussianSimulator:
         hemi_fov = self.params['run']['view_angle'] / 2
         x_min, x_max = x_org - hemi_fov, x_org + hemi_fov
         y_min, y_max = y_org - hemi_fov, y_org + hemi_fov
-     
+
         if remove_invalid:
             # Check if phosphene locations are inside of view angle.
             valid = (
@@ -498,6 +805,10 @@ class GaussianSimulator:
                           f"are outside of view and will be removed.")
             x_coords = x_coords[valid]
             y_coords = y_coords[valid]
+            raster_x = raster_x[to_numpy(valid)]
+            raster_y = raster_y[to_numpy(valid)]
+            self.electrode_tags = self.electrode_tags[to_numpy(valid)]
+            self._sorted_raster_coords = (raster_x.copy(), raster_y.copy())
             coordinates.use_subset(to_numpy(valid))
 
         # Get distance maps to phosphene centres (in degrees of visual angle).
@@ -520,13 +831,36 @@ class GaussianSimulator:
 
         return phosphene_maps
 
+    def _init_power_heatmap_weights(self):
+        """
+        Pre-calculates the weights and indices for the spatial power heatmap.
+        Finds the 4 nearest electrodes for every pixel and computes 1/dist^2 weights.
+        """
+        # self.phosphene_maps contains distances from each electrode (N) to every pixel (H, W)
+        # Shape: (N_phosphenes, H, W)
+        dists = self.phosphene_maps
+
+        # Find the 4 closest electrodes for every pixel
+        # values: the distances, indices: the electrode IDs
+        # We use largest=False to get the smallest distances
+        k = 4
+        nearest_dists, self.power_indices = torch.topk(dists, k=k, dim=0, largest=False)
+
+        # Calculate Weights: 1 / (distance^2)
+        # Add a small epsilon to avoid division by zero at the exact electrode center
+        epsilon = 1e-6
+        dist_sq = nearest_dists ** 2
+        self.power_weights = 1.0 / (dist_sq + epsilon)
+
+
     def update(self, amplitude: torch.Tensor,
                pulse_width: Optional[torch.Tensor] = None,
                frequency: Optional[torch.Tensor] = None,
-               dt: Optional[float] = None):
+               dt: Optional[float] = None,
+               temperature_increase: Optional[Union[float, torch.Tensor]] = None):
         """
         Update phosphene states with raster pattern support.
-        
+
         Parameters
         ----------
         amplitude : torch.Tensor
@@ -538,57 +872,44 @@ class GaussianSimulator:
         dt : float, optional
             Time step in seconds. If None, uses 1/fps.
         """
-        
-        # Update raster timing
+
+        # Update raster state (timing)
         self._update_raster_state(dt)
-        
+
         # Get current raster mask
         raster_mask = self.get_current_raster_mask()
-        
+
         # Apply raster mask to amplitude
-        # Only electrodes in the current group receive stimulation
+        # Electrodes not in the current active group get 0 amplitude (0 Current).
         masked_amplitude = amplitude.view(self.shape) * raster_mask
-        
+
+        # Handle defaults
+
         if pulse_width is None:
             pulse_width = self._pulse_width
         if frequency is None:
             frequency = self._frequency
 
+        current_frequency = frequency.view(self.shape)
+        current_pulse_width = pulse_width.view(self.shape)
+
         charge_per_s = self.get_current(masked_amplitude,
-                                        frequency.view(self.shape),
-                                        pulse_width.view(self.shape))
+                                        current_frequency,
+                                        current_pulse_width)
+        delivered_charge_per_s = masked_amplitude * current_pulse_width * current_frequency
+        self.delivered_amplitude = masked_amplitude
+        self.delivered_charge_per_second = delivered_charge_per_s
+        self.current_pulse_width = current_pulse_width
+        self.current_frequency = current_frequency
+
+        # Determine time step (Frame Duration) for Energy calculation
+        if dt is None:
+            dt = 1.0 / self.params['run']['fps']
 
         self.activation.update(charge_per_s)
         self.trace.update(charge_per_s)
         self.sigma.update(masked_amplitude)
         self.brightness.update(self.activation.get())
-
-        # Cumulative charge guard 
-        if self.enable_charge_guard:
-            dt_s = self._dt_s if dt is None else dt
-            dims = (0, 2, 3) if charge_per_s.dim() == 4 else (1, 2)
-            i_avg_A_per_elec = charge_per_s.sum(dim=dims)
-            delta_C = i_avg_A_per_elec * dt_s
-            delta_uC = delta_C * 1e6
-            self.cumulative_charge_uC = self.cumulative_charge_uC + delta_uC
-            
-            self._charge_guard_step += 1
-            if self._log_every_steps > 0 and (self._charge_guard_step % self._log_every_steps == 0):
-                max_uC = float(self.cumulative_charge_uC.max().item())
-                import logging
-                logging.info(f"[ChargeGuard] max_cum_charge_uC={max_uC:.1f} (limit={self.charge_limit_uC:.1f})")
-            
-            over = self.cumulative_charge_uC > self.to_tensor(self.charge_limit_uC)
-            if torch.any(over):
-                idx = torch.nonzero(over, as_tuple=False).view(-1).tolist()
-                values = [float(self.cumulative_charge_uC[i]) for i in idx]
-                msg = (f"[ChargeGuard] Cumulative charge limit exceeded for electrodes {idx}. "
-                       f"limit={self.charge_limit_uC:.1f} µC, values={values}")
-                if self.charge_warn_only:
-                    import warnings
-                    warnings.warn(msg)
-                else:
-                    raise RuntimeError(msg)
 
 
 
@@ -619,6 +940,10 @@ class GaussianSimulator:
         :return: Stack of Gaussian-shaped phosphene images
         (n_phosphenes, resolution_y, resolution_x)
         """
+        if self.phosphene_maps is None:
+            raise RuntimeError(
+                "Gaussian phosphene rendering requires phosphene_mode='visual'."
+            )
 
         # Calculate normalized Gaussian (peak has value 1).
         sigma = self.sigma.get().clamp(1e-22, None)  # TODO: clamping redundant? Default division by zero gives inf.
@@ -632,30 +957,53 @@ class GaussianSimulator:
             'activation': self.activation.get(),
             'trace': self.trace.get(),
             'threshold': self.threshold.get(),
-            'effective_charge_per_second':
-                self.effective_charge_per_second}
+            'effective_charge_per_second':self.effective_charge_per_second,
+            'delivered_amplitude': self.delivered_amplitude,
+            'delivered_charge_per_second': self.delivered_charge_per_second,
+            'pulse_width': self.current_pulse_width,
+            'frequency': self.current_frequency,
+            }
+
         return state
 
-    def __call__(self, amplitude, pulse_width=None, frequency=None):
-        self.update(amplitude, pulse_width, frequency)
+    def __call__(self, amplitude, pulse_width=None, frequency=None, temperature_increase=None):
+        self.update(amplitude, pulse_width, frequency, temperature_increase=temperature_increase)
         activation = self.gaussian_activation()
         supra_threshold = torch.greater(self.activation.get(), self.threshold.get())
         intensity = torch.where(supra_threshold, self.brightness.get(), self._zero)
-        
+
         # Apply raster mask to zero out inactive electrodes
         if self.raster_enabled:
             raster_mask = self.get_current_raster_mask()
             # Expand mask to match activation shape (add spatial dimensions)
             # mask shape: (n_electrodes, 1, 1)
             intensity = intensity * raster_mask
-        
+
         return torch.sum(intensity * activation, dim=self._electrode_dimension).clamp(0, 1)
 
     @property
     def phosphene_centers(self):
         """Indices (flat indexing) of the phosphene centers"""
         if self._phosphene_centers is None:
-            self._phosphene_centers = self.phosphene_maps.flatten(start_dim=1).argmin(dim=-1)
+            if self.phosphene_maps is not None:
+                self._phosphene_centers = self.phosphene_maps.flatten(start_dim=1).argmin(dim=-1)
+            else:
+                x_coords, y_coords = self._sorted_cartesian_coords
+                res_x, res_y = self.params['run']['resolution']
+                x_org, y_org = self.params['run']['origin']
+                hemi_fov = self.params['run']['view_angle'] / 2
+                x_min, x_max = x_org - hemi_fov, x_org + hemi_fov
+                y_min, y_max = y_org - hemi_fov, y_org + hemi_fov
+                x_idx = np.rint((x_coords - x_min) / (x_max - x_min) * (res_x - 1))
+                y_idx = np.rint((y_coords - y_min) / (y_max - y_min) * (res_y - 1))
+                x_idx = np.clip(x_idx, 0, res_x - 1).astype(np.int64)
+                y_idx = np.clip(y_idx, 0, res_y - 1).astype(np.int64)
+                flat_idx = y_idx * int(res_x) + x_idx
+                self._phosphene_centers = torch.tensor(
+                    flat_idx,
+                    dtype=torch.long,
+                    device=self.data_kwargs['device'],
+                )
         return self._phosphene_centers
 
     def sample_centers(self, x: torch.Tensor) -> torch.Tensor:
@@ -664,11 +1012,26 @@ class GaussianSimulator:
 
     def sample_receptive_fields(self, x: torch.Tensor) -> torch.Tensor:
         """Extracts the maximum value of activation mask x within the 'receptive field' of each phosphene"""
+        if self.phosphene_maps is None:
+            if not self._warned_lightweight_receptive_fields:
+                warnings.warn(
+                    "phosphene_mode='safety_centers' does not allocate receptive-field masks; "
+                    "sampling falls back to phosphene center pixels.",
+                    category=RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._warned_lightweight_receptive_fields = True
+            return self.sample_centers(x)
         return torch.amax(self.sampling_mask * x, dim=(-2,-1))
 
     @property
     def sampling_mask(self):
         """Boolean mask (tensor) that defines which pixels are inside the receptive field / center of each phosphene"""
+        if self.phosphene_maps is None:
+            raise RuntimeError(
+                "sampling_mask requires full phosphene maps. Use phosphene_mode='visual' "
+                "or sample center pixels in safety_centers mode."
+            )
         if self._sampling_mask is None:
             params = self.params['sampling']
             if self._sampling_method == 'receptive_fields':
@@ -715,11 +1078,11 @@ class GaussianSimulator:
                           "rescale=True to map pixels in range [0, 1] or [0, 255] to the default stimulus scale.",
                           category=DeprecationWarning, stacklevel=2)
         return electrode_activation
-    
+
     def get_raster_info(self) -> dict:
         """
         Get information about the current raster configuration.
-        
+
         Returns
         -------
         info : dict
@@ -727,21 +1090,22 @@ class GaussianSimulator:
         """
         if not self.raster_enabled:
             return {'enabled': False}
-        
+
         return {
             'enabled': True,
             'pattern': self.raster_pattern,
             'num_groups': self.raster_num_groups,
             'raster_rate_hz': self.raster_rate_hz,
             'group_interval_s': self.raster_group_interval_s,
+            'reshuffle_interval_s': getattr(self, 'raster_reshuffle_interval_s', 0.0),
             'current_group': self.current_raster_group,
             'array_shape': self.electrode_array_shape,
         }
-    
+
     def _update_raster_state(self, dt: Optional[float] = None):
             """
             Update the current active raster group based on elapsed time.
-            
+
             Parameters
             ----------
             dt : float, optional
@@ -750,36 +1114,56 @@ class GaussianSimulator:
             """
             if not self.raster_enabled:
                 return
-            
+
             if dt is None:
                 dt = 1.0 / self.params['run']['fps']
-            
+
             # Accumulate time
             self.raster_time_accumulator += dt
-            
+            if self.raster_pattern == 'random':
+                self.raster_reshuffle_time_accumulator += dt
+
             # Check if we should advance to next group
             while self.raster_time_accumulator >= self.raster_group_interval_s:
                 self.raster_time_accumulator -= self.raster_group_interval_s
                 self.current_raster_group = (self.current_raster_group + 1) % self.raster_num_groups
-                
-                # Handle random pattern reshuffling
-                if self.raster_pattern == 'random':
-                    self.raster_frame_counter += 1
-                    if self.raster_frame_counter >= self.raster_reshuffle_interval:
-                        self.raster_frame_counter = 0
-                        # Reshuffle groups
-                        self._reshuffle_random_pattern()
-    
+
+            # Handle pseudo-random pattern reshuffling on a seconds-based
+            # cadence, independent of video FPS.
+            if self.raster_pattern == 'random':
+                self.raster_frame_counter += 1
+                while self.raster_reshuffle_time_accumulator >= self.raster_reshuffle_interval_s:
+                    self.raster_reshuffle_time_accumulator -= self.raster_reshuffle_interval_s
+                    self._reshuffle_random_pattern()
+
     def _reshuffle_random_pattern(self):
-        """Reshuffle using pure PyTorch."""
+        """Create a new spaced pseudo-random assignment for random rastering."""
         num_electrodes = len(self.raster_groups_flat)
-        
-        # Create new random assignment on device
-        new_groups = torch.arange(num_electrodes, device=self.raster_groups_flat.device) % self.raster_num_groups
-        perm = torch.randperm(num_electrodes, device=self.raster_groups_flat.device)
-        new_groups = new_groups[perm]
+        group_pool = getattr(self, "_raster_group_pool", None)
+
+        if group_pool:
+            self._raster_group_pool_index = (self._raster_group_pool_index + 1) % len(group_pool)
+            new_groups = group_pool[self._raster_group_pool_index].to(self.raster_groups_flat.device)
+
+        elif self._sorted_raster_coords is not None:
+            x_np, y_np = self._sorted_raster_coords
+            new_groups = _coordinate_based_raster_groups(
+                x_np,
+                y_np,
+                pattern=self.raster_pattern,
+                num_groups=self.raster_num_groups,
+                device=self.raster_groups_flat.device,
+            )
+        else:
+            raster_groups = create_raster_groups(
+                self.electrode_array_shape,
+                self.raster_num_groups,
+                pattern=self.raster_pattern,
+                device=self.raster_groups_flat.device,
+            )
+            new_groups = raster_groups.reshape(-1)[:num_electrodes]
         self.raster_groups_flat = new_groups
-        
+
         # Update schedule masks (all on GPU)
         for group_idx in range(self.raster_num_groups):
             mask = (self.raster_groups_flat == group_idx).float()
@@ -789,7 +1173,7 @@ class GaussianSimulator:
     def get_current_raster_mask(self) -> torch.Tensor:
         """
         Get the current active electrode mask based on raster state.
-        
+
         Returns
         -------
         mask : torch.Tensor
@@ -799,16 +1183,14 @@ class GaussianSimulator:
         if not self.raster_enabled:
             # All electrodes active
             return torch.ones(self.shape, **self.data_kwargs)
-        
+
         # Return mask for current group
         mask = self.raster_schedule[self.current_raster_group]
-        
+
         # Broadcast to full shape if needed
         if len(self.shape) == 4:  # With batch dimension
             mask = mask.unsqueeze(0).expand(self.shape)
         else:
             mask = mask.expand(self.shape)
-        
+
         return mask
-            
-            
