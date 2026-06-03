@@ -125,15 +125,21 @@ def resolve_panel_samples_dir(input_path: Path, export_output_dir: Path) -> Path
 
 
 def resolve_export_output_path(input_path: Path, export_output_dir: Path, method: str) -> Path:
-    return resolve_method_output_dir(input_path, export_output_dir, method) / "preprocessed.mp4"
+    _ = export_output_dir
+    method_name = str(method).strip().lower()
+    return input_path.with_name(f"{input_path.stem}_{method_name}.mp4")
 
 
 def resolve_comparison_output_path(input_path: Path, export_output_dir: Path, method: str) -> Path:
-    return resolve_method_output_dir(input_path, export_output_dir, method) / "comparison_with_original.mp4"
+    _ = export_output_dir
+    method_name = str(method).strip().lower()
+    return input_path.with_name(f"{input_path.stem}_{method_name}_comparison_with_original.mp4")
 
 
 def resolve_sample_frames_dir(input_path: Path, export_output_dir: Path, method: str) -> Path:
-    frames_dir = resolve_method_output_dir(input_path, export_output_dir, method) / "frames"
+    _ = export_output_dir
+    method_name = str(method).strip().lower()
+    frames_dir = input_path.with_name(f"{input_path.stem}_{method_name}_frames")
     frames_dir.mkdir(parents=True, exist_ok=True)
     return frames_dir
 
@@ -613,7 +619,10 @@ def main() -> None:
         "--preprocessed-output-dir",
         type=str,
         default="videos/preprocessed",
-        help="Directory where video outputs will be written as <video>/..., with per-method exports in <video>/<method>/...",
+        help=(
+            "Deprecated. Standalone preprocessed video outputs are saved next to each input "
+            "video as <video_name>_<method>.mp4."
+        ),
     )
     parser.add_argument(
         "--preview-seconds",

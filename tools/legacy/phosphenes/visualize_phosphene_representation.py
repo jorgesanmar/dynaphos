@@ -3,8 +3,8 @@ Render phosphene outputs from images or videos.
 
 For a new user, the shortest path to obtaining a phosphene video is:
 
-1. Start from an original video and let the wrapper preprocess it:
-   python tools/phosphenes/render_video.py \
+1. Start from an original video and let this script preprocess it:
+   python tools/phosphenes/visualize_phosphene_representation.py \
        --input videos/example.mp4 \
        --input-stage original \
        --preprocessing-method dog \
@@ -12,8 +12,8 @@ For a new user, the shortest path to obtaining a phosphene video is:
 
 2. Or start from a preprocessed stimulation video that already contains
    single-channel frames:
-   python tools/phosphenes/render_video.py \
-       --input videos/example/example_dog.mp4 \
+   python tools/phosphenes/visualize_phosphene_representation.py \
+       --input videos/preprocessed/example/dog/preprocessed.mp4 \
        --input-stage preprocessed \
        --raster-mode checkerboard
 
@@ -38,7 +38,7 @@ import numpy as np
 import torch
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -92,15 +92,6 @@ def is_video_file(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTENSIONS
 
 
-def split_preprocessed_media_stem(stem: str) -> tuple[str, str | None]:
-    stem_l = stem.lower()
-    for method in PREPROCESS_METHODS:
-        suffix = f"_{method}"
-        if stem_l.endswith(suffix):
-            return stem[:-len(suffix)], method
-    return stem, None
-
-
 def resolve_media_inputs(input_arg: str) -> list[Path]:
     # The CLI accepts either a single file or a directory. For directories we
     # first look at the top level, then recurse so batch runs can point at a
@@ -115,13 +106,13 @@ def resolve_media_inputs(input_arg: str) -> list[Path]:
         if media_paths:
             return media_paths
 
-        recursive_media_paths = [
+        nested_media_paths = [
             path.resolve()
             for path in sorted(input_path.rglob("*"))
             if path.is_file() and (is_image_file(path) or is_video_file(path))
         ]
-        if recursive_media_paths:
-            return recursive_media_paths
+        if nested_media_paths:
+            return nested_media_paths
 
         raise RuntimeError(f"No supported media files found in: {input_path}")
     if not input_path.exists():
@@ -139,12 +130,17 @@ def format_duration(seconds: float) -> str:
 
 
 def resolve_output_stem(media_path: Path) -> str:
-    base_stem, detected_method = split_preprocessed_media_stem(media_path.stem)
-    return base_stem if detected_method is not None else media_path.stem
+    # Preprocessed videos are commonly named .../<video>/<method>/preprocessed.mp4.
+    # For those, keep the original video name as the main folder key.
+    if media_path.stem.lower() == "preprocessed" and media_path.parent.name.lower() in PREPROCESS_METHODS:
+        grandparent = media_path.parent.parent
+        if grandparent != media_path.parent and grandparent.name:
+            return grandparent.name
+    return media_path.stem
 
 
 def resolve_input_type(media_path: Path) -> str:
-    # The output tree separates image and video runs
+    # The output tree separates image and video runs 
     if is_image_file(media_path):
         return "image"
     return "video"
@@ -152,14 +148,15 @@ def resolve_input_type(media_path: Path) -> str:
 
 def resolve_output_method(media_path: Path, input_stage: str, preprocessing_method: str) -> str:
     # When the input is an original recording, the preprocessing method comes from the CLI.
-    # For side-by-side preprocessed files, infer the method from the filename suffix.
+    # When the input is already preprocessed, infer the method from the parent
+    # folder when possible.
     stage = str(input_stage).strip().lower()
     if stage == "original":
         return str(preprocessing_method).strip().lower()
 
-    _base_stem, detected_method = split_preprocessed_media_stem(media_path.stem)
-    if detected_method is not None:
-        return detected_method
+    if media_path.stem.lower() == "preprocessed" and media_path.parent.name.lower() in PREPROCESS_METHODS:
+        return media_path.parent.name.lower()
+
     return "preprocessed"
 
 
@@ -218,10 +215,6 @@ def normalize_to_u8(frame: np.ndarray) -> np.ndarray:
     return np.clip(normalized * 255.0, 0.0, 255.0).astype(np.uint8)
 
 
-def normalize_to_uint8(frame: np.ndarray) -> np.ndarray:
-    return normalize_to_u8(frame)
-
-
 def ensure_gray_original_frame(frame: np.ndarray) -> np.ndarray:
     if frame.ndim == 2:
         return frame
@@ -261,113 +254,6 @@ def center_crop_square(frame: np.ndarray) -> np.ndarray:
     return frame[start_y:start_y + side, start_x:start_x + side]
 
 
-def prepare_square_gray_frame(frame: np.ndarray, render_size: int) -> np.ndarray:
-    gray = ensure_gray_original_frame(frame)
-    square = center_crop_square(gray)
-    return cv2.resize(square, (int(render_size), int(render_size)), interpolation=cv2.INTER_AREA)
-
-
-def preprocess_gray_frame(
-    frame_gray: np.ndarray,
-    method: str,
-    *,
-    dog_sigma_low: float,
-    dog_sigma_high: float,
-    canny_low: float = 75.0,
-    canny_high: float = 170.0,
-    use_cuda: bool = False,
-) -> np.ndarray:
-    method = str(method).strip().lower()
-    if method not in PREPROCESS_METHODS:
-        raise ValueError(
-            f"Unsupported preprocessing method '{method}'. Expected one of {list(PREPROCESS_METHODS)}."
-        )
-
-    if method == "dog":
-        sigma_low, sigma_high = sorted((float(dog_sigma_low), float(dog_sigma_high)))
-        processed = image_preprocessing(
-            frame_gray,
-            method="dog",
-            sigma_low=sigma_low,
-            sigma_high=sigma_high,
-            use_cuda=bool(use_cuda),
-        )
-        return normalize_to_u8(processed)
-
-    blurred = cv2.GaussianBlur(frame_gray, (9, 9), 5)
-    if method == "none":
-        return normalize_to_u8(blurred)
-    if method == "canny":
-        low, high = sorted((float(canny_low), float(canny_high)))
-        processed = image_preprocessing(
-            blurred,
-            method="canny",
-            threshold_low=low,
-            threshold_high=high,
-        )
-    else:
-        processed = image_preprocessing(blurred, method="sobel")
-    return normalize_to_u8(processed)
-
-
-def _to_bgr_u8(frame: np.ndarray) -> np.ndarray:
-    frame_u8 = normalize_to_u8(frame)
-    if frame_u8.ndim == 2:
-        return cv2.cvtColor(frame_u8, cv2.COLOR_GRAY2BGR)
-    return frame_u8
-
-
-def _add_panel_label(frame: np.ndarray, label: str, color: tuple[int, int, int] = (255, 255, 255)) -> np.ndarray:
-    labeled = _to_bgr_u8(frame).copy()
-    cv2.putText(
-        labeled,
-        str(label),
-        (10, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        color,
-        2,
-        cv2.LINE_AA,
-    )
-    return labeled
-
-
-def make_panel(
-    images: list[np.ndarray] | tuple[np.ndarray, ...],
-    labels: list[str] | tuple[str, ...],
-    *,
-    columns: int | None = None,
-    background: int = 0,
-) -> np.ndarray:
-    if len(images) != len(labels):
-        raise ValueError("images and labels must have the same length.")
-    if not images:
-        raise ValueError("At least one image is required to build a panel.")
-
-    labeled_images = [_add_panel_label(image, label) for image, label in zip(images, labels)]
-    height = max(image.shape[0] for image in labeled_images)
-    width = max(image.shape[1] for image in labeled_images)
-    if columns is None or columns < 1:
-        columns = len(labeled_images)
-    rows = int(np.ceil(float(len(labeled_images)) / float(columns)))
-
-    blank = np.full((height, width, 3), int(background), dtype=np.uint8)
-    padded: list[np.ndarray] = []
-    for image in labeled_images:
-        canvas = blank.copy()
-        canvas[: image.shape[0], : image.shape[1]] = image
-        padded.append(canvas)
-
-    while len(padded) < rows * columns:
-        padded.append(blank.copy())
-
-    row_images = []
-    for row_idx in range(rows):
-        row_start = row_idx * columns
-        row_images.append(np.hstack(padded[row_start:row_start + columns]))
-    return np.vstack(row_images)
-
-
 def prepare_original_frame(
     frame: np.ndarray,
     *,
@@ -375,13 +261,13 @@ def prepare_original_frame(
     preprocessing_method: str,
     dog_sigma_low: float,
     dog_sigma_high: float,
-    canny_low: float = 75.0,
-    canny_high: float = 170.0,
-    use_cuda: bool = False,
+    canny_low: float,
+    canny_high: float,
+    use_cuda: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     # This is the "raw media" path:
-    # original frame -> grayscale -> square crop -> resize -> preprocessing.
-    # Canny and "none" use a smoothing pass; DoG performs its own blurs.
+    # original frame -> grayscale -> square crop -> resize -> blur ->
+    # preprocessing method selected for stimulation sampling.
     gray = ensure_gray_original_frame(frame)
     square = center_crop_square(gray)
     render_width, render_height = render_resolution_xy
@@ -400,7 +286,7 @@ def prepare_original_frame(
     elif method == "dog":
         sigma_low, sigma_high = sorted((float(dog_sigma_low), float(dog_sigma_high)))
         processed = image_preprocessing(
-            resized,
+            blurred,
             method="dog",
             sigma_low=sigma_low,
             sigma_high=sigma_high,
@@ -448,9 +334,9 @@ def prepare_stimulus_frame(
     preprocessing_method: str,
     dog_sigma_low: float,
     dog_sigma_high: float,
-    canny_low: float = 75.0,
-    canny_high: float = 170.0,
-    use_cuda: bool = False,
+    canny_low: float,
+    canny_high: float,
+    use_cuda: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     stage = str(input_stage).strip().lower()
     if stage == "original":
@@ -1054,12 +940,6 @@ def main() -> None:
         help="Directory where outputs will be written.",
     )
     parser.add_argument(
-        "--media-type",
-        choices=("auto", "image", "video"),
-        default="auto",
-        help="Restrict processing to images, videos, or infer from each input path.",
-    )
-    parser.add_argument(
         "--input-stage",
         type=str,
         default="original",
@@ -1102,8 +982,8 @@ def main() -> None:
     )
     parser.add_argument("--groups", type=int, default=4)
     parser.add_argument("--raster-rate-hz", "--raster_rate_hz", dest="raster_rate_hz", type=float, default=1.0)
-    parser.add_argument("--dog-sigma-low", type=float, default=2.0)
-    parser.add_argument("--dog-sigma-high", type=float, default=6.0)
+    parser.add_argument("--dog-sigma-low", type=float, default=4.0)
+    parser.add_argument("--dog-sigma-high", type=float, default=12.0)
     parser.add_argument(
         "--stim-scale",
         type=float,
@@ -1167,13 +1047,7 @@ def main() -> None:
     # The script accepts either one file or a directory. Each video becomes a
     # phosphene MP4 in the chosen output directory.
     for media_path in resolve_media_inputs(args.input_path):
-        is_image = is_image_file(media_path)
-        if args.media_type == "image" and not is_image:
-            raise ValueError(f"render_image received a non-image input: {media_path}")
-        if args.media_type == "video" and is_image:
-            raise ValueError(f"render_video received an image input: {media_path}")
-
-        if is_image:
+        if is_image_file(media_path):
             process_image(
                 media_path,
                 output_dir,

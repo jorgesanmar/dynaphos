@@ -1,7 +1,7 @@
 """
 Generate comparison plots for the declarative safety experiment matrix.
 
-The input is the directory written by tools/safety/run_experiment_matrix.py:
+The input is the directory written by tools/safety/run_phase1.py:
 one subdirectory per experiment block, with one run_manifest.yaml and
 safety_metrics.npz per case.
 """
@@ -131,7 +131,7 @@ class FactorValue:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate comparison plots for run_experiment_matrix.py outputs."
+        description="Generate comparison plots for run_phase1.py outputs."
     )
     parser.add_argument(
         "--input-root",
@@ -624,6 +624,8 @@ def downsample_time_rows(
     x: np.ndarray,
     rows: np.ndarray,
     max_points: int = MAX_CLOUD_POINTS,
+    *,
+    reducer: str = "mean",
 ) -> tuple[np.ndarray, np.ndarray]:
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     values = np.asarray(rows, dtype=np.float64)
@@ -632,6 +634,11 @@ def downsample_time_rows(
     length = min(x.size, values.shape[0])
     if length <= 0:
         return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float32)
+    if reducer == "sample":
+        idx = sample_indices(length, max_points=max_points)
+        return x[:length][idx], values[:length][idx].astype(np.float32, copy=False)
+    if reducer != "mean":
+        raise ValueError(f"Unsupported row downsample reducer: {reducer!r}")
     chunks = time_window_indices(length, max_points)
     x_out = np.asarray([finite_nanmean(x[:length][idx]) for idx in chunks], dtype=np.float64)
     row_out = np.vstack([finite_mean(values[:length][idx], axis=0) for idx in chunks])
@@ -810,7 +817,8 @@ def metric_rows(
     direct = first_matrix(data, direct_keys.get(metric, ()))
     if direct is not None:
         x_full = time_axis_for_length(data, direct.shape[0], prefer_electrode=True)
-        return downsample_time_rows(x_full, direct, max_points=max_points)
+        reducer = "sample" if metric == "amplitude" else "mean"
+        return downsample_time_rows(x_full, direct, max_points=max_points, reducer=reducer)
 
     amp = amplitude_matrix(data)
     if amp is None or metric == "amplitude":
@@ -848,6 +856,7 @@ def distribution_stats(
     rows: np.ndarray,
     *,
     positive_only: bool = True,
+    empty_value: float | None = None,
 ) -> dict[str, np.ndarray]:
     values = np.asarray(rows, dtype=np.float64)
     if values.ndim == 1:
@@ -869,6 +878,14 @@ def distribution_stats(
             mask &= row > 0.0
         valid = row[mask]
         if valid.size == 0:
+            if empty_value is not None:
+                value = float(empty_value)
+                stats["mean"][idx] = value
+                stats["p05"][idx] = value
+                stats["p25"][idx] = value
+                stats["p50"][idx] = value
+                stats["p75"][idx] = value
+                stats["p95"][idx] = value
             continue
         stats["mean"][idx] = float(np.mean(valid))
         p05, p25, p50, p75, p95 = np.percentile(valid, [5, 25, 50, 75, 95])
@@ -890,8 +907,9 @@ def plot_metric_cloud(
     color: str,
     positive_only: bool,
     use_cloud: bool,
+    empty_value: float | None = None,
 ) -> np.ndarray:
-    stats = distribution_stats(rows, positive_only=positive_only)
+    stats = distribution_stats(rows, positive_only=positive_only, empty_value=empty_value)
     mean = stats["mean"]
     if use_cloud:
         ax.fill_between(x, stats["p05"], stats["p95"], color=color, alpha=0.14, linewidth=0)
@@ -929,7 +947,8 @@ def mean_metric_series(
         return None
     x, rows = rows_result
     positive_only = metric not in {"shannon"}
-    stats = distribution_stats(rows, positive_only=positive_only)
+    empty_value = 0.0 if metric == "amplitude" and positive_only else None
+    stats = distribution_stats(rows, positive_only=positive_only, empty_value=empty_value)
     return x, stats["mean"]
 
 
@@ -1266,6 +1285,7 @@ def plot_protocol_metric_distribution(
                 color=color,
                 positive_only=positive_only,
                 use_cloud=should_use_cloud_for_case(manifest),
+                empty_value=0.0 if metric == "amplitude" and positive_only else None,
             )
             ax.legend(frameon=False, fontsize=8)
             style_axes(ax)
@@ -1965,45 +1985,90 @@ def plot_protocol_temperature_heatmaps(
         if not snapshot_keys:
             return
         for grid_name, key in snapshot_keys:
-            out_path = case_visuals_dir(record) / f"temperature_sections_{sanitize_path_part(grid_name)}.{image_format}"
-            if out_path.exists() and not overwrite:
-                print(f"Skipping existing: {out_path}")
-                continue
             stack = get_data_array(data, key, dtype=np.float32)
             if stack is None or stack.ndim != 3 or stack.shape[0] == 0:
                 continue
-            snapshot_index = middle_snapshot_index(data, int(stack.shape[0]))
-            heatmap = np.asarray(stack[snapshot_index], dtype=np.float32)
-            if heatmap.ndim != 2 or heatmap.size == 0:
+            stack = np.asarray(stack, dtype=np.float32)
+            if stack.shape[1] == 0 or stack.shape[2] == 0:
                 continue
             extent = extent_for_grid(data, grid_name)
-            vmax = finite_nanmax(heatmap, default=0.0)
+            vmax = finite_nanmax(stack, default=0.0)
             if not np.isfinite(vmax) or vmax <= 0.0:
                 vmax = 1.0
-            fig, ax = plt.subplots(figsize=(6.4, 5.4))
-            image = ax.imshow(
-                downsample_image(heatmap),
-                origin="lower",
-                extent=extent,
-                cmap="inferno",
-                vmin=0.0,
-                vmax=vmax,
-                interpolation="nearest",
-                aspect="equal",
-            )
-            detail = middle_snapshot_detail(data, snapshot_index)
-            title = f"Mid-Simulation Temperature Map - {grid_name}"
-            if detail:
-                title = f"{title}\n{detail}"
-            ax.set_title(title, fontsize=12, fontweight="bold")
-            ax.set_xlabel("x (mm)" if extent is not None else "x pixel")
-            ax.set_ylabel("y (mm)" if extent is not None else "y pixel")
-            ax.tick_params(labelsize=8)
-            cbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label("dT (deg C)")
-            cbar.ax.tick_params(labelsize=8)
-            fig.tight_layout()
-            save_figure(fig, out_path, overwrite=overwrite)
+
+            safe_grid = sanitize_path_part(grid_name)
+            sheet_path = case_visuals_dir(record) / f"temperature_heatmaps_{safe_grid}.{image_format}"
+            if not sheet_path.exists() or overwrite:
+                n_snapshots = int(stack.shape[0])
+                ncols = min(5, n_snapshots)
+                nrows = int(math.ceil(n_snapshots / float(ncols)))
+                fig, axes = plt.subplots(
+                    nrows,
+                    ncols,
+                    figsize=(3.1 * ncols, 2.85 * nrows),
+                    squeeze=False,
+                )
+                image = None
+                for idx, ax in enumerate(axes.reshape(-1)):
+                    if idx >= n_snapshots:
+                        ax.axis("off")
+                        continue
+                    image = ax.imshow(
+                        downsample_image(stack[idx]),
+                        origin="lower",
+                        extent=extent,
+                        cmap="inferno",
+                        vmin=0.0,
+                        vmax=vmax,
+                        interpolation="nearest",
+                        aspect="equal",
+                    )
+                    detail = middle_snapshot_detail(data, idx)
+                    ax.set_title(detail or f"snapshot {idx + 1}", fontsize=8)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                if image is not None:
+                    cbar = fig.colorbar(image, ax=axes.reshape(-1).tolist(), fraction=0.025, pad=0.015)
+                    cbar.set_label("dT (deg C)")
+                    cbar.ax.tick_params(labelsize=8)
+                fig.suptitle(f"Temperature Heatmaps - {grid_name}", fontsize=12, fontweight="bold")
+                fig.subplots_adjust(top=0.90, right=0.92, hspace=0.28, wspace=0.10)
+                save_figure(fig, sheet_path, overwrite=overwrite)
+            else:
+                print(f"Skipping existing: {sheet_path}")
+
+            snapshot_dir = case_visuals_dir(record) / f"temperature_heatmaps_{safe_grid}"
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            for idx, heatmap in enumerate(stack):
+                detail = middle_snapshot_detail(data, idx)
+                label = sanitize_path_part(detail.replace(" | ", "_")) if detail else f"snapshot_{idx + 1:02d}"
+                out_path = snapshot_dir / f"{idx + 1:02d}_{label}.{image_format}"
+                if out_path.exists() and not overwrite:
+                    print(f"Skipping existing: {out_path}")
+                    continue
+                fig, ax = plt.subplots(figsize=(6.4, 5.4))
+                image = ax.imshow(
+                    downsample_image(heatmap),
+                    origin="lower",
+                    extent=extent,
+                    cmap="inferno",
+                    vmin=0.0,
+                    vmax=vmax,
+                    interpolation="nearest",
+                    aspect="equal",
+                )
+                title = f"Temperature Map - {grid_name}"
+                if detail:
+                    title = f"{title}\n{detail}"
+                ax.set_title(title, fontsize=12, fontweight="bold")
+                ax.set_xlabel("x (mm)" if extent is not None else "x pixel")
+                ax.set_ylabel("y (mm)" if extent is not None else "y pixel")
+                ax.tick_params(labelsize=8)
+                cbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label("dT (deg C)")
+                cbar.ax.tick_params(labelsize=8)
+                fig.tight_layout()
+                save_figure(fig, out_path, overwrite=overwrite)
 
 
 def plot_protocol_temperature_series(
@@ -3105,10 +3170,15 @@ def summary_total_charge_rate_max_mC_s(data: np.lib.npyio.NpzFile | Mapping[str,
     return finite_nanmax(series[1] / 1e6)
 
 
-def stationary_temperature_scalars(data: np.lib.npyio.NpzFile | Mapping[str, Any]) -> list[float]:
+def final_peak_temperature_scalars(data: np.lib.npyio.NpzFile | Mapping[str, Any]) -> list[float]:
     values: list[float] = []
     for key in data_files(data):
-        if key == "stationary_temperature_C" or key.startswith("stationary_temperature_C_"):
+        if (
+            key == "final_peak_temperature_C"
+            or key.startswith("final_peak_temperature_C_")
+            or key == "stationary_temperature_C"
+            or key.startswith("stationary_temperature_C_")
+        ):
             value = scalar_from_data(data, key, math.nan)
             if np.isfinite(value):
                 values.append(value)
@@ -3122,7 +3192,11 @@ def temperature_baseline_C(data: np.lib.npyio.NpzFile | Mapping[str, Any]) -> fl
             return value
     estimates: list[float] = []
     for key in data_files(data):
-        if key == "stationary_temperature_C":
+        if key == "final_peak_temperature_C":
+            dT_key = "final_peak_dT_C"
+        elif key.startswith("final_peak_temperature_C_"):
+            dT_key = key.replace("final_peak_temperature_C_", "final_peak_dT_C_", 1)
+        elif key == "stationary_temperature_C":
             dT_key = "stationary_dT_C"
         elif key.startswith("stationary_temperature_C_"):
             dT_key = key.replace("stationary_temperature_C_", "stationary_dT_C_", 1)
@@ -3196,7 +3270,7 @@ def summary_stationary_temperature_mean(data: np.lib.npyio.NpzFile | Mapping[str
             means.append(baseline + mean_dT)
     if means:
         return float(np.mean(means))
-    temps = stationary_temperature_scalars(data)
+    temps = final_peak_temperature_scalars(data)
     if temps:
         return float(np.mean(temps))
     mean_dT = max_of_series_key(data, "mean_dT")
@@ -3211,7 +3285,7 @@ def summary_stationary_temperature_max(data: np.lib.npyio.NpzFile | Mapping[str,
     max_dT = middle_of_series_key(data, "max_dT")
     if np.isfinite(max_dT):
         return baseline + max_dT
-    temps = stationary_temperature_scalars(data)
+    temps = final_peak_temperature_scalars(data)
     if temps:
         return float(np.max(temps))
     max_values: list[float] = []
@@ -3319,15 +3393,14 @@ def plot_matrix_summary_grid(
     save_figure(fig, path, overwrite=overwrite)
 
 
-def plot_matrix_active_electrode_lines(
+def plot_matrix_active_electrode_errorbars(
     records_by_key: Mapping[tuple[str, str, str], MatrixRecord],
     factors_by_run_id: Mapping[str, MatrixFactors],
-    values_by_run_id: Mapping[str, float],
+    mean_values_by_run_id: Mapping[str, float],
+    max_values_by_run_id: Mapping[str, float],
     output_root: Path,
     image_format: str,
     *,
-    stat_name: str,
-    title: str,
     overwrite: bool,
 ) -> None:
     amplitude_values = sorted_factor_values(factors_by_run_id, "amplitude")
@@ -3345,18 +3418,25 @@ def plot_matrix_active_electrode_lines(
     )
     if amplitude_value is None:
         return
-    path = output_root / MATRIX_BLOCK / "active_electrodes" / f"{sanitize_path_part(stat_name)}_by_grid.{image_format}"
+    path = output_root / MATRIX_BLOCK / "active_electrodes" / f"active_electrodes_by_grid_preprocessing.{image_format}"
     if path.exists() and not overwrite:
         print(f"Skipping existing: {path}")
         return
 
-    fig, ax = plt.subplots(figsize=(5.2, 4.4))
-    x = np.arange(len(grid_values), dtype=np.float64)
-    legend_handles: dict[str, Any] = {}
+    x_positions: list[float] = []
+    means: list[float] = []
+    upper_errors: list[float] = []
+    colors: list[str] = []
+    markers: list[str] = []
+    prep_labels: list[str] = []
+    grid_centers: list[tuple[float, str]] = []
+    separators: list[float] = []
     plotted = False
-    for index, preprocessing_value in enumerate(preprocessing_values):
-        y = []
-        for grid_value in grid_values:
+
+    position = 1.0
+    for grid_index, grid_value in enumerate(grid_values):
+        grid_start = position
+        for prep_index, preprocessing_value in enumerate(preprocessing_values):
             record = matrix_record_for_values(
                 records_by_key,
                 {
@@ -3365,44 +3445,70 @@ def plot_matrix_active_electrode_lines(
                     "preprocessing": preprocessing_value,
                 },
             )
-            y.append(values_by_run_id.get(record.run_id, math.nan) if record is not None else math.nan)
-        if np.any(np.isfinite(y)):
-            offset = (index - (len(preprocessing_values) - 1) / 2.0) * 0.055
-            line = ax.plot(
-                x + offset,
-                y,
-                marker=MATRIX_MARKERS[index % len(MATRIX_MARKERS)],
-                linestyle=MATRIX_LINESTYLES[index % len(MATRIX_LINESTYLES)],
-                linewidth=1.8,
-                markersize=5.5,
+            mean_value = mean_values_by_run_id.get(record.run_id, math.nan) if record is not None else math.nan
+            max_value = max_values_by_run_id.get(record.run_id, math.nan) if record is not None else math.nan
+            x_positions.append(position)
+            means.append(mean_value)
+            upper_errors.append(max(0.0, max_value - mean_value) if np.isfinite(mean_value) and np.isfinite(max_value) else math.nan)
+            colors.append(LINE_COLORS[prep_index % len(LINE_COLORS)])
+            markers.append(MATRIX_MARKERS[prep_index % len(MATRIX_MARKERS)])
+            prep_labels.append(preprocessing_value.label)
+            plotted = plotted or np.isfinite(mean_value)
+            position += 1.0
+        grid_centers.append(((grid_start + position - 1.0) / 2.0, grid_value.label))
+        if grid_index < len(grid_values) - 1:
+            separators.append(position - 0.5)
+        position += 0.85
+
+    fig, ax = plt.subplots(figsize=(max(8.4, 0.55 * len(x_positions) + 3.2), 4.9))
+    if plotted:
+        for x, mean_value, upper_error, color, marker in zip(x_positions, means, upper_errors, colors, markers):
+            if not np.isfinite(mean_value):
+                continue
+            yerr = np.asarray([[0.0], [upper_error if np.isfinite(upper_error) else 0.0]], dtype=np.float64)
+            ax.errorbar(
+                [x],
+                [mean_value],
+                yerr=yerr,
+                fmt=marker,
+                markersize=6.0,
                 markerfacecolor="white",
                 markeredgewidth=1.1,
-                color=LINE_COLORS[index % len(LINE_COLORS)],
-                label=preprocessing_value.label,
-                zorder=3 + index,
-            )[0]
-            legend_handles.setdefault(preprocessing_value.label, line)
-            plotted = True
-    if plotted:
+                color=color,
+                ecolor=color,
+                elinewidth=1.4,
+                capsize=4.0,
+                capthick=1.2,
+                zorder=3,
+            )
         style_axes(ax)
     else:
         add_no_data(ax, "No active electrode data")
-    ax.set_xticks(x)
-    ax.set_xticklabels([value.label for value in grid_values], rotation=30, ha="right", fontsize=8)
-    ax.set_title(f"{amplitude_value.label}")
-    ax.set_xlabel("electrode grid")
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(prep_labels, rotation=90, fontsize=8)
+    for separator in separators:
+        ax.axvline(separator, color=GRID_COLOR, linewidth=1.0)
+    for center, label in grid_centers:
+        ax.text(center, -0.22, label, transform=ax.get_xaxis_transform(), ha="center", va="top", fontsize=8)
     ax.set_ylabel("number of electrodes")
-    if legend_handles:
-        fig.legend(
-            list(legend_handles.values()),
-            list(legend_handles.keys()),
-            loc="upper center",
-            ncol=len(legend_handles),
-            frameon=False,
-            bbox_to_anchor=(0.5, 0.93),
+    ax.set_xlabel("electrode grid and preprocessing")
+    ax.set_title(f"{amplitude_value.label}: point = mean, upper error = max")
+    legend_handles = [
+        plt.Line2D(
+            [0],
+            [0],
+            color=LINE_COLORS[index % len(LINE_COLORS)],
+            marker=MATRIX_MARKERS[index % len(MATRIX_MARKERS)],
+            linestyle="none",
+            markerfacecolor="white",
+            markeredgewidth=1.1,
+            label=value.label,
         )
-    fig.suptitle(f"{title} ({STANDARD_AMPLITUDE_UA:g} uA)", fontsize=13, fontweight="bold")
-    fig.tight_layout(rect=[0, 0.01, 1, 0.84])
+        for index, value in enumerate(preprocessing_values)
+    ]
+    ax.legend(handles=legend_handles, title="preprocessing", frameon=False, fontsize=8, title_fontsize=8, loc="upper right")
+    fig.suptitle(f"Activated Electrodes by Grid and Preprocessing ({STANDARD_AMPLITUDE_UA:g} uA)", fontsize=13, fontweight="bold")
+    fig.subplots_adjust(bottom=0.36, left=0.09, right=0.98, top=0.84)
     save_figure(fig, path, overwrite=overwrite)
 
 
@@ -3584,24 +3690,13 @@ def plot_matrix_pairwise_comparisons(
 
     active_mean = matrix_summary_values(selected_by_run.values(), summary_active_electrodes_mean)
     active_max = matrix_summary_values(selected_by_run.values(), summary_active_electrodes_max)
-    plot_matrix_active_electrode_lines(
+    plot_matrix_active_electrode_errorbars(
         records_by_key,
         factors_by_run_id,
         active_mean,
-        output_root,
-        image_format,
-        stat_name="mean_active_electrodes",
-        title="Mean Activated Electrodes by Grid",
-        overwrite=overwrite,
-    )
-    plot_matrix_active_electrode_lines(
-        records_by_key,
-        factors_by_run_id,
         active_max,
         output_root,
         image_format,
-        stat_name="max_active_electrodes",
-        title="Max Activated Electrodes by Grid",
         overwrite=overwrite,
     )
     shannon_mean = matrix_summary_values(selected_by_run.values(), summary_shannon_mean)

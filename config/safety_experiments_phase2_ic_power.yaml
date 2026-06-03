@@ -1,0 +1,49 @@
+defaults:
+  video: videos/SANPO/SANPOgt1min.mp4
+  source_input_label: gt
+  coords_yaml: config/coords_800um.yaml
+  preprocessing_method: groundtruth
+  amplitude_uA: 60.0
+  appearance_threshold_uA: 30.0
+  frequency_hz: 300.0
+  pulse_width_us: 170.0
+  raster_mode: none
+  ic_heat_mode: with
+
+blocks:
+  ic_power:
+    description: Compare IC power levels for the 800 um grid at 60 uA across preprocessing methods.
+    run_id_template: "{grid}__{preprocessing}__{amplitude}_{ic_power}"
+    matrix:
+      grid:
+        - label: coords_800um
+          coords_yaml: config/coords_800um.yaml
+
+      preprocessing:
+        - label: dog
+          video: videos/SANPO/SANPOdog1min.mp4
+          source_input_label: dog
+          preprocessing_method: dog
+        - label: canny
+          video: videos/SANPO/SANPOcanny1min.mp4
+          source_input_label: canny
+          preprocessing_method: canny
+        - label: gt
+          video: videos/SANPO/SANPOgt1min.mp4
+          source_input_label: gt
+          preprocessing_method: groundtruth
+
+      amplitude:
+        - label: amp_60uA
+          amplitude_uA: 60.0
+          appearance_threshold_uA: 30.0
+
+      ic_power:
+        - label: 0mW
+          internal_circuit_power_mw: 0.0
+        - label: 10mW
+          internal_circuit_power_mw: 10.0
+        - label: 20mW
+          internal_circuit_power_mw: 20.0
+        - label: 50mW
+          internal_circuit_power_mw: 50.0

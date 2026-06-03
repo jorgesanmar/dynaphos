@@ -115,8 +115,6 @@ bioheat:
   ic_source_thickness_mm: 1.7
   device_constant_power_mw: 0.0
   driver_efficiency: 0.5
-  source_area_mode: convex_hull
-  ic_source_area_mode: convex_hull
   top_heat_transfer_W_m2_K: 5.0
   T_b: 37.0
 

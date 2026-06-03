@@ -68,12 +68,12 @@ branches:
    carried forward between thermal updates so the electrical trace remains
    frame-resolved.
 
-For the 30-minute simulation videos, the final 5 minutes can be configured as
-an implant-off cooldown tail. In that tail, the runner stops decoding the black
-video frames, skips phosphene simulation and electrical safety logging, sets
-both stimulation-dependent and constant device power to zero, and advances only
-the bioheat model. This keeps the thermal cooldown trace while avoiding large
-per-electrode zero-valued electrical arrays.
+After the stimulation video ends, the runner can append a post-video thermal
+cooldown phase. During cooldown it no longer decodes video frames, runs the
+phosphene simulator, or logs electrical safety samples. Instead, it sets both
+stimulation-dependent and constant device power to zero and advances only the
+bioheat model until the peak temperature rise is back within the configured
+baseline tolerance, or until the configured maximum cooldown duration is reached.
 
 Independent protocol cases can also be run concurrently with the matrix
 runner's worker setting. Within one case, the branches share the same sampled
@@ -341,51 +341,31 @@ biphasic duty cycle:
 P_load_frame_i(t) = P_load_inst_i(t) * 2 * PW_i * f_i * relative_stim_duration
 ```
 
-This load power is not injected into the bioheat model, because the study
-deliberately disregards electrode-local Joule heating. Instead, the safety
-runner converts delivered stimulation into stimulation-dependent internal
-circuit heat and total internal-circuit heat, then advances the bioheat model
-once per simulated second by default. The model receives the mean
-internal-circuit heat power over that one-second window. The update interval can
-still be overridden in frames for performance or sensitivity checks.
+The 2D bioheat model uses this frame-level electrode-load power as the
+electrode-local Joule heat source. A separate constant internal-circuit heat
+source can also be enabled; it is spread over the electrode-grid footprint. The
+update interval can still be overridden in frames for performance or sensitivity
+checks.
 
-Temperature propagation is simulated with a coarse three-dimensional Pennes
+Temperature propagation is simulated with a coarse two-dimensional Pennes-style
 bioheat model using temperature rise above the 37 deg C baseline:
 
 ```text
-d(dT)/dt = alpha * Lap(dT) - beta * dT + Q_device / (rho * c)
+d(dT)/dt = alpha * Lap(dT) - beta * dT + Q / (rho * c)
 ```
 
-The thermal domain follows the covered-implant setup from Kim et al. 2007:
-50 mm brain, 5 mm skull, and 3 mm scalp over a 100 mm x 100 mm lateral field at
-1 mm resolution. Side and bottom boundaries are held at baseline, and the top
-scalp surface uses free convection to a zero-rise ambient boundary.
-Internal-circuit heat is placed as a uniform source over the electrode-grid
-footprint at the top of the brain, just under skull and scalp.
-Electrode-local Joule heating is no longer injected into the tissue model.
-
-The internal-circuit heat input is:
-
-```text
-Pload = sum_i(2 * Z_i * I_i^2 * pulse_width_i * frequency_i) * relative_stim_duration
-Pic_stim = Pload * (1 / driver_efficiency - 1)
-Pic_total = Pconstant + Pic_stim
-```
-
-Here `Pconstant` captures stimulation-independent device work such as reading,
-decoding, multiplexing, and background control logic. `Pic_stim` captures the
-extra IC dissipation required to drive the active stimulation channels.
+The 2D thermal domain is a single tissue sheet. Electrode-load heat is inserted
+at the nearest bioheat cell for each electrode, while internal-circuit heat is
+spread uniformly over the convex hull of the electrode grid.
 
 For every thermal sample, the runner records:
 
 - maximum temperature rise, `max_dT`;
 - mean temperature rise, `mean_dT`;
 - projected tissue area above 1, 2, and 3 deg C;
-- tissue volume above 1, 2, and 3 deg C;
-- final temperature-rise heatmaps as z-maximum projections;
-- the final source-plane map and full 3D temperature-rise volume;
-- final hotspot temperature, saved as `stationary_temperature_C` and
-  `stationary_dT_C`;
+- final temperature-rise heatmaps;
+- final hotspot temperature, saved as `final_peak_temperature_C` and
+  `final_peak_dT_C`;
 - optional CEM43 thermal dose maps and summaries when CEM43 is enabled.
 
 CEM43 is disabled by default in the common safety runs. When enabled, the runner

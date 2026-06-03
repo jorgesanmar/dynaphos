@@ -1,0 +1,324 @@
+﻿# ----------------------------------------------
+# Safety Thresholds Configuration
+# ----------------------------------------------
+# 
+# This file defines the safety limits for electrical stimulation parameters.
+# All values are validated before stimulation is applied.
+#
+# Usage:
+#   from neurolight2.safety.safety_checks import SafetyChecker
+#   checker = SafetyChecker.from_yaml("configs/safety.yaml")
+#   result = checker.validate(stim_params)
+# ----------------------------------------------
+
+# Safety Table (IrOx Utah array) - VALUES FROM THIS CONFIG
+#
+# Parameter                      Definition/Equation                           Safe Limit (This Config)                      Notes
+# Charge per phase (Q)           Q = I x PW                                    Q <= 100 nC/phase                             Primary tissue damage limit; microelectrodes use 4 nC limit instead.
+# Charge density (D)             D = Q / A_g (geometric area)                  D <= 4000 uC/cm2                              Microelectrode limit; 30 uC/cm2 is macroelectrode guideline.
+# Shannon k-value                k = log10(Q[uC]) + log10(D[uC/cm2])           k <= 1.85 (reference only)                    NOT a hard limit for microelectrodes; log and flag if exceeded.
+# Current amplitude (I)          Peak current per phase                        1 <= I <= 120 uA                              Step resolution: 1 uA (hardware DAC limit).
+# Current density (J)            J = I / A_g                                   J <= 4.0 A/cm2                                Short PW tolerates higher J; long PW + high J increases risk.
+# Pulse width (PW)               One phase duration                            50 <= PW <= 800 us                            Longer PW increases Q and interface stress for same I.
+# Frequency (f)                  Stimulation frequency                         0.5 <= f <= 300 Hz                            Higher freq increases duty cycle and thermal load.
+# Num pulses (N)                 Pulses per train                              1 <= N <= 1000                                Train duration = N / f.
+# Interphase delay               Gap between biphasic phases                   0 <= interphase <= 1000 us                    Allows electrode discharge between phases.
+# Interpulse interval            Time from pulse end to next pulse start       interpulse > 0 (no overlap)                   Calculated: period - (2xPW + interphase + offset).
+# Net DC / imbalance             Q_net = 0 over biphasic pulse                 |Q_net| = 0; leakage << 1%                    Use charge-balanced pulses, coupling caps, active balancing.
+# Electrode potential window     V_electrode vs Ag/AgCl                        -0.6 V to +0.8 V (IrOx)                       Water window depends on material; measure if possible.
+# Compliance voltage             V_needed = I x Z_load                         V_needed <= 8.0 V                             Avoid clipping; Z may vary over time; max impedance 100 kOhm.
+# Avg power (per electrode)      P_avg = I_rms^2 x R                           P <= 0.5 mW/electrode                         Heating model needed for rigor; usually not limiting for ICMS.
+# Avg power (total)              Sum across all active electrodes              P_total <= 5.0 mW                             System-wide thermal budget.
+# Temperature rise (dT)          dT = P_avg x R_th (lumped)                    dT <= 2 C above 37C                           Prefer <<1 C; needs geometry/perfusion-dependent R_th.
+# Accumulated charge (dose)      Q_acc = Sum(Q x N) over time                  Q_acc <= 1.6e-5 C/s                           ~8 electrodes x 100uA x 300Hz x 167ms duty; chronic tracking.
+#
+# Electrode geometry: 3000 um2 (3e-5 cm2); Microelectrode threshold: 2000 um2 (uses 4 nC charge limit instead of Shannon)
+# Material limits (in vivo uC/cm2): Smooth Pt=30, Porous Pt=125, IrOx/SIROF=600, TiN=90
+geometry: 
+  electrode_surface_area_cm2:  3.0e-5  # normal ranges are 500 to 4000 um diameter electrode.
+  # In Berna IJNS paper we have around 3000 um^2 as measured with electrode microscope
+  
+  # Microelectrode classification threshold
+  # Electrodes smaller than this are classified as microelectrodes
+  # and use the charge-per-phase limit (4 nC) instead of Shannon equation
+  microelectrode_area_threshold_cm2: 2.0e-5  # 2000 um2 = 2e-5 cm2
+  
+  # Microelectrode charge limit (nC/phase)
+  # For microelectrodes (<2000 um2), charge per phase is the primary safety limit
+  # Shannon equation does NOT apply to microelectrodes
+  microelectrode_charge_limit_nc: 4.0
+
+thresholds:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Rate Limiting / Watchdog
+  # ─────────────────────────────────────────────────────────────────────────────
+    
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Amplitude limits (uA)
+  # ─────────────────────────────────────────────────────────────────────────────
+  amplitude_min_ua: 1.0
+  amplitude_max_ua: 120.0
+  
+  # Amplitude resolution step (uA)
+  # Hardware DAC resolution - amplitude must be a multiple of this value
+  # Ripple Micro+Stim: 1 uA step resolution
+  amplitude_step_ua: 1.0
+  
+  # Pulse width limits (µs)
+  pulse_width_min_us: 50.0
+  pulse_width_max_us: 800.0
+  
+  # Frequency limits (Hz)
+  frequency_min_hz: 0.5
+  frequency_max_hz: 300.0
+  
+  # Number of pulses per train
+  num_pulses_min: 1
+  num_pulses_max: 1000
+  
+  # Interphase delay limits (µs)
+  interphase_min_us: 0.0
+  interphase_max_us: 1000.0
+  
+  # Offset / pre-stimulation delay limits (µs)
+  # NOTE: This upper bound is an arbitrary engineering value for current experiments.
+  # It is NOT derived from peer-reviewed literature and is intentionally set very large
+  # (effectively disabling offset upper-limit blocking in normal usage).
+  # Delay you get from camera input-perception
+  offset_min_us: 0.0
+  offset_max_us: 1000000000000.0
+  
+  # Maximum charge per phase Q = I * PW (nC)
+  # This is the primary safety limit for tissue damage prevention
+  # may change to 50 uC  
+  charge_per_phase_max_nc: 100.0
+
+  # Charge density (D) limits (uC/cm2)
+  # D = Q / A, where A is the electrode surface area in cm2
+  # we likely allow higher D for microelectrodes; indeed 4000 uC/cm2
+  # Alternatively, use the Shannon k-limit: compute k = log10(Q) + log10(D) 
+  # and require k to remain below a chosen cutoff (e.g., k < 1.85), 
+  # which indirectly enforces the trade-off between charge per phase (Q) 
+  # and charge density (D).
+  charge_density_max_uc_per_cm2: 4000.0
+
+  # Shannon k-limit cutoff
+  # k = log10(Q) + log10(D)
+  # where:
+  #   Q = charge per phase in microcoulombs (uC)
+  #   D = charge density in microcoulombs per cm^2 (uC/cm^2)
+  #
+  # Classical Shannon threshold: k = 1.85
+  # Originally derived from macroelectrode data; not an absolute safety boundary.
+  #
+  # Microelectrode and intracortical data show:
+  # - Tissue damage can occur below k = 1.85 in some cases
+  # - No damage can occur above k = 1.85 in other cases
+  #
+  # Therefore, k should be treated as a reference metric, not a hard limit.
+  # Recommended software behavior:
+  # - Compute and log k for each pulse or stimulation condition
+  # - If k consistently or significantly exceeds ~1.85,
+  #   flag the condition for review, justification, or parameter adjustment
+  #
+  # This metric enforces the trade-off between charge per phase (Q)
+  # and charge density (D), complementing explicit Q and D limits.
+  shannon_k_limit: 1.85
+
+  # Thermal (average power) check
+  # Track a moving average of dissipated power per channel and in total.
+  #
+  # For each pulse, delivered energy can be approximated as:
+  #   E_pulse ~= I^2 * R integrated over pulse duration
+  # (equivalently Q^2 * Z, depending on formulation).
+  #
+  # A simpler and conservative approximation uses average power:
+  #   P_avg = I_rms^2 * R
+  # where:
+  #   I_rms = root-mean-square current
+  #   R = electrode-tissue impedance (ohms)
+  #
+  # For pulsed stimulation:
+  #   I_rms = I_amp * sqrt(duty_cycle)
+  #
+  # Example:
+  #   I_amp = 100 uA
+  #   Frequency = 300 Hz
+  #   Pulse width = 0.2 ms per phase
+  #   Duty cycle per phase = 300 * 0.0002 = 0.06 (6%)
+  #   Biphasic pulse, non-overlapping phases -> total duty ~12%
+  #
+  #   I_rms ~= sqrt(0.12) * 100 uA ~= 34.6 uA
+  #
+  #   For R = 50 kOhm:
+  #   P_avg = (34.6e-6 A)^2 * 50,000 ohm ~= 0.06 mW per channel
+  #
+  # Power can be summed across channels to estimate total dissipation,
+  # or evaluated per channel to assess worst-case localized heating.
+  #
+  # A conservative safety guideline:
+  #   No single electrode should exceed ~0.5 mW average power
+  #   (corresponding to roughly a 2 degree C temperature rise if localized).
+  #
+  # This corresponds to I_rms ~= 100 uA on a 50 kOhm electrode.
+  # Typical intracortical stimulation regimes are well below this limit,
+  # so thermal constraints are usually not the active limiting factor.
+  thermal_power_limit_per_electrode_mw: 0.5
+  thermal_power_limit_total_mw: 5.0
+
+  # Accumulated charge over time (coulomb dosage)
+  #
+  # The total charge delivered over long
+  # time scales (seconds, hours, days)
+  # may contribute to chronic tissue effects.
+  #
+  # Lets make it equivalent to 8 electrodes 100 uA at 300Hz for 167 ms in 1 second
+  #
+  # Calculations:
+  #
+  # 1. Charge per pulse (per electrode)
+  #    Q_pulse = I * PW_total
+  #            = 100e-6 A * 0.0004 s
+  #            = 4.0e-8 C
+  #            = 40 nC
+  #
+  # 2. Number of pulses per second (during active window)
+  #    Pulses = frequency * active_time
+  #            = 300 Hz * 0.167 s
+  #            ~= 50 pulses
+  #
+  # 3. Charge per electrode per second
+  #    Q_electrode = Pulses * Q_pulse
+  #                = 50 * 40 nC
+  #                = 2000 nC
+  #                = 2.0 uC
+  #                = 2.0e-6 C
+  #
+  # 4. Total charge across 8 electrodes
+  #    Q_total = 8 * Q_electrode
+  #            = 8 * 2.0e-6 C
+  #            = 1.6e-5 C per second
+  #accumulated_charge_limit_coulombs_per_second: 1.6e-5 # original
+  accumulated_charge_limit_coulombs_per_second: 0.8e-5 # Cristina
+  
+  # Per-electrode accumulated charge rate limit (nC/s)
+  #
+  # RATIONALE: If global limit is 8 µC/s = 8000 nC/s for all electrodes,
+  # and we want to allow up to 4 electrodes stimulating at max rate simultaneously,
+  # then per-electrode limit = 8000 / 4 = 2000 nC/s = 2 µC/s
+  #
+  # CHECK: 100 nC/phase × 2 (biphasic) × 10 pulses/s = 2000 nC/s ✓
+  # This allows 10 Hz at max charge per phase, or 100 Hz at 10 nC/phase
+  accumulated_charge_per_electrode_nc_per_s: 2000.0  # 2 µC/s per electrode
+  
+  # Accumulated charge time window (ms)
+  #
+  # RATIONALE: 1 second (1000 ms) is clinically meaningful:
+  # - Captures typical burst patterns (10-100 Hz stims)  
+  # - Averages out single-pulse variations
+  # - Aligns with physiological charge dissipation timescales
+  # - Matches typical safety monitoring intervals
+  accumulated_charge_window_ms: 5000.0  # 5 seconds default
+  
+  # Accumulated power per electrode limit (mW)
+  #
+  # RATIONALE: Single-stim limit is 0.5 mW/electrode peak.
+  # For sustained average over the window, use slightly lower value (0.3 mW)
+  # to account for repeated stimulation thermal buildup.
+  accumulated_power_per_electrode_mw: 0.3
+
+  # Current density (J) limit (A/cm^2)
+  # J = I / A_g.
+  # Using electrode_surface_area_cm2 = 3e-5 cm^2 (i.e., 3000 um^2):
+  # J_max = (120e-6 A) / (3e-5 cm^2) = 4 A/cm^2.
+  current_density_max_a_per_cm2: 4.0
+
+# ----------------------------------------------
+# Chronic / Session-Level Safety Limits
+# ----------------------------------------------
+# These limits track cumulative charge over an entire experimental session,
+# independent of the sliding window. They catch scenarios where many
+# individually-safe stimulations accumulate to dangerous total doses.
+
+chronic:
+  # Maximum total charge delivered in a session (Coulombs)
+  #
+  # RATIONALE: At max global rate of 8 µC/s:
+  #   - 1 hour continuous = 8e-6 × 3600 = 28.8 mC
+  #   - Setting limit at 50 mC provides ~1.7 hour margin
+  #   - Literature suggests chronic intracortical limits in 10-100 mC range
+  #   - Conservative limit for safety during long experiments
+  session_charge_limit_c: 0.05  # 50 mC = 0.05 C
+  
+  # Maximum session duration (seconds)
+  #
+  # RATIONALE: Standard experiment duration limit.
+  # Can be extended via config for specific approved protocols.
+  session_max_duration_s: 3600.0  # 1 hour default
+  
+  # Warning threshold (fraction of limit)
+  # Trigger warning when approaching limits
+  warning_threshold_fraction: 0.8  # Warn at 80% of limit
+
+thermal: 
+  tissue_time_constant: 10.0  # seconds, for heat diffusion TBD
+  tissue_heat_capacity: 4.0   # J/C for the local tissue mass TBD
+  baseline_temp: 37.0         # C
+  max_temp_rise: 2.0         # C above baseline
+
+hardware:
+  # Compliance voltage limit (V)
+  # For each stimulation channel, estimate the required voltage as:
+  #   V_needed = I_cmd * Z + V_irreversible
+  # where:
+  #   I_cmd = commanded stimulation current (A or uA)
+  #   Z = electrode impedance (ohms)
+  #   V_irreversible = allowance for electrode polarization / interface effects
+  #
+  # The V_irreversible term reflects electrode overpotential.
+  # To remain within the water window, electrode potential is often kept
+  # below ~0.6 V, meaning the stimulator should not be forced to drive
+  # beyond this plus any resistive voltage drop.
+  #
+  # In practice, a simpler and conservative rule is used:
+  #   I_cmd * Z < V_compliance_margin
+  #
+  # The compliance margin is set below the device's absolute compliance
+  # voltage to provide headroom and avoid saturation.
+  # Example:
+  #   Device compliance voltage: 10 V
+  #   Chosen compliance margin: 8 V
+  #
+  # Example calculation:
+  #   If Z = 60 kOhm,
+  #   I_max = 8 V / 60000 ohm = 133 uA
+  #
+  # In practice, this limit is typically redundant because I_cmd
+  # is already capped by charge-per-phase and safety rules,
+  # but this check ensures no channel enters voltage compliance.
+  compliance_voltage_limit_v: 8.0 # This will need to actually be checked per-channel and using real data
+  #
+  # Electrode impedance limit (ohms)
+  # We will not use electrodes with excessively high impedance,
+  # as they may indicate poor contact, damage, or other issues.
+  max_electrode_impedance_ohm: 100000.0  # 100 kOhm
+
+# ----------------------------------------------
+# Electrode Material Charge Injection Limits
+# ----------------------------------------------
+# Maximum reversible charge injection capacity varies by electrode material.
+# In vivo values are typically 2-10x lower than in vitro measurements.
+#
+# Material        In Vitro (uC/cm2)   In Vivo (uC/cm2)
+# Smooth Pt       35-100              ~10-50
+# Porous Pt       ~1000               ~125
+# SIROF/IrOx      ~3500               ~350-900
+# TiN             ~900                Unknown (~90 conservative)
+
+electrode_materials:
+  # In vivo charge density limits (uC/cm2)
+  # Use conservative estimates for safety
+  smooth_pt: 30       # Smooth platinum
+  porous_pt: 125      # Porous platinum
+  irox: 600           # Iridium oxide (SIROF)
+  tin: 90             # Titanium nitride (conservative estimate)

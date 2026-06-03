@@ -14,7 +14,7 @@ Canonical entry points now live under:
 - `tools/electrode_grid/visualize_electrode_grid.py`
 - `tools/phosphenes/render_image.py`
 - `tools/phosphenes/render_video.py`
-- `tools/safety/run_experiment_matrix.py`
+- `tools/safety/run_phase1.py`
 - `tools/safety/visualize.py`
 
 Reusable implementation code lives in `dynaphos/`, especially

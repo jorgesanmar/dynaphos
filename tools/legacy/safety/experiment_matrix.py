@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from itertools import product
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import yaml
 
-from dynaphos.safety.io import (
+from tools.safety.common import (
     PROJECT_ROOT,
     SimulationCase,
     normalize_raster_mode,
@@ -14,7 +13,7 @@ from dynaphos.safety.io import (
 )
 
 
-DEFAULT_MATRIX_CONFIG = PROJECT_ROOT / "config" / "safety_experiments_phase1.yaml"
+DEFAULT_MATRIX_CONFIG = PROJECT_ROOT / "config" / "safety_experiments.yaml"
 
 
 def load_experiment_matrix(path: str | Path = DEFAULT_MATRIX_CONFIG) -> dict:
@@ -45,63 +44,6 @@ def _float_value(values: dict, key: str) -> float:
     return float(values[key])
 
 
-def _optional_int_value(values: dict, key: str) -> int | None:
-    if key not in values or values[key] is None:
-        return None
-    return int(values[key])
-
-
-def _matrix_axis_variants(axis_name: str, axis_cfg: Sequence[dict] | dict) -> list[tuple[str, dict]]:
-    variants: list[tuple[str, dict]] = []
-    if isinstance(axis_cfg, dict):
-        iterable = axis_cfg.items()
-    else:
-        iterable = enumerate(axis_cfg or [], start=1)
-
-    for fallback_label, raw_variant in iterable:
-        variant = dict(raw_variant or {})
-        label = str(variant.pop("label", fallback_label))
-        if not label:
-            raise ValueError(f"Empty label in matrix axis '{axis_name}'.")
-        variants.append((label, variant))
-
-    if not variants:
-        raise ValueError(f"Matrix axis '{axis_name}' must contain at least one variant.")
-    return variants
-
-
-def _expand_matrix_cases(block_cfg: dict) -> list[dict]:
-    matrix_cfg = block_cfg.get("matrix", None)
-    if not matrix_cfg:
-        return []
-    if not isinstance(matrix_cfg, dict):
-        raise ValueError("Experiment block 'matrix' must be a mapping of axis names to variants.")
-
-    axis_names = list(matrix_cfg.keys())
-    axis_variants = [
-        _matrix_axis_variants(axis_name, matrix_cfg[axis_name])
-        for axis_name in axis_names
-    ]
-    run_id_template = str(block_cfg.get("run_id_template", "__".join(f"{{{axis}}}" for axis in axis_names)))
-
-    cases: list[dict] = []
-    for combination in product(*axis_variants):
-        values: dict = {}
-        labels: dict[str, str] = {}
-        metadata: dict[str, object] = {}
-        for axis_name, (label, variant_values) in zip(axis_names, combination):
-            labels[axis_name] = label
-            values.update(variant_values)
-            metadata[f"{axis_name}_label"] = label
-
-        values["run_id"] = run_id_template.format(**labels)
-        if metadata:
-            values["metadata"] = {**metadata, **dict(values.get("metadata", {}) or {})}
-        cases.append(values)
-
-    return cases
-
-
 def _case_from_values(block_name: str, block_cfg: dict, values: dict) -> SimulationCase:
     metadata = dict(values.get("metadata", {}) or {})
     metadata.setdefault("experiment_block", block_name)
@@ -122,7 +64,6 @@ def _case_from_values(block_name: str, block_cfg: dict, values: dict) -> Simulat
         frequency_hz=_float_value(values, "frequency_hz"),
         pulse_width_us=_float_value(values, "pulse_width_us"),
         raster_mode=raster_mode,
-        raster_groups=_optional_int_value(values, "raster_groups"),
         appearance_threshold_uA=_float_value(values, "appearance_threshold_uA"),
         source_input_label=str(values.get("source_input_label", values["preprocessing_method"])),
         internal_circuit_power_mw=_float_value(values, "internal_circuit_power_mw"),
@@ -155,11 +96,7 @@ def build_cases(
     seen_run_ids: set[str] = set()
     for block_name in block_names:
         block_cfg = block_cfgs[block_name] or {}
-        raw_cases = [
-            *_expand_matrix_cases(block_cfg),
-            *(block_cfg.get("cases", []) or []),
-        ]
-        for raw_case in raw_cases:
+        for raw_case in block_cfg.get("cases", []) or []:
             values = {**defaults, **(raw_case or {})}
             if "run_id" not in values:
                 raise ValueError(f"Missing run_id in safety experiment block '{block_name}'.")

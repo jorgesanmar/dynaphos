@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import gc
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -18,14 +17,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dynaphos.safety import runner as simulation_runner
+from tools.safety import simulation_runner
 
 
 DEFAULT_PARAMS = "config/params.yaml"
 DEFAULT_SAFETY = "config/safety.yaml"
 DEFAULT_OUTPUT_ROOT = "results/safety/simulation_pipeline"
-DEFAULT_VISUALS_ROOT = "results/safety/simulation_pipeline/visuals"
-GROUNDTRUTH_VIDEO = "videos/SANPO/SANPO25min.mp4"
+DEFAULT_VISUALS_ROOT = "results/safety/simulation_pipeline_visuals"
+GROUNDTRUTH_VIDEO = "videos/SANPO/SANPOgt30min.mp4"
 DOG_VIDEO = "videos/preprocessed/SANPO/dog/preprocessed.mp4"
 CANNY_VIDEO = "videos/preprocessed/SANPO/canny/preprocessed.mp4"
 STANDARD_GRID = "config/coords_800um.yaml"
@@ -63,7 +62,6 @@ class SimulationCase:
     frequency_hz: float = STANDARD_FREQUENCY_HZ
     pulse_width_us: float = STANDARD_PULSE_WIDTH_US
     raster_mode: str = "none"
-    raster_groups: int | None = None
     appearance_threshold_uA: float | None = None
     source_input_label: str = "SANPO_groundtruth"
     internal_circuit_power_mw: float = 0.0
@@ -87,13 +85,6 @@ def sanitize_path_part(value: object) -> str:
     text = str(value)
     safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text)
     return safe.strip("._") or "item"
-
-
-def case_raster_groups(case: SimulationCase, fallback_groups: int) -> int:
-    groups = int(fallback_groups if case.raster_groups is None else case.raster_groups)
-    if groups <= 0:
-        raise ValueError(f"Raster groups must be > 0, got {groups}.")
-    return groups
 
 
 def configure_device(params: dict, *, force_cpu: bool = False) -> torch.device:
@@ -134,8 +125,6 @@ def write_manifest(
     max_frames: int,
     groups: int,
     phosphene_mode: str,
-    cooldown_seconds: float,
-    cooldown_baseline_tolerance_C: float,
     enable_cem43: bool,
 ) -> None:
     manifest = {
@@ -162,8 +151,6 @@ def write_manifest(
         "max_frames": int(max_frames),
         "metadata": dict(case.metadata),
         "phosphene_mode": str(phosphene_mode),
-        "cooldown_seconds": float(cooldown_seconds),
-        "cooldown_baseline_tolerance_C": float(cooldown_baseline_tolerance_C),
         "enable_cem43": bool(enable_cem43),
     }
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -198,41 +185,16 @@ def add_common_cli(parser: argparse.ArgumentParser) -> None:
         "--thermal-update-interval-frames",
         type=int,
         default=None,
-        help=(
-            "Maximum thermal-only cooldown batch size in video frames. Stimulation bioheat "
-            "updates every video frame."
-        ),
-    )
-    parser.add_argument(
-        "--cooldown-seconds",
-        type=float,
-        default=300.0,
-        help=(
-            "After the input video ends, continue thermal-only cooling with "
-            "all device power off for up to this many seconds."
-        ),
-    )
-    parser.add_argument(
-        "--cooldown-baseline-tolerance-C",
-        "--cooldown-baseline-tolerance-c",
-        dest="cooldown_baseline_tolerance_C",
-        type=float,
-        default=1e-3,
-        help=(
-            "Stop post-video cooling early when the peak temperature rise "
-            "across all thermal grids is at or below this value."
-        ),
+        help="Update the bioheat model every N video frames instead of every frame/window default.",
     )
     parser.add_argument("--preview-seconds", type=float, default=0.0)
     parser.add_argument(
         "--preview-policy",
-        choices=("all", "none", "worst-case", "standard", "matrix-representative"),
+        choices=("all", "none", "worst-case", "standard"),
         default="all",
         help=(
             "Choose which cases write phosphene preview MP4s. This does not "
-            "change simulation or saved safety metrics. matrix-representative "
-            "renders the standard-amplitude grid/preprocessing plane plus a "
-            "single-grid amplitude check."
+            "change simulation or saved safety metrics."
         ),
     )
     parser.add_argument(
@@ -261,7 +223,7 @@ def iter_case_lines(cases: Iterable[SimulationCase]) -> Iterable[str]:
             f"amp={case.amplitude_uA:g}uA freq={case.frequency_hz:g}Hz "
             f"pw={case.pulse_width_us:g}us threshold="
             f"{'default' if case.appearance_threshold_uA is None else f'{case.appearance_threshold_uA:g}uA'} "
-            f"raster={case.raster_mode} groups={case.raster_groups if case.raster_groups is not None else 'cli'} "
+            f"raster={case.raster_mode} "
             f"ic={case.internal_circuit_power_mw:g}mW"
         )
 
@@ -283,26 +245,6 @@ def should_write_preview(case: SimulationCase, preview_policy: str, preview_seco
             and float(case.frequency_hz) == STANDARD_FREQUENCY_HZ
             and float(case.pulse_width_us) == STANDARD_PULSE_WIDTH_US
         )
-    if policy == "matrix-representative":
-        is_standard_protocol = (
-            float(case.frequency_hz) == STANDARD_FREQUENCY_HZ
-            and float(case.pulse_width_us) == STANDARD_PULSE_WIDTH_US
-        )
-        if not is_standard_protocol:
-            return False
-
-        is_standard_amplitude = float(case.amplitude_uA) == STANDARD_AMPLITUDE_UA
-        if case.block != "amplitude_grid_preprocessing":
-            return is_standard_amplitude
-
-        grid_label = str((case.metadata or {}).get("grid_label", Path(case.coords_yaml).stem)).strip().lower()
-        source_label = str(
-            (case.metadata or {}).get("preprocessing_label", case.source_input_label)
-        ).strip().lower()
-        preprocessing_method = str(case.preprocessing_method).strip().lower()
-        is_groundtruth = source_label in {"gt", "groundtruth"} or preprocessing_method == "groundtruth"
-        is_amplitude_check_grid = grid_label in {"coords_1200um", "1200um"}
-        return is_standard_amplitude or (is_amplitude_check_grid and is_groundtruth)
     raise ValueError(f"Unsupported preview policy: {preview_policy}")
 
 
@@ -323,7 +265,6 @@ def run_one_case(
     out_dir = output_root / case.block / sanitize_path_part(case.run_id)
     preview_dir = visuals_root / case.block / sanitize_path_part(case.run_id)
     params, stimulus_scale = build_params_for_case(base_params, case, safety_yaml)
-    groups = case_raster_groups(case, int(args_dict["groups"]))
     sim_resolution = args_dict.get("sim_resolution")
     if sim_resolution is not None:
         sim_resolution = int(sim_resolution)
@@ -338,10 +279,8 @@ def run_one_case(
         safety_yaml=safety_yaml,
         output_root=output_root,
         max_frames=int(args_dict["max_frames"]),
-        groups=groups,
+        groups=int(args_dict["groups"]),
         phosphene_mode=str(args_dict["phosphene_mode"]),
-        cooldown_seconds=float(args_dict["cooldown_seconds"]),
-        cooldown_baseline_tolerance_C=float(args_dict["cooldown_baseline_tolerance_C"]),
         enable_cem43=bool(args_dict["enable_cem43"]),
     )
     preview_seconds = (
@@ -355,40 +294,31 @@ def run_one_case(
         f"amp={case.amplitude_uA:g} uA | freq={case.frequency_hz:g} Hz | "
         f"pw={case.pulse_width_us:g} us | threshold="
         f"{'default' if case.appearance_threshold_uA is None else f'{case.appearance_threshold_uA:g} uA'} | "
-        f"raster={case.raster_mode} groups={groups} | "
-        f"ic={case.internal_circuit_power_mw:g} mW | preview={preview_seconds:g}s | "
-        f"cooldown={float(args_dict['cooldown_seconds']):g}s"
+        f"raster={case.raster_mode} | "
+        f"ic={case.internal_circuit_power_mw:g} mW | preview={preview_seconds:g}s"
     )
-    try:
-        simulation_runner.run_one_mode(
-            params=params,
-            coords_yaml=resolve_repo_path(case.coords_yaml),
-            video_path=resolve_repo_path(case.video),
-            mode_out_dirs={case.ic_heat_mode: out_dir},
-            preview_out_dirs={case.ic_heat_mode: preview_dir},
-            preprocessing_method=case.preprocessing_method,
-            stim_scale=None,
-            stimulus_scale_base=stimulus_scale,
-            raster_name=case.raster_mode,
-            appearance_threshold_uA=case.appearance_threshold_uA,
-            groups=groups,
-            max_frames=int(args_dict["max_frames"]),
-            internal_circuit_power_mw=float(case.internal_circuit_power_mw),
-            preview_seconds=preview_seconds,
-            snapshot_interval_s=5.0,
-            save_every_n_frames=args_dict["save_every_n_frames"],
-            thermal_update_interval_frames=args_dict["thermal_update_interval_frames"],
-            cooldown_seconds=float(args_dict["cooldown_seconds"]),
-            cooldown_baseline_tolerance_C=float(args_dict["cooldown_baseline_tolerance_C"]),
-            phosphene_mode=str(args_dict["phosphene_mode"]),
-            enable_cem43=bool(args_dict["enable_cem43"]),
-            track_electrical=bool(args_dict.get("track_electrical", True)),
-            device=device,
-        )
-    finally:
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    simulation_runner.run_one_mode(
+        params=params,
+        coords_yaml=resolve_repo_path(case.coords_yaml),
+        video_path=resolve_repo_path(case.video),
+        mode_out_dirs={case.ic_heat_mode: out_dir},
+        preview_out_dirs={case.ic_heat_mode: preview_dir},
+        preprocessing_method=case.preprocessing_method,
+        stim_scale=None,
+        stimulus_scale_base=stimulus_scale,
+        raster_name=case.raster_mode,
+        appearance_threshold_uA=case.appearance_threshold_uA,
+        groups=int(args_dict["groups"]),
+        max_frames=int(args_dict["max_frames"]),
+        internal_circuit_power_mw=float(case.internal_circuit_power_mw),
+        preview_seconds=preview_seconds,
+        snapshot_interval_s=5.0,
+        save_every_n_frames=args_dict["save_every_n_frames"],
+        thermal_update_interval_frames=args_dict["thermal_update_interval_frames"],
+        phosphene_mode=str(args_dict["phosphene_mode"]),
+        enable_cem43=bool(args_dict["enable_cem43"]),
+        device=device,
+    )
     print(f"saved: {out_dir}")
     return out_dir
 
@@ -403,21 +333,7 @@ def run_cases(cases: list[SimulationCase], args: argparse.Namespace) -> None:
         raise ValueError(f"This pipeline must use config/safety.yaml, got: {safety_yaml}")
 
     if args.dry_run:
-        preview_count = sum(
-            1
-            for case in cases
-            if should_write_preview(case, str(args.preview_policy), float(args.preview_seconds))
-        )
         print(f"Planned simulations: {len(cases)}")
-        print(
-            f"Planned phosphene previews: {preview_count} "
-            f"(policy={args.preview_policy}, seconds={float(args.preview_seconds):g})"
-        )
-        print(
-            "Post-video thermal cooldown: "
-            f"{float(args.cooldown_seconds):g}s max, "
-            f"baseline tolerance={float(args.cooldown_baseline_tolerance_C):g} C"
-        )
         for line in iter_case_lines(cases):
             print(line)
         return
@@ -433,13 +349,10 @@ def run_cases(cases: list[SimulationCase], args: argparse.Namespace) -> None:
         "save_every_n_frames": args.save_every_n_frames,
         "sim_resolution": args.sim_resolution,
         "thermal_update_interval_frames": args.thermal_update_interval_frames,
-        "cooldown_seconds": float(args.cooldown_seconds),
-        "cooldown_baseline_tolerance_C": float(args.cooldown_baseline_tolerance_C),
         "preview_seconds": float(args.preview_seconds),
         "preview_policy": str(args.preview_policy),
         "force_cpu": bool(args.force_cpu),
         "enable_cem43": bool(args.enable_cem43),
-        "track_electrical": bool(getattr(args, "track_electrical", True)),
     }
     workers = int(args.workers)
     if workers <= 0:
@@ -454,9 +367,6 @@ def run_cases(cases: list[SimulationCase], args: argparse.Namespace) -> None:
             print("Using device: cpu")
         for index, case in enumerate(cases, start=1):
             run_one_case(index, len(cases), case, args_dict)
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
         return
 
     print(
@@ -491,7 +401,6 @@ def load_safety_limits(safety_yaml: str | Path = DEFAULT_SAFETY) -> dict[str, fl
     acc_limits = acc.get("limits", {}) or {}
     temp = guidelines.get("temperature", {}) or {}
     temp_inc = temp.get("temperature_increase", {}) or {}
-    chronic = cfg.get("chronic", {}) or {}
     return {
         "charge_per_phase_nC": float((guidelines.get("charge_per_phase", {}) or {}).get("value", np.inf)),
         "window_charge_per_electrode_nC": safety_value_to_nC(
@@ -512,7 +421,6 @@ def load_safety_limits(safety_yaml: str | Path = DEFAULT_SAFETY) -> dict[str, fl
             (temp_inc.get("absolute_max_temperature_increase", {}) or {}).get("value", np.inf)
         ),
         "cem43_min": float((temp.get("cem43", {}) or {}).get("value", np.inf)),
-        "session_charge_limit_mC": float(chronic.get("session_charge_limit_c", np.inf)) * 1e3,
     }
 
 
@@ -543,15 +451,10 @@ def scalar_value(data: dict[str, np.ndarray], key: str, default: float = np.nan)
 def derive_frame_charge_per_electrode_nC(data: dict[str, np.ndarray]) -> np.ndarray | None:
     if "frame_charge_per_electrode_nC" in data:
         return np.asarray(data["frame_charge_per_electrode_nC"], dtype=np.float64)
-    amplitude_key = (
-        "amplitude_per_electrode_uA"
-        if "amplitude_per_electrode_uA" in data
-        else "current_amplitude_per_electrode_uA"
-    )
-    required = (amplitude_key, "pulse_width_s", "pulse_frequency_hz", "fps")
+    required = ("current_amplitude_per_electrode_uA", "pulse_width_s", "pulse_frequency_hz", "fps")
     if any(key not in data for key in required):
         return None
-    amplitude = np.asarray(data[amplitude_key], dtype=np.float64)
+    amplitude = np.asarray(data["current_amplitude_per_electrode_uA"], dtype=np.float64)
     pulse_width = np.asarray(data["pulse_width_s"], dtype=np.float64).reshape(-1)
     frequency = np.asarray(data["pulse_frequency_hz"], dtype=np.float64).reshape(-1)
     fps = scalar_value(data, "fps")
@@ -597,26 +500,12 @@ def score_safety_metrics(npz_path: Path, limits: dict[str, float]) -> tuple[floa
         if "window_charge_per_electrode_nC" in data
         else max_rolling_charge_per_electrode_nC(data, scalar_value(data, "charge_window_s", 5.0))
     )
-    if "amplitude_per_electrode_uA" in data:
-        amplitude = np.asarray(data["amplitude_per_electrode_uA"], dtype=np.float64)
-    else:
-        amplitude = np.asarray(data.get("current_amplitude_per_electrode_uA", []), dtype=np.float64)
-    if amplitude.ndim == 2:
-        active_count = float(np.nanmax(np.sum(amplitude > 0.0, axis=1))) if amplitude.size else 0.0
-    elif amplitude.ndim == 1 and amplitude.size:
-        active_count = float(np.count_nonzero(amplitude > 0.0))
-    else:
-        active_count = scalar_max(data, "active_count")
     ratios = {
-        "charge_per_phase": (
-            scalar_max(data, "charge_per_phase_per_electrode_nC")
-            if "charge_per_phase_per_electrode_nC" in data
-            else scalar_max(data, "peak_charge_per_phase_nC_exact")
-        ) / limits["charge_per_phase_nC"],
+        "charge_per_phase": scalar_max(data, "peak_charge_per_phase_nC_exact") / limits["charge_per_phase_nC"],
         "window_charge_per_electrode": window_charge_per_electrode_nC / limits["window_charge_per_electrode_nC"],
         "window_charge_total": scalar_max(data, "window_charge_total_nC") / limits["window_charge_total_nC"],
         "active_percentage": (
-            100.0 * active_count / float(electrode_count)
+            100.0 * scalar_max(data, "active_count") / float(electrode_count)
         ) / limits["simultaneous_activation_pct"],
         "temperature": scalar_max(data, "max_dT") / limits["temperature_increase_C"],
         "cem43": scalar_max(data, "max_cem43") / limits["cem43_min"],
@@ -651,7 +540,6 @@ def load_case_from_manifest(manifest_path: Path, *, block: str, run_id: str) -> 
         frequency_hz=float(manifest["frequency_hz"]),
         pulse_width_us=float(manifest["pulse_width_us"]),
         raster_mode="random",
-        raster_groups=int(manifest["raster_groups"]) if manifest.get("raster_groups", None) is not None else None,
         appearance_threshold_uA=(
             None
             if manifest.get("appearance_threshold_uA", None) is None

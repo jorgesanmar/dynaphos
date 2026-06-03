@@ -1,0 +1,51 @@
+defaults:
+  video: videos/SANPO/SANPOgt25min.mp4
+  source_input_label: ground truth
+  coords_yaml: config/coords_800um.yaml
+  preprocessing_method: gt
+  amplitude_uA: 60.0
+  appearance_threshold_uA: 30.0
+  frequency_hz: 300.0
+  pulse_width_us: 170.0
+  raster_mode: none
+  # Matches bioheat.device_constant_power_mw in config/params.yaml.
+  internal_circuit_power_mw: 0.0
+  ic_heat_mode: with
+
+blocks:
+  amplitude_grid_preprocessing:
+    description: Run every amplitude, electrode-grid, and preprocessing combination with fixed internal circuit power.
+    run_id_template: "{grid}__{preprocessing}__{amplitude}"
+    matrix:
+      amplitude:
+        - label: amp_10uA
+          amplitude_uA: 10.0
+          appearance_threshold_uA: 5.0
+        - label: amp_60uA
+          amplitude_uA: 60.0
+          appearance_threshold_uA: 30.0
+        - label: amp_120uA
+          amplitude_uA: 120.0
+          appearance_threshold_uA: 60.0
+
+      grid:
+        - label: coords_400um
+          coords_yaml: config/coords_400um.yaml
+        - label: coords_800um
+          coords_yaml: config/coords_800um.yaml
+        - label: coords_1200um
+          coords_yaml: config/coords_1200um.yaml
+
+      preprocessing:
+        - label: dog
+          video: videos/SANPO/SANPOdog25min.mp4
+          source_input_label: dog
+          preprocessing_method: dog
+        - label: canny
+          video: videos/SANPO/SANPOcanny25min.mp4
+          source_input_label: canny
+          preprocessing_method: canny
+        - label: gt
+          video: videos/SANPO/SANPO25min.mp4
+          source_input_label: gt
+          preprocessing_method: groundtruth

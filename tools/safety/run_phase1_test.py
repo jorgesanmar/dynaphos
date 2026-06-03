@@ -8,14 +8,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dynaphos.safety.io import add_common_cli, resolve_repo_path, run_cases
+from dynaphos.safety import visualize
 from dynaphos.safety.experiments import (
-    DEFAULT_MATRIX_CONFIG,
     available_blocks,
     build_cases,
     normalize_block_selection,
 )
-from dynaphos.safety import visualize
+from dynaphos.safety.io import add_common_cli, resolve_repo_path, run_cases
+
+
+DEFAULT_PHASE1_CONFIG = PROJECT_ROOT / "config" / "safety_experiments_phase1.yaml"
+DEFAULT_OUTPUT_ROOT = "results/safety/simulation_pipeline_test"
+DEFAULT_VISUALS_ROOT = "results/safety/simulation_pipeline_test/visuals"
+DEFAULT_BLOCKS = ("amplitude_grid_preprocessing",)
 
 
 def run_visualizer(args: argparse.Namespace) -> None:
@@ -31,35 +36,46 @@ def run_visualizer(args: argparse.Namespace) -> None:
     visualize.set_plot_safety_limits(visualize.load_safety_limits(safety_yaml))
     comparative_root = output_root / "comparative_visuals"
     visualize.write_summary_csv(records, output_root)
-    visualize.plot_ratio_breakdown(records, comparative_root, "png", overwrite=True)
-    visualize.plot_all_block_summaries(records, comparative_root, "png", overwrite=True)
     visualize.plot_comparative_suites(records, comparative_root, "png", overwrite=True)
     visualize.write_single_case_overviews(records, "png", overwrite=True, output_root=output_root)
     visualize.write_per_protocol_visuals(records, "png", overwrite=True, output_root=output_root)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a declarative safety experiment matrix.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the phase-1 SANPO 1-minute safety matrix into a separate "
+            "simulation_pipeline_test output tree, with no post-video cooling."
+        )
+    )
     add_common_cli(parser)
     parser.set_defaults(
+        output_root=DEFAULT_OUTPUT_ROOT,
+        visuals_root=DEFAULT_VISUALS_ROOT,
         preview_seconds=0.0,
         preview_policy="none",
         phosphene_mode="safety_centers",
-        implant_off_tail_seconds=300.0,
+        cooldown_seconds=0.0,
+        cooldown_baseline_tolerance_C=1e-3,
     )
     parser.add_argument(
         "--matrix-config",
-        default=str(DEFAULT_MATRIX_CONFIG),
-        help="YAML file defining safety experiment defaults and block cases.",
+        default=str(DEFAULT_PHASE1_CONFIG),
+        help="YAML file defining the quick phase-1 SANPO test cases.",
     )
     parser.add_argument(
         "--blocks",
         nargs="+",
-        default=None,
+        default=list(DEFAULT_BLOCKS),
         help=(
-            "Optional experiment blocks to run. Values may be space or comma separated. "
-            f"Available in the default config: {', '.join(available_blocks(DEFAULT_MATRIX_CONFIG))}."
+            "Experiment blocks to run. Values may be space or comma separated. "
+            f"Available in the default config: {', '.join(available_blocks(DEFAULT_PHASE1_CONFIG))}."
         ),
+    )
+    parser.add_argument(
+        "--skip-visualizer",
+        action="store_true",
+        help="Only write safety_metrics.npz outputs; skip summary and plot generation.",
     )
     return parser.parse_args()
 
@@ -71,7 +87,7 @@ def main() -> None:
         matrix_path=args.matrix_config,
     )
     run_cases(cases, args)
-    if not args.dry_run:
+    if not args.dry_run and not args.skip_visualizer:
         run_visualizer(args)
 
 

@@ -28,12 +28,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from dynaphos import cortex_models, utils
-from dynaphos.safety.bioheat import Bioheat2D
-from dynaphos.safety.impedance import Impedance, compute_frame_power
-from dynaphos.safety.tracking import SafetyTracker
-from dynaphos.simulator import GaussianSimulator, apply_appearance_threshold, compute_raster_timing
+from dynaphos.simulator import Bioheat2D, GaussianSimulator
 from dynaphos.utils import Map
-from dynaphos.pipeline import (
+from tools.phosphenes.visualize_phosphene_representation import (
     build_comparison_frame,
     open_video_writer,
     render_phosphene_frame_from_state,
@@ -56,17 +53,10 @@ RASTER_MODE_ALIASES = {
 }
 VALID_IC_HEAT_MODES = ("with", "without")
 VALID_PHOSPHENE_MODES = ("safety_centers", "visual")
-HEATMAP_SNAPSHOT_PERCENT_STEP = 5
-HEATMAP_SNAPSHOT_COUNT = 100 // HEATMAP_SNAPSHOT_PERCENT_STEP
+HEATMAP_SNAPSHOT_COUNT = 20
 HEATMAP_UPDATE_INTERVAL_FRAMES = 10
-HEATMAP_SNAPSHOT_FRACTIONS = (
-    np.arange(
-        HEATMAP_SNAPSHOT_PERCENT_STEP,
-        100 + HEATMAP_SNAPSHOT_PERCENT_STEP,
-        HEATMAP_SNAPSHOT_PERCENT_STEP,
-        dtype=np.float64,
-    )
-    / 100.0
+HEATMAP_SNAPSHOT_FRACTIONS = np.linspace(
+    0.05, 1.0, num=HEATMAP_SNAPSHOT_COUNT, dtype=np.float64
 )
 
 
@@ -153,48 +143,9 @@ def resolve_appearance_threshold_a(params: dict, appearance_threshold_uA: float 
     return threshold_uA * 1e-6
 
 
-def activation_threshold_from_current_threshold(params: dict, threshold_a: float) -> float:
-    """Convert a current threshold into the simulator activation-threshold units."""
-    threshold_a = float(threshold_a)
-    if threshold_a < 0.0:
-        raise ValueError(f"threshold_a must be >= 0, got {threshold_a}.")
-
-    default_stim = params.get("default_stim", {}) or {}
-    pulse_width_s = float(default_stim.get("pw_default", 0.0))
-    frequency_hz = float(default_stim.get("freq_default", 0.0))
-    relative_stim_duration = float(default_stim.get("relative_stim_duration", 1.0))
-    if pulse_width_s < 0.0:
-        raise ValueError(f"default_stim.pw_default must be >= 0, got {pulse_width_s}.")
-    if frequency_hz < 0.0:
-        raise ValueError(f"default_stim.freq_default must be >= 0, got {frequency_hz}.")
-    if relative_stim_duration < 0.0:
-        raise ValueError(
-            "default_stim.relative_stim_duration must be >= 0, "
-            f"got {relative_stim_duration}."
-        )
-
-    activation_input = threshold_a * pulse_width_s * frequency_hz * relative_stim_duration
-    temporal = params.get("temporal_dynamics", {}) or {}
-    decay_per_second = float(temporal.get("activation_decay_per_second", 1.0))
-    if decay_per_second <= 0.0:
-        raise ValueError(
-            "temporal_dynamics.activation_decay_per_second must be > 0, "
-            f"got {decay_per_second}."
-        )
-    decay_rate = -float(np.log(decay_per_second))
-    if decay_rate <= 0.0:
-        return activation_input
-    return activation_input / decay_rate
-
-
-def apply_adaptive_activation_threshold(params: dict, current_threshold_a: float) -> float:
-    activation_threshold = activation_threshold_from_current_threshold(params, current_threshold_a)
-    thresholding = params.setdefault("thresholding", {})
-    thresholding["activation_threshold"] = float(activation_threshold)
-    thresholding["activation_threshold_sd"] = 0.0
-    return float(activation_threshold)
-
-
+def apply_appearance_threshold(stim_raw: torch.Tensor, threshold_a: float) -> torch.Tensor:
+    threshold = torch.as_tensor(float(threshold_a), dtype=stim_raw.dtype, device=stim_raw.device)
+    return torch.where(stim_raw >= threshold, stim_raw, torch.zeros_like(stim_raw))
 
 
 def sanitize_path_part(name: str) -> str:
@@ -236,13 +187,6 @@ def percentile_tensor_from_tensor_list(values: list[torch.Tensor], percentile: f
     return torch.kthvalue(merged, k).values
 
 
-def thermal_projection(value: torch.Tensor) -> torch.Tensor:
-    """Return the 2D map used for summary heatmaps from a 2D or 3D solver state."""
-    if value.ndim == 3:
-        return value.max(dim=0).values
-    return value
-
-
 # Input discovery helpers.
 def resolve_video_inputs(video_arg: str) -> list[Path]:
     video_path = Path(video_arg)
@@ -262,16 +206,20 @@ def resolve_video_inputs(video_arg: str) -> list[Path]:
 
 
 def resolve_preprocessed_video_inputs(video_dir: Path) -> list[Path]:
-    video_paths = []
-    for path in sorted(video_dir.rglob("*")):
-        if (
-            not path.is_file()
-            or path.suffix.lower() not in VIDEO_EXTENSIONS
-        ):
-            continue
-        _base_stem, detected_method = describe_preprocessed_video_path(path)
-        if detected_method in VALID_PREPROCESS_METHODS:
-            video_paths.append(path.resolve())
+    # Prefer the nested export layout produced by the preprocessing pipeline.
+    nested_paths = sorted(
+        path.resolve()
+        for path in video_dir.rglob("preprocessed.mp4")
+        if path.is_file() and path.parent.name.lower() in VALID_PREPROCESS_METHODS
+    )
+    if nested_paths:
+        return nested_paths
+
+    video_paths = sorted(
+        path.resolve()
+        for path in video_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+    )
     if not video_paths:
         raise RuntimeError(f"No preprocessed video files found in input directory: {video_dir}")
     return video_paths
@@ -334,6 +282,10 @@ def split_preprocessed_video_stem(stem: str) -> tuple[str, str | None]:
 
 
 def describe_preprocessed_video_path(video_path: Path) -> tuple[str, str | None]:
+    if video_path.stem.lower() == "preprocessed":
+        method = video_path.parent.name.lower()
+        if method in VALID_PREPROCESS_METHODS:
+            return video_path.parent.parent.name, method
     return split_preprocessed_video_stem(video_path.stem)
 
 
@@ -380,8 +332,15 @@ def resolve_preprocessed_video_runs(
         ]
 
     candidate_roots = []
-    # Search close-by side-by-side variants first, then fall back to the standard repo folder.
-    for candidate_root in [video_path.parent, (PROJECT_ROOT / "videos").resolve()]:
+    nested_root = None
+    if (
+        video_path.stem.lower() == "preprocessed"
+        and video_path.parent.name.lower() in VALID_PREPROCESS_METHODS
+        and video_path.parent.parent != video_path.parent
+    ):
+        nested_root = video_path.parent.parent.parent
+    # Search close-by variants first, then fall back to the standard repo folder.
+    for candidate_root in [nested_root, video_path.parent, (PROJECT_ROOT / "videos" / "preprocessed").resolve()]:
         if candidate_root is not None and candidate_root not in candidate_roots:
             candidate_roots.append(candidate_root)
 
@@ -392,6 +351,11 @@ def resolve_preprocessed_video_runs(
     for method in requested_methods:
         found_path = None
         for candidate_root in candidate_roots:
+            nested_candidate = candidate_root / base_stem / method / "preprocessed.mp4"
+            if nested_candidate.exists():
+                found_path = nested_candidate.resolve()
+                break
+
             suffixes = [preferred_suffix] if preferred_suffix else []
             suffixes.extend(ext for ext in sorted(VIDEO_EXTENSIONS) if ext not in suffixes)
             for suffix in suffixes:
@@ -457,8 +421,6 @@ def write_run_manifest(out_dir: Path, *, video_path: Path, params_path: Path,
                        stimulus_scale_base: float,
                        stimulus_scale_effective: float,
                        phosphene_mode: str,
-                       cooldown_seconds: float,
-                       cooldown_baseline_tolerance_C: float,
                        enable_cem43: bool):
     manifest = {
         "video": str(video_path),
@@ -474,8 +436,6 @@ def write_run_manifest(out_dir: Path, *, video_path: Path, params_path: Path,
         "stimulus_scale_base": float(stimulus_scale_base),
         "stimulus_scale_effective": float(stimulus_scale_effective),
         "phosphene_mode": str(phosphene_mode),
-        "cooldown_seconds": float(cooldown_seconds),
-        "cooldown_baseline_tolerance_C": float(cooldown_baseline_tolerance_C),
         "enable_cem43": bool(enable_cem43),
         "params": str(params_path),
         "safety_yaml": str(safety_path),
@@ -499,6 +459,29 @@ def resolve_video_fps(cap: cv2.VideoCapture, video_path: Path, fallback_fps: flo
     raise RuntimeError(f"Unable to determine FPS for input video: {video_path}")
 
 
+def compute_raster_timing(video_fps: float, groups: int, raster_enabled: bool) -> dict[str, float]:
+    if float(video_fps) <= 0:
+        raise ValueError(f"Video FPS must be > 0, got {video_fps}.")
+    if int(groups) <= 0:
+        raise ValueError(f"Raster groups must be > 0, got {groups}.")
+
+    if not raster_enabled:
+        return {
+            "video_fps": float(video_fps),
+            "cycle_rate_hz": 0.0,
+            "group_step_rate_hz": 0.0,
+            "group_interval_s": 0.0,
+        }
+
+    # GaussianSimulator expects raster_rate_hz to be the full cycle rate.
+    # If there are N groups and the video advances one group per frame,
+    # then the cycle rate is video_fps / N.
+    return {
+        "video_fps": float(video_fps),
+        "cycle_rate_hz": float(video_fps) / float(groups),
+        "group_step_rate_hz": float(video_fps),
+        "group_interval_s": 1.0 / float(video_fps),
+    }
 
 
 def validate_and_report_raster_timing(
@@ -553,53 +536,6 @@ def resolve_simulation_frame_count(cap: cv2.VideoCapture, max_frames: int) -> in
     return 0
 
 
-def resolve_thermal_update_interval_frames(
-    params: dict,
-    *,
-    fps: float,
-    override_frames: int | None = None,
-) -> int:
-    """Resolve bioheat cadence to video frames.
-
-    Thermal integration defaults to one video frame so each frame's electrode
-    load power is injected at the electrode locations.
-    """
-    if override_frames is not None:
-        frames = int(override_frames)
-        if frames <= 0:
-            raise ValueError("thermal_update_interval_frames must be >= 1.")
-        return frames
-
-    bioheat_params = params.get("bioheat", {}) or {}
-    configured_frames = bioheat_params.get("thermal_update_interval_frames", None)
-    if configured_frames is not None:
-        frames = int(configured_frames)
-        if frames <= 0:
-            raise ValueError("bioheat.thermal_update_interval_frames must be >= 1.")
-        return frames
-
-    if float(fps) <= 0.0:
-        raise ValueError(f"fps must be > 0 to resolve thermal cadence, got {fps}.")
-    interval_s = float(bioheat_params.get("thermal_update_interval_s", 1.0 / float(fps)))
-    if interval_s <= 0.0:
-        raise ValueError("bioheat.thermal_update_interval_s must be > 0.")
-    return max(1, int(round(interval_s * float(fps))))
-
-
-def resolve_cooldown_frame_count(
-    *,
-    fps: float,
-    cooldown_seconds: float,
-) -> int:
-    """Return the maximum number of thermal-only cooldown frames to append."""
-    cooldown_seconds = float(cooldown_seconds)
-    if cooldown_seconds <= 0.0:
-        return 0
-    if float(fps) <= 0.0:
-        raise ValueError(f"fps must be > 0 to resolve cooldown frames, got {fps}.")
-    return max(0, int(round(cooldown_seconds * float(fps))))
-
-
 def build_heatmap_snapshot_schedule(total_frames: int, dt: float) -> list[dict[str, float | int]]:
     if total_frames <= 0:
         return []
@@ -645,37 +581,6 @@ def scalar_from_value(value, default: float = np.nan) -> float:
     if array.size == 0:
         return float(default)
     return float(array.reshape(-1)[0])
-
-
-def resolve_device_constant_power_mw(params: dict, override_mw: float | None) -> float:
-    if override_mw is not None:
-        return float(override_mw)
-    bioheat = params.get("bioheat", {}) or {}
-    return float(
-        bioheat.get(
-            "device_constant_power_mw",
-            bioheat.get("internal_circuit_power_mw", 13.0),
-        )
-    )
-
-
-def configure_runtime_device(params: dict, *, force_cpu: bool = False) -> torch.device:
-    gpu_id = params.get("run", {}).get("gpu", None)
-    if force_cpu or gpu_id is None or gpu_id is False or not torch.cuda.is_available():
-        params.setdefault("run", {})["gpu"] = None
-        return torch.device("cpu")
-    try:
-        torch.cuda.set_device(int(gpu_id))
-        device = torch.device(f"cuda:{int(gpu_id)}")
-        _ = (torch.ones(1, device=device) + 1.0).item()
-        return device
-    except Exception as exc:
-        print(
-            "Warning: CUDA is visible but failed a simple tensor test; "
-            f"falling back to CPU. CUDA error: {exc}"
-        )
-        params.setdefault("run", {})["gpu"] = None
-        return torch.device("cpu")
 
 
 def derive_charge_density_uc_cm2(
@@ -746,39 +651,97 @@ def build_run_summary_text(
     thermal_snapshots: dict[str, object] | None,
 ) -> str:
     time_s = np.asarray(common_metrics["time_s"])
-    thermal_time_s = np.asarray(thermal_metrics.get("thermal_time_s", time_s))
-    final_time_s = safe_last(thermal_time_s, default=safe_last(time_s, default=0.0))
-    amplitude = np.asarray(common_metrics.get("amplitude_per_electrode_uA", []), dtype=np.float32)
-    charge_per_phase = np.asarray(common_metrics.get("charge_per_phase_per_electrode_nC", []), dtype=np.float32)
-    charge_density = np.asarray(common_metrics.get("charge_density_per_electrode_uc_cm2", []), dtype=np.float32)
-    shannon = np.asarray(common_metrics.get("shannon_k_per_electrode", []), dtype=np.float32)
-    charge_rate = np.asarray(common_metrics.get("charge_per_second_per_electrode_nC_s", []), dtype=np.float32)
-    total_charge_rate = np.sum(charge_rate, axis=1) if charge_rate.ndim == 2 else np.asarray([], dtype=np.float32)
-    total_window_charge = np.asarray(common_metrics.get("window_charge_total_nC", []), dtype=np.float32)
-    protocol_charge = np.asarray(common_metrics.get("protocol_charge_per_electrode_nC", []), dtype=np.float32)
-    active_count = np.sum(amplitude > 0.0, axis=1) if amplitude.ndim == 2 else np.asarray([], dtype=np.int32)
+    final_time_s = safe_last(time_s, default=0.0)
+    total_charge_rate = np.asarray(common_metrics["total_charge_per_second_nC"])
+    total_window_charge = np.asarray(common_metrics["total_window_nC"])
+    total_protocol_charge = np.asarray(common_metrics["total_protocol_nC"])
+    protocol_charge_per_grid = common_metrics.get("total_protocol_nC_per_grid", {})
+    stimulated_count = np.asarray(common_metrics["stimulated_electrode_count"])
+    active_count = np.asarray(common_metrics["active_count"])
     max_dT = np.asarray(thermal_metrics["max_dT"])
     mean_dT = np.asarray(thermal_metrics["mean_dT"])
     area_gt1 = np.asarray(thermal_metrics["area_gt1_mm2"])
     area_gt2 = np.asarray(thermal_metrics["area_gt2_mm2"])
     area_gt3 = np.asarray(thermal_metrics["area_gt3_mm2"])
-    internal_circuit_power_W = np.asarray(thermal_metrics.get("internal_circuit_power_W", []), dtype=np.float32)
-    electrode_load_power_W = np.asarray(thermal_metrics.get("electrode_load_power_W", []), dtype=np.float32)
     max_cem43 = np.asarray(thermal_metrics.get("max_cem43", []))
     p99_cem43 = np.asarray(thermal_metrics.get("p99_cem43", []))
-    threshold_uA = scalar_from_value(
-        common_metrics.get("threshold_uA", np.asarray(np.nan, dtype=np.float32))
+    electrode_time_s = np.asarray(common_metrics.get("electrode_time_s", time_s))
+    sampled_charge_per_phase = np.asarray(common_metrics.get("charge_per_phase_nC", []))
+    pulse_width_s = np.asarray(common_metrics.get("pulse_width_s", []))
+    electrode_surface_area_cm2 = scalar_from_value(
+        common_metrics.get("electrode_surface_area_cm2", np.asarray(np.nan, dtype=np.float32))
+    )
+    fixed_firing_threshold_uA = scalar_from_value(
+        common_metrics.get("fixed_firing_threshold_uA", np.asarray(np.nan, dtype=np.float32))
+    )
+    input_binarized_for_safety = bool(
+        scalar_from_value(
+            common_metrics.get("input_binarized_for_safety", np.asarray(False, dtype=np.bool_)),
+            default=0.0,
+        )
+    )
+    temporal_dynamics_disabled = bool(
+        scalar_from_value(
+            common_metrics.get("temporal_dynamics_disabled", np.asarray(False, dtype=np.bool_)),
+            default=0.0,
+        )
+    )
+    trace_increase_rate = scalar_from_value(
+        common_metrics.get("trace_increase_rate", np.asarray(np.nan, dtype=np.float32))
+    )
+    activation_threshold_sd = scalar_from_value(
+        common_metrics.get("activation_threshold_sd", np.asarray(np.nan, dtype=np.float32))
     )
     metrics_save_every_n_frames = int(
         scalar_from_value(
-            common_metrics.get("save_every_n_frames", np.asarray(1, dtype=np.int32)),
+            common_metrics.get("electrode_metrics_save_every_n_frames", np.asarray(1, dtype=np.int32)),
             default=1.0,
         )
     )
-    peak_charge_per_phase_nC = safe_nanmax(charge_per_phase)
-    peak_current_amplitude_uA = safe_nanmax(amplitude)
-    peak_charge_density_uc_cm2 = safe_nanmax(charge_density)
-    peak_shannon_k = safe_nanmax(shannon)
+    peak_charge_per_phase_nC = scalar_from_value(
+        common_metrics.get(
+            "peak_charge_per_phase_nC_exact",
+            np.asarray(safe_nanmax(sampled_charge_per_phase), dtype=np.float32),
+        )
+    )
+    peak_current_amplitude_uA = scalar_from_value(
+        common_metrics.get(
+            "peak_current_amplitude_uA_exact",
+            np.asarray(
+                safe_nanmax(derive_current_amplitude_uA(sampled_charge_per_phase, pulse_width_s))
+                if sampled_charge_per_phase.size > 0 and pulse_width_s.size > 0 else np.nan,
+                dtype=np.float32,
+            ),
+        )
+    )
+    peak_charge_density_uc_cm2 = scalar_from_value(
+        common_metrics.get(
+            "peak_charge_density_uc_cm2_exact",
+            np.asarray(
+                safe_nanmax(
+                    derive_charge_density_uc_cm2(
+                        sampled_charge_per_phase,
+                        electrode_surface_area_cm2,
+                    )
+                ) if sampled_charge_per_phase.size > 0 else np.nan,
+                dtype=np.float32,
+            ),
+        )
+    )
+    peak_shannon_k = scalar_from_value(
+        common_metrics.get(
+            "peak_shannon_k_exact",
+            np.asarray(
+                safe_nanmax(
+                    derive_shannon_k(
+                        sampled_charge_per_phase,
+                        electrode_surface_area_cm2,
+                    )
+                ) if sampled_charge_per_phase.size > 0 else np.nan,
+                dtype=np.float32,
+            ),
+        )
+    )
 
     snapshot_times = np.asarray(
         [] if thermal_snapshots is None else thermal_snapshots.get("times_s", []),
@@ -797,6 +760,10 @@ def build_run_summary_text(
         f"stim_scale={'default' if stim_scale is None else f'{float(stim_scale):.6f}'}",
         f"stimulus_scale_base={float(stimulus_scale_base):.6f}",
         f"stimulus_scale_effective={float(stimulus_scale_effective):.6f}",
+        f"input_binarized_for_safety={input_binarized_for_safety}",
+        f"temporal_dynamics_disabled={temporal_dynamics_disabled}",
+        f"trace_increase_rate={trace_increase_rate:.6g}",
+        f"activation_threshold_sd={activation_threshold_sd:.6g}",
         f"frames={int(total_frames)}",
         f"duration_s={final_time_s:.6f}",
         f"fps={float(video_fps):.6f}",
@@ -805,15 +772,8 @@ def build_run_summary_text(
         f"raster_group_step_rate_hz={float(raster_timing['group_step_rate_hz']):.6f}",
         f"raster_group_interval_s={float(raster_timing['group_interval_s']):.6f}",
         f"internal_circuit_power_total_mW={float(internal_circuit_power_mw):.6f}",
-        f"save_every_n_frames={int(metrics_save_every_n_frames)}",
-        f"electrical_frame_count={int(time_s.size)}",
-        f"thermal_sample_count={int(thermal_time_s.size)}",
-        f"cooldown_max_seconds={scalar_from_value(common_metrics.get('cooldown_max_seconds', 0.0), default=0.0):.6f}",
-        f"cooldown_duration_s={scalar_from_value(common_metrics.get('cooldown_duration_s', 0.0), default=0.0):.6f}",
-        f"cooldown_start_s={scalar_from_value(common_metrics.get('cooldown_start_s', np.nan), default=np.nan):.6f}",
-        f"cooldown_baseline_tolerance_C={scalar_from_value(common_metrics.get('cooldown_baseline_tolerance_C', 0.0), default=0.0):.6f}",
-        f"cooldown_stop_reason={str(np.asarray(common_metrics.get('cooldown_stop_reason', np.asarray('disabled'))).item())}",
-        f"cooldown_thermal_frames={int(scalar_from_value(common_metrics.get('cooldown_thermal_frames', 0), default=0.0))}",
+        f"electrode_metrics_saved_every_n_frames={int(metrics_save_every_n_frames)}",
+        f"electrode_metrics_saved_count={int(electrode_time_s.size)}",
         f"thermal_grid_names={', '.join(sorted(thermal_grids.keys()))}",
         "",
         "Saved heatmaps",
@@ -831,30 +791,23 @@ def build_run_summary_text(
             + ", ".join(f"{value:.3f}" for value in snapshot_times)
         )
 
-    if "amplitude_per_electrode_uA" in common_metrics:
-        lines.extend(
-            [
-                "",
-                "Electrical results",
-                f"pulse_frequency_hz_min={float(np.min(pulse_frequency_hz)):.6f}",
-                f"pulse_frequency_hz_mean={float(np.mean(pulse_frequency_hz)):.6f}",
-                f"pulse_frequency_hz_max={float(np.max(pulse_frequency_hz)):.6f}",
-                f"threshold_uA={threshold_uA:.6f}",
-                f"peak_current_amplitude_uA={peak_current_amplitude_uA:.6f}",
-                f"peak_charge_per_phase_nC={peak_charge_per_phase_nC:.6f}",
-                f"peak_charge_density_uC_cm2={peak_charge_density_uc_cm2:.6f}",
-                f"peak_shannon_k={peak_shannon_k:.6f}",
-                f"peak_total_charge_per_second_nC_s={safe_nanmax(total_charge_rate):.6f}",
-                f"peak_total_window_charge_nC={safe_nanmax(total_window_charge):.6f}",
-                f"final_total_protocol_charge_nC={float(np.nansum(protocol_charge)):.6f}",
-                f"peak_active_electrode_count={int(safe_nanmax(active_count, default=0.0))}",
-            ]
-        )
-    else:
-        lines.extend(["", "Electrical results", "electrical_tracking=disabled"])
-
     lines.extend(
         [
+            "",
+            "Electrical results",
+            f"pulse_frequency_hz_min={float(np.min(pulse_frequency_hz)):.6f}",
+            f"pulse_frequency_hz_mean={float(np.mean(pulse_frequency_hz)):.6f}",
+            f"pulse_frequency_hz_max={float(np.max(pulse_frequency_hz)):.6f}",
+            f"fixed_firing_threshold_uA={fixed_firing_threshold_uA:.6f}",
+            f"peak_current_amplitude_uA={peak_current_amplitude_uA:.6f}",
+            f"peak_charge_per_phase_nC={peak_charge_per_phase_nC:.6f}",
+            f"peak_charge_density_uC_cm2={peak_charge_density_uc_cm2:.6f}",
+            f"peak_shannon_k={peak_shannon_k:.6f}",
+            f"peak_total_charge_per_second_nC_s={safe_nanmax(total_charge_rate):.6f}",
+            f"peak_total_window_charge_nC={safe_nanmax(total_window_charge):.6f}",
+            f"final_total_protocol_charge_nC={safe_last(total_protocol_charge):.6f}",
+            f"peak_active_electrode_count={int(safe_nanmax(active_count, default=0.0))}",
+            f"peak_stimulated_electrode_count={int(safe_nanmax(stimulated_count, default=0.0))}",
             "",
             "Thermal results",
             f"peak_max_dT_C={safe_nanmax(max_dT):.6f}",
@@ -864,10 +817,6 @@ def build_run_summary_text(
             f"peak_area_gt1_mm2={safe_nanmax(area_gt1):.6f}",
             f"peak_area_gt2_mm2={safe_nanmax(area_gt2):.6f}",
             f"peak_area_gt3_mm2={safe_nanmax(area_gt3):.6f}",
-            f"peak_internal_circuit_power_mW={safe_nanmax(internal_circuit_power_W * 1e3):.6f}",
-            f"mean_internal_circuit_power_mW={float(np.nanmean(internal_circuit_power_W * 1e3)) if internal_circuit_power_W.size else float('nan'):.6f}",
-            f"peak_electrode_load_power_mW={safe_nanmax(electrode_load_power_W * 1e3):.6f}",
-            f"mean_electrode_load_power_mW={float(np.nanmean(electrode_load_power_W * 1e3)) if electrode_load_power_W.size else float('nan'):.6f}",
         ]
     )
     if max_cem43.size > 0 and p99_cem43.size > 0:
@@ -884,6 +833,9 @@ def build_run_summary_text(
         grid_data = thermal_grids[grid_name]
         grid_max = safe_nanmax(grid_data["dT_final"])
         grid_cem43_max = safe_nanmax(grid_data.get("cem43_final", []))
+        if grid_name in protocol_charge_per_grid:
+            grid_protocol_charge = np.asarray(protocol_charge_per_grid[grid_name])
+            lines.append(f"final_total_protocol_charge_nC[{grid_name}]={safe_last(grid_protocol_charge):.6f}")
         lines.append(f"final_grid_peak_dT_C[{grid_name}]={grid_max:.6f}")
         if "cem43_final" in grid_data:
             lines.append(f"final_grid_peak_cem43_min[{grid_name}]={grid_cem43_max:.6f}")
@@ -995,118 +947,6 @@ def build_electrode_grid_ids(
     return grid_ids[first_idx].astype(np.int64)
 
 
-def build_electrode_base_indices(
-    remaining_indices: np.ndarray,
-    base_indices: np.ndarray,
-) -> np.ndarray:
-    remaining_indices = np.asarray(remaining_indices, dtype=np.int64)
-    base_indices = np.asarray(base_indices, dtype=np.int64)
-    _, first_idx = np.unique(remaining_indices, return_index=True)
-    return base_indices[first_idx].astype(np.int64)
-
-
-def build_full_electrode_reference(
-    coords_yaml: Path,
-    mapping: dict,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return the full electrode ID/location table used by saved metrics.
-
-    The simulator may only contain phosphenes that survive cortical mapping and
-    FOV filtering. Safety outputs and bioheat placement should still use the
-    full implanted coordinate table, with zero-valued metrics for electrodes
-    that were not represented by a phosphene in this run.
-    """
-    x_raw_mm, y_raw_mm = utils.load_coordinates_from_yaml(str(coords_yaml))
-    x_raw_mm = np.asarray(x_raw_mm, dtype=np.float64).reshape(-1)
-    y_raw_mm = np.asarray(y_raw_mm, dtype=np.float64).reshape(-1)
-    if x_raw_mm.size != y_raw_mm.size or x_raw_mm.size == 0:
-        raise ValueError(f"Invalid electrode coordinate YAML: {coords_yaml}")
-
-    n_base = int(x_raw_mm.size)
-    mapped_indices = np.asarray(mapping["indices"], dtype=np.int64).reshape(-1)
-    mapped_grid_ids = np.asarray(mapping.get("grid_ids", []), dtype=np.int64).reshape(-1)
-    is_full_field = (
-        mapped_indices.size > 0
-        and (
-            int(mapped_indices.max()) >= n_base
-            or np.unique(mapped_grid_ids).size > 1
-        )
-    )
-
-    if is_full_field:
-        electrode_ids = np.arange(2 * n_base, dtype=np.int64)
-        electrode_xy_mm = np.concatenate(
-            [
-                np.column_stack([np.abs(x_raw_mm), y_raw_mm]),
-                np.column_stack([-np.abs(x_raw_mm), y_raw_mm]),
-            ],
-            axis=0,
-        ).astype(np.float64)
-        electrode_grid_ids = np.concatenate(
-            [
-                np.zeros(n_base, dtype=np.int64),
-                np.ones(n_base, dtype=np.int64),
-            ]
-        )
-        electrode_base_indices = np.concatenate(
-            [
-                np.arange(n_base, dtype=np.int64),
-                np.arange(n_base, dtype=np.int64),
-            ]
-        )
-    else:
-        electrode_ids = np.arange(n_base, dtype=np.int64)
-        electrode_xy_mm = np.column_stack([x_raw_mm, y_raw_mm]).astype(np.float64)
-        electrode_grid_ids = np.zeros(n_base, dtype=np.int64)
-        electrode_base_indices = np.arange(n_base, dtype=np.int64)
-
-    return electrode_ids, electrode_xy_mm, electrode_grid_ids, electrode_base_indices
-
-
-def build_reference_index(
-    electrode_ids: np.ndarray,
-    reference_electrode_ids: np.ndarray,
-    device: torch.device,
-) -> torch.Tensor:
-    electrode_ids = np.asarray(electrode_ids, dtype=np.int64).reshape(-1)
-    reference_electrode_ids = np.asarray(reference_electrode_ids, dtype=np.int64).reshape(-1)
-    positions = {int(electrode_id): idx for idx, electrode_id in enumerate(reference_electrode_ids)}
-    missing = [int(electrode_id) for electrode_id in electrode_ids if int(electrode_id) not in positions]
-    if missing:
-        raise ValueError(
-            "Surviving electrode IDs are missing from the full electrode reference: "
-            f"{missing[:10]}"
-        )
-    return torch.tensor(
-        [positions[int(electrode_id)] for electrode_id in electrode_ids],
-        dtype=torch.long,
-        device=device,
-    )
-
-
-def expand_metric_to_reference_tensor(
-    metric: torch.Tensor,
-    compact_to_reference_t: torch.Tensor,
-    reference_count: int,
-    *,
-    fill_value: float = 0.0,
-) -> torch.Tensor:
-    metric = metric.reshape(-1).to(compact_to_reference_t.device)
-    if metric.numel() != compact_to_reference_t.numel():
-        raise ValueError(
-            "Metric length does not match compact electrode mapping: "
-            f"{metric.numel()} vs {compact_to_reference_t.numel()}."
-        )
-    out = torch.full(
-        (int(reference_count),),
-        float(fill_value),
-        dtype=metric.dtype,
-        device=metric.device,
-    )
-    out.scatter_(0, compact_to_reference_t, metric)
-    return out
-
-
 def align_mapping_to_simulator(mapping: dict, sim: GaussianSimulator) -> dict:
     order = np.asarray(
         getattr(sim, "electrode_tags", np.arange(len(mapping["indices"]), dtype=np.int64)),
@@ -1154,7 +994,6 @@ def build_bioheat_grid_sets(
             return_inverse=True,
         )
         grid_sets[int(grid_id)] = {
-            "grid_id": int(grid_id),
             "name": "right" if int(grid_id) == 0 else "left",
             "mask_t": torch.tensor(mask, dtype=torch.bool, device=device),
             "inverse_t": torch.tensor(inverse.astype(np.int64), dtype=torch.long, device=device),
@@ -1199,59 +1038,26 @@ def aggregate_metric_tensor(metric: torch.Tensor, inv_map_t: torch.Tensor, n_ele
     return out
 
 
-def raster_groups_to_electrodes(
-    sim: GaussianSimulator,
-    inv_map_t: torch.Tensor,
-    n_elec: int,
-) -> torch.Tensor:
-    """Return one raster group label per physical electrode."""
-    if not sim.raster_enabled or sim.raster_groups_flat is None:
-        return torch.zeros(n_elec, device=inv_map_t.device, dtype=torch.int32)
-
-    phos_groups = sim.raster_groups_flat.reshape(-1).to(inv_map_t.device).to(dtype=torch.long)
-    electrode_groups = torch.full((n_elec,), -1, device=inv_map_t.device, dtype=torch.int32)
-    for electrode_idx in range(n_elec):
-        groups = phos_groups[inv_map_t == electrode_idx]
-        if groups.numel() == 0:
-            continue
-        electrode_groups[electrode_idx] = torch.mode(groups).values.to(dtype=torch.int32)
-    return electrode_groups
-
-
 def aggregate_metric(metric: torch.Tensor, inv_map_t: torch.Tensor, n_elec: int) -> np.ndarray:
     return aggregate_metric_tensor(metric, inv_map_t, n_elec).detach().cpu().numpy().astype(np.float32)
 
 
-def tensor_list_to_numpy(values: list[torch.Tensor | np.ndarray | float], dtype=np.float32) -> np.ndarray:
+def tensor_list_to_numpy(values: list[torch.Tensor], dtype=np.float32) -> np.ndarray:
     if not values:
         return np.asarray([], dtype=dtype)
-    if not any(torch.is_tensor(value) for value in values):
-        return np.asarray(values, dtype=dtype)
     stacked = torch.stack([value.detach().reshape(()) for value in values])
     return stacked.cpu().numpy().astype(dtype, copy=False)
 
 
-def tensor_rows_to_numpy(values: list[torch.Tensor | np.ndarray], dtype=np.float32) -> np.ndarray:
+def tensor_rows_to_numpy(values: list[torch.Tensor], dtype=np.float32) -> np.ndarray:
     if not values:
         return np.asarray([], dtype=dtype)
-    if not any(torch.is_tensor(value) for value in values):
-        return np.asarray(values, dtype=dtype)
     stacked = torch.stack([value.detach().reshape(-1) for value in values], dim=0)
     return stacked.cpu().numpy().astype(dtype, copy=False)
 
 
 def scalar_tensor_to_numpy(value: torch.Tensor, dtype=np.float32) -> np.ndarray:
     return value.detach().cpu().numpy().astype(dtype, copy=False)
-
-
-def tensor_row_to_numpy(value: torch.Tensor, dtype=np.float32) -> np.ndarray:
-    return value.detach().reshape(-1).cpu().numpy().astype(dtype, copy=True)
-
-
-def tensor_scalar_to_float(value: torch.Tensor | float) -> float:
-    if torch.is_tensor(value):
-        return float(value.detach().reshape(()).cpu().item())
-    return float(value)
 
 
 def prepare_frame(frame: np.ndarray, target_res: tuple[int, int]) -> np.ndarray:
@@ -1363,89 +1169,6 @@ def plot_multi_series(x: np.ndarray, series: list[np.ndarray], labels: list[str]
     plt.close(fig)
 
 
-def plot_device_power_diagnostics(
-    time_s: np.ndarray,
-    active_electrodes: np.ndarray,
-    internal_circuit_power_W: np.ndarray,
-    electrode_load_power_W: np.ndarray,
-    out_path: Path,
-    active_time_s: np.ndarray | None = None,
-) -> None:
-    n_power = min(
-        len(time_s),
-        len(internal_circuit_power_W),
-        len(electrode_load_power_W),
-    )
-    if n_power <= 0:
-        return
-
-    x_min = time_axis_minutes(time_s[:n_power])
-    internal_circuit_mW = np.asarray(internal_circuit_power_W[:n_power], dtype=np.float64) * 1e3
-    electrode_load_mW = np.asarray(electrode_load_power_W[:n_power], dtype=np.float64) * 1e3
-
-    fig, ax_active = plt.subplots(figsize=(9.0, 4.8))
-    active_line = []
-    active_time = np.asarray(active_time_s if active_time_s is not None else time_s, dtype=np.float64).reshape(-1)
-    active_values = np.asarray(active_electrodes, dtype=np.float64).reshape(-1)
-    n_active = min(active_time.size, active_values.size)
-    if n_active > 0:
-        active_line = ax_active.plot(
-            time_axis_minutes(active_time[:n_active]),
-            active_values[:n_active],
-            color="#475569",
-            linewidth=1.5,
-            alpha=0.85,
-            label="Active electrodes",
-        )
-    ax_active.set_xlabel("Time (min)", fontsize=11)
-    ax_active.set_ylabel("Active electrodes", fontsize=11, color="#475569")
-    ax_active.tick_params(axis="y", labelcolor="#475569")
-    _style_axes(ax_active)
-
-    ax_power = ax_active.twinx()
-    power_lines = []
-    power_lines.extend(
-        ax_power.plot(x_min, internal_circuit_mW, color="#2563eb", linewidth=1.8, label="Internal-circuit heat")
-    )
-    power_lines.extend(
-        ax_power.plot(x_min, electrode_load_mW, color="#7C3AED", linewidth=1.3, label="Electrode load heat")
-    )
-    ax_power.set_ylabel("Device power (mW)", fontsize=11)
-    ax_power.spines["top"].set_visible(False)
-    ax_power.tick_params(labelsize=10, width=0.8)
-
-    lines = active_line + power_lines
-    ax_active.legend(lines, [line.get_label() for line in lines], frameon=False, fontsize=9, loc="upper left")
-    ax_active.set_title("Video-driven device power", fontsize=12, pad=10)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_thermal_response_diagnostics(
-    time_s: np.ndarray,
-    mean_dT: np.ndarray,
-    max_dT: np.ndarray,
-    out_path: Path,
-) -> None:
-    n = min(len(time_s), len(mean_dT), len(max_dT))
-    if n <= 0:
-        return
-
-    plot_multi_series(
-        np.asarray(time_s[:n], dtype=np.float64),
-        [
-            np.asarray(mean_dT[:n], dtype=np.float64),
-            np.asarray(max_dT[:n], dtype=np.float64),
-        ],
-        ["Mean dT in electrode footprint", "Maximum dT"],
-        out_path,
-        "Video-driven thermal response",
-        "Temperature rise dT (C)",
-        ymin=0.0,
-    )
-
-
 def save_temperature_snapshot(dT_map: np.ndarray, extent_mm: tuple[float, float, float, float],
                               out_path: Path, time_s: float):
     xmin, xmax, ymin, ymax = extent_mm
@@ -1458,7 +1181,7 @@ def save_temperature_snapshot(dT_map: np.ndarray, extent_mm: tuple[float, float,
         cmap="inferno",
     )
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Î”T (Â°C)", fontsize=11)
+    cbar.set_label("ΔT (°C)", fontsize=11)
     ax.set_xlabel("x (mm)", fontsize=11)
     ax.set_ylabel("y (mm)", fontsize=11)
     ax.set_title(f"Temperature Rise at t = {time_s / 60.0:.2f} min", fontsize=12, pad=10)
@@ -1503,8 +1226,6 @@ def save_mode_outputs(
             cem43_extent_mm = None
         footprint_pixels = float(thermal_grids[hottest_grid_name]["ic_footprint_pixel_count"])
         power_density_w_m3 = float(thermal_grids[hottest_grid_name]["ic_power_density_W_m3"])
-        voxel_size_mm = np.asarray(thermal_grids[hottest_grid_name]["voxel_size_mm"], dtype=np.float32)
-        bioheat_model = str(thermal_grids[hottest_grid_name].get("bioheat_model", "bioheat"))
     else:
         hottest_grid_name = "aggregate"
         hottest_cem43_grid_name = None
@@ -1512,43 +1233,23 @@ def save_mode_outputs(
         cem43_extent_mm = None
         footprint_pixels = 0.0
         power_density_w_m3 = 0.0
-        voxel_size_mm = np.asarray(0.0, dtype=np.float32)
-        bioheat_model = "bioheat"
 
     save_payload = {
         "time_s": common_metrics["time_s"],
-        "thermal_time_s": thermal_metrics.get("thermal_time_s", common_metrics["time_s"]),
-        "device_power_time_s": thermal_metrics.get(
-            "device_power_time_s",
-            thermal_metrics.get("thermal_time_s", common_metrics["time_s"]),
-        ),
-        "cooldown_max_seconds": common_metrics.get(
-            "cooldown_max_seconds",
-            np.asarray(0.0, dtype=np.float32),
-        ),
-        "cooldown_duration_s": common_metrics.get(
-            "cooldown_duration_s",
-            np.asarray(0.0, dtype=np.float32),
-        ),
-        "cooldown_start_s": common_metrics.get(
-            "cooldown_start_s",
-            np.asarray(np.nan, dtype=np.float32),
-        ),
-        "cooldown_baseline_tolerance_C": common_metrics.get(
-            "cooldown_baseline_tolerance_C",
-            np.asarray(0.0, dtype=np.float32),
-        ),
-        "cooldown_stop_reason": common_metrics.get(
-            "cooldown_stop_reason",
-            np.asarray("disabled"),
-        ),
-        "cooldown_thermal_frames": common_metrics.get(
-            "cooldown_thermal_frames",
-            np.asarray(0, dtype=np.int32),
-        ),
-        "save_every_n_frames": common_metrics["save_every_n_frames"],
-        "threshold_uA": common_metrics["threshold_uA"],
+        "electrode_time_s": common_metrics["electrode_time_s"],
+        "electrode_frame_indices": common_metrics["electrode_frame_indices"],
+        "electrode_metrics_save_every_n_frames": common_metrics["electrode_metrics_save_every_n_frames"],
+        "frame_charge_total_nC": common_metrics["frame_charge_total_nC"],
+        "charge_per_second_total_nC_s": common_metrics["total_charge_per_second_nC"],
+        "charge_per_phase_mean_nC": common_metrics["mean_charge_per_phase_nC"],
+        "charge_density_mean_uc_cm2": common_metrics["mean_charge_density_uc_cm2"],
+        "shannon_k_mean": common_metrics["mean_shannon_k"],
+        "charge_per_second_mean_per_electrode_nC_s": common_metrics["mean_charge_per_second_per_electrode_nC_s"],
+        "window_charge_total_nC": common_metrics["total_window_nC"],
+        "protocol_charge_total_nC": common_metrics["total_protocol_nC"],
+        "final_protocol_charge_per_electrode_nC": common_metrics["final_protocol_charge_per_electrode_nC"],
         "relative_stim_duration": common_metrics["relative_stim_duration"],
+        "charge_window_s": common_metrics["charge_window_s"],
         "pulse_width_s": common_metrics["pulse_width_s"],
         "electrode_surface_area_cm2": common_metrics["electrode_surface_area_cm2"],
         "max_dT": thermal_metrics["max_dT"],
@@ -1556,57 +1257,37 @@ def save_mode_outputs(
         "area_gt1_mm2": thermal_metrics["area_gt1_mm2"],
         "area_gt2_mm2": thermal_metrics["area_gt2_mm2"],
         "area_gt3_mm2": thermal_metrics["area_gt3_mm2"],
+        "active_count": common_metrics["active_count"],
+        "stimulated_electrode_count": common_metrics["stimulated_electrode_count"],
         "dT_final": thermal_metrics["dT_final"],
-        "internal_circuit_power_W": thermal_metrics["internal_circuit_power_W"],
-        "electrode_load_power_W": thermal_metrics["electrode_load_power_W"],
         "fps": np.asarray(video_fps, dtype=np.float32),
-        "raster_mode": common_metrics["raster_mode"],
-        "raster_mode_normalized": common_metrics["raster_mode_normalized"],
-        "raster_num_groups": common_metrics["raster_num_groups"],
         "raster_rate_hz": np.asarray(raster_rate_hz, dtype=np.float32),
         "raster_group_step_rate_hz": np.asarray(raster_timing["group_step_rate_hz"], dtype=np.float32),
         "raster_group_interval_s": np.asarray(raster_timing["group_interval_s"], dtype=np.float32),
-        "raster_reshuffle_interval_s": common_metrics["raster_reshuffle_interval_s"],
         "extent_mm": extent_mm,
-        "voxel_size_mm": voxel_size_mm,
-        "bioheat_model": np.asarray(bioheat_model),
         "pulse_frequency_hz": pulse_frequency_hz.astype(np.float32),
         "electrode_ids": common_metrics["electrode_ids"],
-        "electrode_base_indices": common_metrics["electrode_base_indices"],
         "electrode_xy_mm": common_metrics["electrode_xy_mm"],
         "electrode_impedance_ohm": common_metrics["electrode_impedance_ohm"],
         "electrode_grid_ids": common_metrics["electrode_grid_ids"],
         "electrode_grid_names": common_metrics["electrode_grid_names"],
+        "fixed_firing_threshold_uA": common_metrics["fixed_firing_threshold_uA"],
+        "appearance_threshold_uA": common_metrics["appearance_threshold_uA"],
+        "appearance_threshold_explicit": common_metrics["appearance_threshold_explicit"],
+        "input_binarized_for_safety": common_metrics["input_binarized_for_safety"],
+        "temporal_dynamics_disabled": common_metrics["temporal_dynamics_disabled"],
+        "trace_increase_rate": common_metrics["trace_increase_rate"],
+        "activation_threshold_sd": common_metrics["activation_threshold_sd"],
+        "current_amplitude_per_electrode_uA": common_metrics["current_amplitude_per_electrode_uA"],
         "internal_circuit_power_total_mW": np.asarray(internal_circuit_power_mw, dtype=np.float32),
         "internal_circuit_footprint_pixels": np.asarray(footprint_pixels, dtype=np.float32),
         "internal_circuit_power_density_W_m3": np.asarray(power_density_w_m3, dtype=np.float32),
+        "peak_charge_per_phase_nC_exact": common_metrics["peak_charge_per_phase_nC_exact"],
+        "peak_current_amplitude_uA_exact": common_metrics["peak_current_amplitude_uA_exact"],
+        "peak_charge_density_uc_cm2_exact": common_metrics["peak_charge_density_uc_cm2_exact"],
+        "peak_shannon_k_exact": common_metrics["peak_shannon_k_exact"],
+        "peak_charge_per_second_per_electrode_nC_s_exact": common_metrics["peak_charge_per_second_per_electrode_nC_s_exact"],
     }
-    electrical_payload_keys = (
-        "amplitude_per_electrode_uA",
-        "charge_per_phase_per_electrode_nC",
-        "charge_density_per_electrode_uc_cm2",
-        "shannon_k_per_electrode",
-        "charge_per_second_per_electrode_nC_s",
-        "window_charge_per_electrode_nC",
-        "window_charge_total_nC",
-        "protocol_charge_per_electrode_nC",
-        "power_per_electrode_W",
-        "active_electrode_count",
-        "window_exceedance_time_start_s",
-        "window_exceedance_time_end_s",
-        "window_exceedance_scope",
-        "window_exceedance_electrode_id",
-        "window_exceedance_charge_nC",
-        "window_exceedance_limit_nC",
-        "charge_window_s",
-        "raster_active_group",
-        "raster_group_assignment_frame_indices",
-        "raster_group_assignment_times_s",
-        "raster_group_assignments",
-    )
-    for key in electrical_payload_keys:
-        if key in common_metrics:
-            save_payload[key] = common_metrics[key]
     if "max_cem43" in thermal_metrics:
         save_payload["max_cem43"] = thermal_metrics["max_cem43"]
     if "p99_cem43" in thermal_metrics:
@@ -1616,15 +1297,30 @@ def save_mode_outputs(
     if cem43_extent_mm is not None:
         save_payload["cem43_extent_mm"] = cem43_extent_mm
 
+    if "total_protocol_nC_per_grid" in common_metrics:
+        save_payload["protocol_charge_grid_names"] = np.asarray(
+            list(common_metrics["total_protocol_nC_per_grid"].keys())
+        )
+        for grid_name, series in common_metrics["total_protocol_nC_per_grid"].items():
+            suffix = sanitize_path_part(grid_name)
+            save_payload[f"protocol_charge_total_nC_{suffix}"] = np.asarray(series, dtype=np.float32)
+    if "total_charge_per_second_nC_per_grid" in common_metrics:
+        save_payload["charge_per_second_grid_names"] = np.asarray(
+            list(common_metrics["total_charge_per_second_nC_per_grid"].keys())
+        )
+        for grid_name, series in common_metrics["total_charge_per_second_nC_per_grid"].items():
+            suffix = sanitize_path_part(grid_name)
+            save_payload[f"charge_per_second_total_nC_s_{suffix}"] = np.asarray(series, dtype=np.float32)
+
     if thermal_grids:
         save_payload["thermal_grid_names"] = np.asarray(list(thermal_grids.keys()))
         save_payload["dT_final_reference_grid"] = np.asarray(hottest_grid_name)
-        save_payload["final_peak_temperature_C"] = np.asarray(
-            thermal_grids[hottest_grid_name]["final_peak_temperature_C"],
+        save_payload["stationary_temperature_C"] = np.asarray(
+            thermal_grids[hottest_grid_name]["stationary_temperature_C"],
             dtype=np.float32,
         )
-        save_payload["final_peak_dT_C"] = np.asarray(
-            thermal_grids[hottest_grid_name]["final_peak_dT_C"],
+        save_payload["stationary_dT_C"] = np.asarray(
+            thermal_grids[hottest_grid_name]["stationary_dT_C"],
             dtype=np.float32,
         )
         if hottest_cem43_grid_name is not None:
@@ -1632,18 +1328,17 @@ def save_mode_outputs(
         for grid_name, grid_data in thermal_grids.items():
             suffix = sanitize_path_part(grid_name)
             save_payload[f"dT_final_{suffix}"] = grid_data["dT_final"]
-            save_payload[f"final_peak_temperature_C_{suffix}"] = np.asarray(
-                grid_data["final_peak_temperature_C"],
+            save_payload[f"stationary_temperature_C_{suffix}"] = np.asarray(
+                grid_data["stationary_temperature_C"],
                 dtype=np.float32,
             )
-            save_payload[f"final_peak_dT_C_{suffix}"] = np.asarray(
-                grid_data["final_peak_dT_C"],
+            save_payload[f"stationary_dT_C_{suffix}"] = np.asarray(
+                grid_data["stationary_dT_C"],
                 dtype=np.float32,
             )
             if "cem43_final" in grid_data:
                 save_payload[f"cem43_final_{suffix}"] = grid_data["cem43_final"]
             save_payload[f"extent_mm_{suffix}"] = np.asarray(grid_data["extent_mm"], dtype=np.float32)
-            save_payload[f"voxel_size_mm_{suffix}"] = np.asarray(grid_data["voxel_size_mm"], dtype=np.float32)
             save_payload[f"internal_circuit_footprint_pixels_{suffix}"] = np.asarray(
                 grid_data["ic_footprint_pixel_count"],
                 dtype=np.float32,
@@ -1691,24 +1386,6 @@ def save_mode_outputs(
             save_payload[f"cem43_heatmaps_{suffix}"] = np.asarray(snapshots, dtype=np.float32)
 
     np.savez(out_dir / "safety_metrics.npz", **save_payload)
-    if "active_electrode_count" in common_metrics:
-        plot_device_power_diagnostics(
-            thermal_metrics.get(
-                "device_power_time_s",
-                thermal_metrics.get("thermal_time_s", common_metrics["time_s"]),
-            ),
-            common_metrics["active_electrode_count"],
-            thermal_metrics["internal_circuit_power_W"],
-            thermal_metrics["electrode_load_power_W"],
-            out_dir / "device_power_over_time.png",
-            active_time_s=common_metrics["time_s"],
-        )
-    plot_thermal_response_diagnostics(
-        thermal_metrics.get("thermal_time_s", common_metrics["time_s"]),
-        thermal_metrics["mean_dT"],
-        thermal_metrics["max_dT"],
-        out_dir / "thermal_response_over_time.png",
-    )
 
 
 # Main simulation pass for one video / preprocessing / raster combination.
@@ -1726,10 +1403,7 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                  device: torch.device,
                  phosphene_mode: str = "safety_centers",
                  thermal_update_interval_frames: int | None = None,
-                 cooldown_seconds: float = 300.0,
-                 cooldown_baseline_tolerance_C: float = 1e-3,
-                 appearance_threshold_uA: float | None = None,
-                 track_electrical: bool = True):
+                 appearance_threshold_uA: float | None = None):
     _ = snapshot_interval_s  # Legacy CLI option kept for compatibility.
     if not mode_out_dirs:
         raise ValueError("run_one_mode requires at least one IC mode output directory.")
@@ -1769,7 +1443,6 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
     fixed_firing_threshold_a = resolve_appearance_threshold_a(simulation_params, appearance_threshold_uA)
     if explicit_appearance_threshold:
         simulation_params.setdefault("thresholding", {})["rheobase"] = 0.0
-        apply_adaptive_activation_threshold(simulation_params, fixed_firing_threshold_a)
     stimulus_scale_effective = float(
         simulation_params.get("sampling", {}).get("stimulus_scale", stimulus_scale_base)
     )
@@ -1798,56 +1471,28 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
         aligned_mapping["indices"],
         device=device,
     )
-    n_elec_surv = elec_xy_mm_surv.shape[0]
-    surviving_electrode_ids, _surviving_electrode_xy_mm = build_surviving_electrode_metadata(
+    n_elec = elec_xy_mm_surv.shape[0]
+    electrode_ids, electrode_xy_mm = build_surviving_electrode_metadata(
         aligned_mapping["cortical_coordinates"],
         aligned_mapping["indices"],
     )
-    electrode_ids, electrode_xy_mm, electrode_grid_ids, electrode_base_indices = build_full_electrode_reference(
-        coords_yaml,
-        aligned_mapping,
-    )
-    n_elec = int(electrode_ids.shape[0])
-    compact_to_reference_t = build_reference_index(
-        surviving_electrode_ids,
-        electrode_ids,
-        device=device,
-    )
-    impedance = Impedance(
-        simulation_params,
-        sim.shape,
-        rng=np.random.default_rng(int(simulation_params.get("run", {}).get("seed", 42))),
-        verbose=bool(simulation_params.get("run", {}).get("print_stats", False)),
-    )
-    impedance.state = impedance.state.to(device=device, dtype=torch.float32)
-    safety_tracker = (
-        SafetyTracker(
-            params=simulation_params,
-            num_electrodes=sim.num_phosphenes,
-            data_kwargs={**sim.data_kwargs, "device": str(device)},
-        )
-        if track_electrical
-        else None
-    )
-    impedance_phos_t = impedance.state.reshape(-1).to(device=device, dtype=torch.float32)
-    impedance_sum_t = torch.zeros(n_elec_surv, dtype=torch.float32, device=device)
-    impedance_count_t = torch.zeros(n_elec_surv, dtype=torch.float32, device=device)
+    impedance_phos_t = sim.impedance.state.reshape(-1).to(device=device, dtype=torch.float32)
+    impedance_sum_t = torch.zeros(n_elec, dtype=torch.float32, device=device)
+    impedance_count_t = torch.zeros(n_elec, dtype=torch.float32, device=device)
     impedance_sum_t.scatter_add_(0, inv_map_t, impedance_phos_t)
     impedance_count_t.scatter_add_(0, inv_map_t, torch.ones_like(impedance_phos_t))
-    electrode_impedance_ohm_surv = (
+    electrode_impedance_ohm = (
         impedance_sum_t / impedance_count_t.clamp_min(1.0)
-    )
-    electrode_impedance_ohm = expand_metric_to_reference_tensor(
-        electrode_impedance_ohm_surv,
-        compact_to_reference_t,
-        n_elec,
-        fill_value=float("nan"),
     ).detach().cpu().numpy().astype(np.float32)
     bioheat_grid_sets = build_bioheat_grid_sets(
-        Map(x=electrode_xy_mm[:, 0], y=electrode_xy_mm[:, 1]),
-        electrode_grid_ids,
-        electrode_base_indices,
+        aligned_mapping["cortical_coordinates"],
+        aligned_mapping["grid_ids"],
+        aligned_mapping["base_indices"],
         device=device,
+    )
+    electrode_grid_ids = build_electrode_grid_ids(
+        aligned_mapping["indices"],
+        aligned_mapping["grid_ids"],
     )
     grid_name_by_id = {
         int(grid_id): grid_info["name"] for grid_id, grid_info in bioheat_grid_sets.items()
@@ -1863,35 +1508,11 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
 
     fps = float(video_fps)
     dt = 1.0 / fps
-    video_frame_limit = resolve_simulation_frame_count(cap, max_frames)
-    cooldown_seconds = float(cooldown_seconds)
-    cooldown_baseline_tolerance_C = float(cooldown_baseline_tolerance_C)
-    if cooldown_baseline_tolerance_C < 0.0:
-        raise ValueError("cooldown_baseline_tolerance_C must be >= 0.")
-    cooldown_max_frames = resolve_cooldown_frame_count(
-        fps=fps,
-        cooldown_seconds=cooldown_seconds,
-    )
-    scheduled_thermal_frames = (
-        video_frame_limit + cooldown_max_frames
-        if video_frame_limit > 0
-        else video_frame_limit
-    )
-    heatmap_snapshot_schedule = build_heatmap_snapshot_schedule(scheduled_thermal_frames, dt)
+    total_simulation_frames = resolve_simulation_frame_count(cap, max_frames)
+    heatmap_snapshot_schedule = build_heatmap_snapshot_schedule(total_simulation_frames, dt)
     heatmap_snapshot_lookup = {
         int(item["frame_idx"]): item for item in heatmap_snapshot_schedule
     }
-    cooldown_thermal_frames = 0
-    cooldown_stop_reason = "disabled" if cooldown_max_frames <= 0 else "not_started"
-    if cooldown_max_frames > 0:
-        print(
-            "Post-video thermal cooldown | "
-            f"max_duration={cooldown_seconds:.2f}s | "
-            f"baseline_tolerance={cooldown_baseline_tolerance_C:.6f} C | "
-            "device power off"
-        )
-    if not track_electrical:
-        print("Electrical tracking disabled; saving thermal metrics only.")
     target_res = tuple(int(v) for v in simulation_params["run"]["resolution"])
     binarize_input = should_binarize_preprocessed_input(preprocessing_method)
     preview_max_frames = max(0, int(round(float(preview_seconds) * fps)))
@@ -1904,46 +1525,41 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
         preview_max_frames = 0
     progress_started_at = time.perf_counter()
 
-    amplitude_per_electrode_uA = []
-    charge_per_phase_per_electrode_nC = []
-    charge_density_per_electrode_uc_cm2 = []
-    shannon_k_per_electrode = []
-    charge_per_second_per_electrode_nC_s = []
-    window_charge_per_electrode_nC = []
-    window_charge_total_nC = []
-    power_per_electrode_W = []
-    active_electrode_count = []
-    raster_active_group = []
-    raster_group_assignment_frame_indices = []
-    raster_group_assignment_times_s = []
-    raster_group_assignments = []
-    window_exceedance_time_start_s = []
-    window_exceedance_time_end_s = []
-    window_exceedance_scope = []
-    window_exceedance_electrode_id = []
-    window_exceedance_charge_nC = []
-    window_exceedance_limit_nC = []
+    sampled_frame_indices = []
+    sampled_time_s = []
+    frame_charge_total_nC = []
+    total_charge_per_second_nC = []
+    mean_charge_per_phase_nC = []
+    mean_charge_density_uc_cm2 = []
+    mean_shannon_k = []
+    mean_charge_per_second_per_electrode_nC_s = []
+    total_window_nC = []
+    total_protocol_nC = []
+    total_protocol_nC_per_grid = {
+        grid_info["name"]: [] for grid_info in bioheat_grid_sets.values()
+    }
+    total_charge_per_second_nC_per_grid = {
+        grid_info["name"]: [] for grid_info in bioheat_grid_sets.values()
+    }
+    current_amplitude_per_electrode_uA = []
     final_protocol_charge_per_electrode_nC = torch.zeros(n_elec, dtype=torch.float32, device=device)
+    charge_per_second_window_entries = []
+    charge_per_second_window_time_s = 0.0
+    charge_per_second_window_elec_nC = torch.zeros(n_elec, dtype=torch.float32, device=device)
+    active_count = []
+    stimulated_electrode_count = []
     time_s = []
 
-    pulse_frequency_hz_compact_t = aggregate_metric_tensor(sim._frequency.reshape(-1), inv_map_t, n_elec_surv).to(
+    pulse_frequency_hz_t = aggregate_metric_tensor(sim._frequency.reshape(-1), inv_map_t, n_elec).to(
         device=device,
         dtype=torch.float32,
     )
-    pulse_width_s_compact_t = aggregate_metric_tensor(sim._pulse_width.reshape(-1), inv_map_t, n_elec_surv).to(
+    pulse_width_s_t = aggregate_metric_tensor(sim._pulse_width.reshape(-1), inv_map_t, n_elec).to(
         device=device,
         dtype=torch.float32,
     )
-    pulse_frequency_hz = expand_metric_to_reference_tensor(
-        pulse_frequency_hz_compact_t,
-        compact_to_reference_t,
-        n_elec,
-    ).detach().cpu().numpy().astype(np.float32)
-    pulse_width_s = expand_metric_to_reference_tensor(
-        pulse_width_s_compact_t,
-        compact_to_reference_t,
-        n_elec,
-    ).detach().cpu().numpy().astype(np.float32)
+    pulse_frequency_hz = pulse_frequency_hz_t.detach().cpu().numpy().astype(np.float32)
+    pulse_width_s = pulse_width_s_t.detach().cpu().numpy().astype(np.float32)
     electrode_area_cm2 = float(simulation_params["safety"]["electrode_surface_area_cm2"])
     relative_stim_duration = float(simulation_params.get("default_stim", {}).get("relative_stim_duration", 1.0))
     configured_save_every = (
@@ -1953,17 +1569,24 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
     )
     if configured_save_every <= 0:
         raise ValueError("save_every_n_frames must be >= 1.")
-    last_raster_assignment_key: tuple[int, ...] | None = None
-    configured_thermal_update_interval = resolve_thermal_update_interval_frames(
-        simulation_params,
-        fps=fps,
-        override_frames=thermal_update_interval_frames,
+    exact_electrical_peaks = {
+        "peak_charge_per_phase_nC_exact": torch.tensor(0.0, dtype=torch.float32, device=device),
+        "peak_current_amplitude_uA_exact": torch.tensor(0.0, dtype=torch.float32, device=device),
+        "peak_charge_density_uc_cm2_exact": torch.tensor(0.0, dtype=torch.float32, device=device),
+        "peak_shannon_k_exact": torch.tensor(-torch.inf, dtype=torch.float32, device=device),
+        "peak_charge_per_second_per_electrode_nC_s_exact": torch.tensor(0.0, dtype=torch.float32, device=device),
+    }
+    heat_window_power_sum_phos = None
+    heat_window_frame_count = 0
+    configured_thermal_update_interval = (
+        int(thermal_update_interval_frames)
+        if thermal_update_interval_frames is not None
+        else HEATMAP_UPDATE_INTERVAL_FRAMES
     )
-    print(
-        "Thermal cadence | "
-        f"stimulation update every video frame ({dt:.3f}s); "
-        f"cooldown batch up to {configured_thermal_update_interval} frame(s)"
-    )
+    if configured_thermal_update_interval <= 0:
+        raise ValueError("thermal_update_interval_frames must be >= 1.")
+    electrode_grid_ids_t = torch.tensor(electrode_grid_ids, dtype=torch.long, device=device)
+
     mode_states = {}
     for ic_heat_mode, out_dir in mode_out_dirs.items():
         mode_params = yaml.safe_load(yaml.safe_dump(simulation_params))
@@ -1974,32 +1597,23 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             grid_params = yaml.safe_load(yaml.safe_dump(mode_params))
             grid_params.setdefault("bioheat", {})
             grid_params["bioheat"]["internal_circuit_power_mw"] = ic_power_mw
-            grid_params["bioheat"]["device_constant_power_mw"] = ic_power_mw
             bio = Bioheat2D(params=grid_params, elec_xy_mm=grid_info["elec_xy_mm"], device=device)
-            electrode_mask_t = torch.tensor(
-                electrode_grid_ids == int(grid_id),
-                dtype=torch.bool,
-                device=device,
-            )
             grid_heat_states[grid_info["name"]] = {
                 "bio": bio,
                 "mask_t": grid_info["mask_t"],
                 "inverse_t": grid_info["inverse_t"],
                 "n_elec": grid_info["n_elec"],
-                "electrode_mask_t": electrode_mask_t,
                 "baseline_temp": float(bio.baseline_T),
                 "pixel_area_mm2": float(bio.dx * bio.dy) * 1e6,
-                "device_constant_power_W": float(ic_power_mw) * 1e-3,
-                "prev_dT_map": torch.zeros_like(bio.dT_projection()),
+                "prev_dT_map": torch.zeros_like(bio.T),
             }
             if enable_cem43:
-                grid_heat_states[grid_info["name"]]["cem43_map"] = torch.zeros_like(bio.dT)
+                grid_heat_states[grid_info["name"]]["cem43_map"] = torch.zeros_like(bio.T)
 
         mode_states[ic_heat_mode] = {
             "out_dir": out_dir,
             "preview_out_dir": preview_out_dirs[ic_heat_mode],
             "internal_circuit_power_mw": ic_power_mw * max(len(grid_heat_states), 1),
-            "ic_enabled": ic_heat_mode == "with",
             "grid_heat_states": grid_heat_states,
             "preview_phosphene_writer": None,
             "preview_comparison_writer": None,
@@ -2015,10 +1629,6 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             "area_gt1_mm2": [],
             "area_gt2_mm2": [],
             "area_gt3_mm2": [],
-            "internal_circuit_power_W": [],
-            "electrode_load_power_W": [],
-            "device_power_time_s": [],
-            "thermal_time_s": [],
         }
         if enable_cem43:
             mode_states[ic_heat_mode]["snapshot_cem43_grids"] = {
@@ -2027,43 +1637,36 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             mode_states[ic_heat_mode]["max_cem43"] = []
             mode_states[ic_heat_mode]["p99_cem43"] = []
 
-    def update_bioheat_from_electrode_power(
-        electrode_power_elec: torch.Tensor,
-        update_dt: float,
-        *,
-        include_internal_power: bool = True,
-    ) -> None:
-        """Advance Bioheat2D using per-electrode dissipated load power."""
-        if update_dt <= 0.0:
+    def update_bioheat_from_window(window_power_sum_phos: torch.Tensor, window_frame_count: int) -> None:
+        """Advance bioheat once using the mean delivered power over a frame window."""
+        if window_frame_count <= 0:
             return
 
+        window_power_phos = window_power_sum_phos / float(window_frame_count)
+        window_dt = dt * float(window_frame_count)
         for state in mode_states.values():
             for grid_name, grid_state in state["grid_heat_states"].items():
                 bio = grid_state["bio"]
-                p_grid = electrode_power_elec[grid_state["electrode_mask_t"]]
+                fp_grid = window_power_phos[grid_state["mask_t"]]
+                p_grid = torch.zeros(
+                    grid_state["n_elec"],
+                    device=device,
+                    dtype=fp_grid.dtype,
+                )
+                p_grid.scatter_add_(0, grid_state["inverse_t"], fp_grid)
                 if enable_cem43:
-                    cem43_weight_prev = cem43_weight_from_temperature(bio.temperature_C)
-                original_internal_power_W = float(getattr(bio, "internal_circuit_power_W", 0.0))
-                if not include_internal_power:
-                    bio.internal_circuit_power_W = 0.0
-                try:
-                    bio.update(p_grid, update_dt)
-                finally:
-                    bio.internal_circuit_power_W = original_internal_power_W
-                dT_map = bio.dT_projection().detach()
+                    cem43_weight_prev = cem43_weight_from_temperature(bio.T)
+                bio.update(p_grid, window_dt)
+                dT_map = (bio.T - grid_state["baseline_temp"]).detach()
                 if enable_cem43:
-                    cem43_weight_cur = cem43_weight_from_temperature(bio.temperature_C)
+                    cem43_weight_cur = cem43_weight_from_temperature(bio.T)
                     grid_state["cem43_map"].add_(
-                        0.5 * (cem43_weight_prev + cem43_weight_cur) * (update_dt / 60.0)
+                        0.5 * (cem43_weight_prev + cem43_weight_cur) * (window_dt / 60.0)
                     )
                 grid_state["prev_dT_map"] = dT_map
 
-    def record_thermal_metrics_and_snapshots(
-        snapshot_entry: dict[str, object] | None,
-        sample_time_s: float,
-    ) -> None:
+    def record_thermal_metrics_and_snapshots(snapshot_entry: dict[str, object] | None) -> None:
         for state in mode_states.values():
-            state["thermal_time_s"].append(float(sample_time_s))
             grid_max_dT = []
             grid_cem43_maps = [] if enable_cem43 else None
             grid_max_cem43 = [] if enable_cem43 else None
@@ -2076,23 +1679,17 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             for grid_name, grid_state in state["grid_heat_states"].items():
                 dT_map = grid_state["prev_dT_map"]
                 grid_max_value = dT_map.max()
-                ic_mask = grid_state["bio"].ic_footprint_mask.to(device=dT_map.device, dtype=torch.bool)
-                if torch.any(ic_mask):
-                    grid_mean_value = dT_map[ic_mask].mean()
-                    grid_mean_weight = int(torch.count_nonzero(ic_mask).item())
-                else:
-                    grid_mean_value = dT_map.mean()
-                    grid_mean_weight = int(dT_map.numel())
-                state["grid_max_dT"][grid_name].append(tensor_scalar_to_float(grid_max_value))
-                state["grid_mean_dT"][grid_name].append(tensor_scalar_to_float(grid_mean_value))
+                grid_mean_value = dT_map.mean()
+                state["grid_max_dT"][grid_name].append(grid_max_value)
+                state["grid_mean_dT"][grid_name].append(grid_mean_value)
 
                 grid_max_dT.append(grid_max_value)
                 if enable_cem43:
                     grid_cem43_max_value = grid_state["cem43_map"].max()
                     grid_cem43_maps.append(grid_state["cem43_map"])
                     grid_max_cem43.append(grid_cem43_max_value)
-                weighted_mean_sum += grid_mean_value * grid_mean_weight
-                weighted_mean_count += grid_mean_weight
+                weighted_mean_sum += grid_mean_value * int(dT_map.numel())
+                weighted_mean_count += int(dT_map.numel())
                 area_gt1_total += (dT_map > 1.0).sum(dtype=torch.float32) * grid_state["pixel_area_mm2"]
                 area_gt2_total += (dT_map > 2.0).sum(dtype=torch.float32) * grid_state["pixel_area_mm2"]
                 area_gt3_total += (dT_map > 3.0).sum(dtype=torch.float32) * grid_state["pixel_area_mm2"]
@@ -2100,16 +1697,14 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             if not grid_max_dT:
                 raise RuntimeError("No bioheat grids were configured for the current mode.")
 
-            state["max_dT"].append(tensor_scalar_to_float(torch.stack(grid_max_dT).max()))
-            state["mean_dT"].append(tensor_scalar_to_float(weighted_mean_sum / max(weighted_mean_count, 1)))
-            state["area_gt1_mm2"].append(tensor_scalar_to_float(area_gt1_total))
-            state["area_gt2_mm2"].append(tensor_scalar_to_float(area_gt2_total))
-            state["area_gt3_mm2"].append(tensor_scalar_to_float(area_gt3_total))
+            state["max_dT"].append(torch.stack(grid_max_dT).max())
+            state["mean_dT"].append(weighted_mean_sum / max(weighted_mean_count, 1))
+            state["area_gt1_mm2"].append(area_gt1_total)
+            state["area_gt2_mm2"].append(area_gt2_total)
+            state["area_gt3_mm2"].append(area_gt3_total)
             if enable_cem43:
-                state["max_cem43"].append(tensor_scalar_to_float(torch.stack(grid_max_cem43).max()))
-                state["p99_cem43"].append(
-                    tensor_scalar_to_float(percentile_tensor_from_tensor_list(grid_cem43_maps, 99.0, device))
-                )
+                state["max_cem43"].append(torch.stack(grid_max_cem43).max())
+                state["p99_cem43"].append(percentile_tensor_from_tensor_list(grid_cem43_maps, 99.0, device))
 
             if snapshot_entry is not None:
                 state["snapshot_frame_indices"].append(int(snapshot_entry["frame_idx"]))
@@ -2122,26 +1717,18 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                     )
                     if enable_cem43:
                         state["snapshot_cem43_grids"][grid_name].append(
-                            thermal_projection(grid_state["cem43_map"]).detach().cpu().numpy().astype(np.float32)
+                            grid_state["cem43_map"].detach().cpu().numpy().astype(np.float32)
                         )
 
     def remove_latest_thermal_metric_samples() -> None:
         for state in mode_states.values():
-            if state["thermal_time_s"]:
-                state["thermal_time_s"].pop()
             for series in state["grid_max_dT"].values():
                 if series:
                     series.pop()
             for series in state["grid_mean_dT"].values():
                 if series:
                     series.pop()
-            for key in (
-                "max_dT",
-                "mean_dT",
-                "area_gt1_mm2",
-                "area_gt2_mm2",
-                "area_gt3_mm2",
-            ):
+            for key in ("max_dT", "mean_dT", "area_gt1_mm2", "area_gt2_mm2", "area_gt3_mm2"):
                 if state[key]:
                     state[key].pop()
             if enable_cem43:
@@ -2149,31 +1736,40 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                     if state[key]:
                         state[key].pop()
 
-    def current_peak_dT_C() -> float:
-        peaks = []
-        for state in mode_states.values():
-            for grid_state in state["grid_heat_states"].values():
-                dT_map = grid_state["prev_dT_map"]
-                if dT_map is not None and dT_map.numel() > 0:
-                    peaks.append(float(dT_map.max().detach().cpu().item()))
-        if not peaks:
-            return 0.0
-        return max(peaks)
-
     frame_idx = 0
-    thermal_frame_idx = 0
+
+    def push_charge_per_second_window(dt_s: float, delta_charge_elec_nC: torch.Tensor) -> torch.Tensor:
+        nonlocal charge_per_second_window_time_s, charge_per_second_window_elec_nC
+        delta_charge_elec_nC = delta_charge_elec_nC.to(device=device, dtype=torch.float32)
+        charge_per_second_window_entries.append([float(dt_s), delta_charge_elec_nC])
+        charge_per_second_window_time_s += float(dt_s)
+        charge_per_second_window_elec_nC = charge_per_second_window_elec_nC + delta_charge_elec_nC
+
+        while charge_per_second_window_time_s > 1.0 + 1e-12 and charge_per_second_window_entries:
+            excess_s = charge_per_second_window_time_s - 1.0
+            head_dt_s, head_charge_nC = charge_per_second_window_entries[0]
+            if head_dt_s <= excess_s + 1e-12:
+                charge_per_second_window_entries.pop(0)
+                charge_per_second_window_time_s -= head_dt_s
+                charge_per_second_window_elec_nC = charge_per_second_window_elec_nC - head_charge_nC
+            else:
+                fraction = excess_s / head_dt_s
+                trim_charge_nC = head_charge_nC * fraction
+                charge_per_second_window_entries[0] = [head_dt_s - excess_s, head_charge_nC - trim_charge_nC]
+                charge_per_second_window_time_s -= excess_s
+                charge_per_second_window_elec_nC = charge_per_second_window_elec_nC - trim_charge_nC
+
+        return charge_per_second_window_elec_nC.clone()
 
     try:
         while True:
-            if max_frames > 0 and frame_idx >= int(max_frames):
-                break
-
             ok, frame = cap.read()
             if not ok:
                 break
 
             frame_idx += 1
-            thermal_frame_idx = frame_idx
+            if max_frames > 0 and frame_idx > int(max_frames):
+                break
 
             gray = prepare_frame(frame, target_res)
             if binarize_input:
@@ -2182,16 +1778,9 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
 
             stim = apply_appearance_threshold(stim_raw, fixed_firing_threshold_a)
 
-            # The phosphene simulation is shared across IC modes, so delivered
-            # current and raster state are updated only once per frame.
+            # The phosphene simulation is shared across IC modes, so the
+            # electrical update runs only once per frame.
             sim.update(stim, dt=dt, temperature_increase=None)
-            if track_electrical:
-                safety_tracker.update(
-                    charge_per_s=sim.delivered_charge_per_second,
-                    frequency=sim.current_frequency,
-                    dt_s=dt,
-                    temperature_increase=None,
-                )
 
             if preview_max_frames > 0 and frame_idx <= preview_max_frames:
                 percept_u8 = render_phosphene_frame_from_state(sim)
@@ -2223,170 +1812,153 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                     state["preview_phosphene_writer"].write(percept_u8)
                     state["preview_comparison_writer"].write(comparison_u8)
 
-            current_time_s = frame_idx * dt
-
-            current_amplitude_compact = aggregate_metric_tensor(
-                (sim.delivered_amplitude * 1e6).reshape(-1),
-                inv_map_t,
-                n_elec_surv,
-            ).to(
+            # SafetyTracker stores per-phosphene values; aggregate them back to
+            # physical electrodes so electrical and thermal metrics align.
+            current_amplitude_elec = aggregate_metric_tensor((stim * 1e6).reshape(-1), inv_map_t, n_elec).to(
                 dtype=torch.float32
             )
-            current_amplitude_elec = expand_metric_to_reference_tensor(
-                current_amplitude_compact,
-                compact_to_reference_t,
+            current_amplitude_per_electrode_uA.append(current_amplitude_elec.clone())
+            q_phase_elec = aggregate_metric_tensor(
+                sim.safety_tracker.last_charge_per_phase_nC,
+                inv_map_t,
                 n_elec,
-            )
-
-            # Per-electrode load power is the Bioheat2D electrode heat input.
-            _instant_power, frame_power = compute_frame_power(
-                sim.delivered_amplitude,
-                impedance.state,
-                sim.current_pulse_width,
-                sim.current_frequency,
-                relative_stim_duration,
-            )
-            fp_phos = frame_power.reshape(-1).to(device)
-            frame_power_compact = aggregate_metric_tensor(fp_phos, inv_map_t, n_elec_surv).to(dtype=torch.float32)
-            frame_power_elec = expand_metric_to_reference_tensor(
-                frame_power_compact,
-                compact_to_reference_t,
+            ).to(dtype=torch.float32)
+            q_window_elec = aggregate_metric_tensor(
+                sim.safety_tracker.window_charge_per_electrode_nC,
+                inv_map_t,
                 n_elec,
+            ).to(dtype=torch.float32)
+            q_protocol_elec = aggregate_metric_tensor(
+                sim.safety_tracker.protocol_charge_per_electrode_nC,
+                inv_map_t,
+                n_elec,
+            ).to(dtype=torch.float32)
+            final_protocol_charge_per_electrode_nC = q_protocol_elec
+
+            charge_density_elec = q_phase_elec / 1e3 / electrode_area_cm2
+            shannon_elec = torch.full_like(charge_density_elec, -torch.inf)
+            valid = (q_phase_elec > 0) & (charge_density_elec > 0)
+            shannon_elec[valid] = torch.log10(q_phase_elec[valid] / 1e3) + torch.log10(charge_density_elec[valid])
+
+            # One-second accumulated charge from the delivered per-frame amplitudes.
+            # Biphasic stimulation has two phases per pulse; pulse width is per phase.
+            frame_charge_elec_nC = (
+                2.0
+                * current_amplitude_elec
+                * pulse_width_s_t
+                * pulse_frequency_hz_t
+                * float(dt)
+                * relative_stim_duration
+                * 1e3
             )
-            if track_electrical:
-                # SafetyTracker stores per-phosphene values; aggregate them
-                # back to physical electrodes for the general safety pipeline.
-                q_phase_compact = aggregate_metric_tensor(
-                    safety_tracker.last_charge_per_phase_nC,
-                    inv_map_t,
-                    n_elec_surv,
-                ).to(dtype=torch.float32)
-                q_window_compact = aggregate_metric_tensor(
-                    safety_tracker.window_charge_per_electrode_nC,
-                    inv_map_t,
-                    n_elec_surv,
-                ).to(dtype=torch.float32)
-                q_protocol_compact = aggregate_metric_tensor(
-                    safety_tracker.protocol_charge_per_electrode_nC,
-                    inv_map_t,
-                    n_elec_surv,
-                ).to(dtype=torch.float32)
-                q_phase_elec = expand_metric_to_reference_tensor(
-                    q_phase_compact,
-                    compact_to_reference_t,
-                    n_elec,
+            charge_per_second_elec = push_charge_per_second_window(float(dt), frame_charge_elec_nC)
+            frame_charge_total_nC.append(frame_charge_elec_nC.sum())
+
+            # Accumulate delivered heat input, then step Bioheat2D once per
+            # 10-frame window with the corresponding 10/fps duration.
+            fp_phos = sim.frame_power.reshape(-1).to(device)
+            if heat_window_power_sum_phos is None:
+                heat_window_power_sum_phos = torch.zeros_like(fp_phos)
+            heat_window_power_sum_phos.add_(fp_phos)
+            heat_window_frame_count += 1
+            if (
+                heat_window_frame_count >= configured_thermal_update_interval or
+                (total_simulation_frames > 0 and frame_idx >= total_simulation_frames)
+            ):
+                update_bioheat_from_window(
+                    heat_window_power_sum_phos,
+                    heat_window_frame_count,
                 )
-                q_window_elec = expand_metric_to_reference_tensor(
-                    q_window_compact,
-                    compact_to_reference_t,
-                    n_elec,
-                )
-                q_protocol_elec = expand_metric_to_reference_tensor(
-                    q_protocol_compact,
-                    compact_to_reference_t,
-                    n_elec,
-                )
-                final_protocol_charge_per_electrode_nC = q_protocol_elec
+                heat_window_power_sum_phos.zero_()
+                heat_window_frame_count = 0
 
-                charge_density_elec = q_phase_elec / 1e3 / electrode_area_cm2
-                shannon_elec = torch.full_like(charge_density_elec, -torch.inf)
-                valid = (q_phase_elec > 0) & (charge_density_elec > 0)
-                shannon_elec[valid] = torch.log10(q_phase_elec[valid] / 1e3) + torch.log10(charge_density_elec[valid])
-
-                charge_rate_compact_nC_s = (
-                    2.0
-                    * current_amplitude_compact
-                    * pulse_width_s_compact_t
-                    * pulse_frequency_hz_compact_t
-                    * relative_stim_duration
-                    * 1e3
-                )
-                charge_rate_elec_nC_s = expand_metric_to_reference_tensor(
-                    charge_rate_compact_nC_s,
-                    compact_to_reference_t,
-                    n_elec,
-                )
-                active_count_frame = torch.count_nonzero(current_amplitude_elec > 0.0).to(dtype=torch.float32)
-                active_electrode_count.append(tensor_scalar_to_float(active_count_frame))
-
-            for state in mode_states.values():
-                state_internal_circuit_power_W = 0.0
-                state_electrode_load_power_W = 0.0
-                for grid_state in state["grid_heat_states"].values():
-                    electrode_mask = grid_state["electrode_mask_t"]
-                    grid_load_power_W = frame_power_elec[electrode_mask].reshape(-1).sum()
-                    constant_power_W = float(grid_state["device_constant_power_W"])
-                    electrode_load_power_value = float(grid_load_power_W.detach().cpu().item())
-                    internal_circuit_power_value = constant_power_W if state["ic_enabled"] else 0.0
-
-                    state_internal_circuit_power_W += internal_circuit_power_value
-                    state_electrode_load_power_W += electrode_load_power_value
-
-                state["internal_circuit_power_W"].append(state_internal_circuit_power_W)
-                state["electrode_load_power_W"].append(state_electrode_load_power_W)
-                state["device_power_time_s"].append(float(current_time_s))
-
-            update_bioheat_from_electrode_power(frame_power_elec, dt)
-
-            if track_electrical:
-                total_window_charge_nC = q_window_elec.sum()
-                window_start_s = max(0.0, current_time_s - float(safety_tracker.charge_window_s))
-                over_window = torch.nonzero(
-                    q_window_elec > float(safety_tracker.acc_limit_per_electrode_nC),
-                    as_tuple=False,
-                ).reshape(-1)
-                for idx_t in over_window.detach().cpu().tolist():
-                    idx = int(idx_t)
-                    window_exceedance_time_start_s.append(window_start_s)
-                    window_exceedance_time_end_s.append(float(current_time_s))
-                    window_exceedance_scope.append("electrode")
-                    window_exceedance_electrode_id.append(int(electrode_ids[idx]) if idx < len(electrode_ids) else idx)
-                    window_exceedance_charge_nC.append(float(q_window_elec[idx].detach().cpu().item()))
-                    window_exceedance_limit_nC.append(float(safety_tracker.acc_limit_per_electrode_nC))
-                if float(total_window_charge_nC.detach().cpu().item()) > float(safety_tracker.acc_limit_total_nC):
-                    window_exceedance_time_start_s.append(window_start_s)
-                    window_exceedance_time_end_s.append(float(current_time_s))
-                    window_exceedance_scope.append("total")
-                    window_exceedance_electrode_id.append(-1)
-                    window_exceedance_charge_nC.append(float(total_window_charge_nC.detach().cpu().item()))
-                    window_exceedance_limit_nC.append(float(safety_tracker.acc_limit_total_nC))
-
-                raster_active_group.append(int(sim.current_raster_group) if sim.raster_enabled else -1)
-                raster_assignment_compact = raster_groups_to_electrodes(sim, inv_map_t, n_elec_surv)
-                raster_assignment = expand_metric_to_reference_tensor(
-                    raster_assignment_compact.to(dtype=torch.float32),
-                    compact_to_reference_t,
-                    n_elec,
-                    fill_value=-1.0,
-                ).to(dtype=torch.int32)
-                raster_assignment_key = tuple(int(value) for value in raster_assignment.detach().cpu().tolist())
-                if raster_assignment_key != last_raster_assignment_key:
-                    raster_group_assignment_frame_indices.append(int(frame_idx))
-                    raster_group_assignment_times_s.append(float(current_time_s))
-                    raster_group_assignments.append(tensor_row_to_numpy(raster_assignment, dtype=np.int32))
-                    last_raster_assignment_key = raster_assignment_key
-
+            current_time_s = frame_idx * dt
             snapshot_entry = heatmap_snapshot_lookup.get(frame_idx)
-            record_thermal_metrics_and_snapshots(snapshot_entry, current_time_s)
+            record_thermal_metrics_and_snapshots(snapshot_entry)
 
-            if track_electrical:
-                amplitude_per_electrode_uA.append(tensor_row_to_numpy(current_amplitude_elec))
-                charge_per_phase_per_electrode_nC.append(tensor_row_to_numpy(q_phase_elec))
-                charge_density_per_electrode_uc_cm2.append(tensor_row_to_numpy(charge_density_elec))
-                shannon_k_per_electrode.append(tensor_row_to_numpy(shannon_elec))
-                charge_per_second_per_electrode_nC_s.append(tensor_row_to_numpy(charge_rate_elec_nC_s))
-                window_charge_per_electrode_nC.append(tensor_row_to_numpy(q_window_elec))
-                window_charge_total_nC.append(tensor_scalar_to_float(total_window_charge_nC))
-                power_per_electrode_W.append(tensor_row_to_numpy(frame_power_elec))
+            exact_electrical_peaks["peak_charge_per_phase_nC_exact"] = torch.maximum(
+                exact_electrical_peaks["peak_charge_per_phase_nC_exact"],
+                q_phase_elec.max() if q_phase_elec.numel() else torch.tensor(0.0, dtype=torch.float32, device=device),
+            )
+            exact_electrical_peaks["peak_current_amplitude_uA_exact"] = torch.maximum(
+                exact_electrical_peaks["peak_current_amplitude_uA_exact"],
+                current_amplitude_elec.max()
+                if current_amplitude_elec.numel()
+                else torch.tensor(0.0, dtype=torch.float32, device=device),
+            )
+            exact_electrical_peaks["peak_charge_density_uc_cm2_exact"] = torch.maximum(
+                exact_electrical_peaks["peak_charge_density_uc_cm2_exact"],
+                charge_density_elec.max()
+                if charge_density_elec.numel()
+                else torch.tensor(0.0, dtype=torch.float32, device=device),
+            )
+            exact_electrical_peaks["peak_shannon_k_exact"] = torch.maximum(
+                exact_electrical_peaks["peak_shannon_k_exact"],
+                shannon_elec.max()
+                if shannon_elec.numel()
+                else torch.tensor(-torch.inf, dtype=torch.float32, device=device),
+            )
+            exact_electrical_peaks["peak_charge_per_second_per_electrode_nC_s_exact"] = torch.maximum(
+                exact_electrical_peaks["peak_charge_per_second_per_electrode_nC_s_exact"],
+                charge_per_second_elec.max()
+                if charge_per_second_elec.numel()
+                else torch.tensor(0.0, dtype=torch.float32, device=device),
+            )
+
+            if (frame_idx - 1) % configured_save_every == 0:
+                sampled_frame_indices.append(int(frame_idx))
+                sampled_time_s.append(float(current_time_s))
+
+            total_charge_per_second_nC.append(charge_per_second_elec.sum())
+            active_q = q_phase_elec > 0.0
+            active_count_t = active_q.sum()
+            active_denominator = active_count_t.clamp_min(1).to(dtype=torch.float32)
+            finite_shannon = torch.isfinite(shannon_elec) & active_q
+            finite_shannon_count = finite_shannon.sum()
+            finite_shannon_denominator = finite_shannon_count.clamp_min(1).to(dtype=torch.float32)
+            mean_charge_per_phase_nC.append((q_phase_elec * active_q).sum() / active_denominator)
+            mean_charge_density_uc_cm2.append((charge_density_elec * active_q).sum() / active_denominator)
+            mean_shannon_k.append(
+                torch.where(
+                    finite_shannon_count > 0,
+                    torch.where(finite_shannon, shannon_elec, torch.zeros_like(shannon_elec)).sum()
+                    / finite_shannon_denominator,
+                    torch.tensor(-torch.inf, dtype=torch.float32, device=device),
+                )
+            )
+            mean_charge_per_second_per_electrode_nC_s.append(
+                (charge_per_second_elec * active_q).sum() / active_denominator
+            )
+            total_window_nC.append(q_window_elec.sum())
+            total_protocol_nC.append(q_protocol_elec.sum())
+            for grid_id, grid_name in grid_name_by_id.items():
+                grid_mask = electrode_grid_ids_t == int(grid_id)
+                total_protocol_nC_per_grid[grid_name].append(q_protocol_elec[grid_mask].sum())
+                total_charge_per_second_nC_per_grid[grid_name].append(charge_per_second_elec[grid_mask].sum())
+            # Count physical electrodes carrying non-zero charge in the current
+            # frame after the raster mask has already been applied upstream.
+            active_count.append(active_count_t.to(dtype=torch.int32))
+
+            if explicit_appearance_threshold:
+                stimulated_electrode_count.append(active_count_t.to(dtype=torch.int32))
+            else:
+                # Legacy path: count physical electrodes whose simulated
+                # activation exceeds the model's activation threshold.
+                supra_phos = torch.greater(sim.activation.get(), sim.threshold.get()).reshape(-1)
+                if sim.raster_enabled:
+                    supra_phos = supra_phos & sim.get_current_raster_mask().reshape(-1).bool()
+                supra_elec = torch.zeros(n_elec, device=device, dtype=torch.int32)
+                supra_elec.scatter_add_(0, inv_map_t, supra_phos.to(torch.int32))
+                stimulated_electrode_count.append((supra_elec > 0).sum().to(dtype=torch.int32))
             time_s.append(current_time_s)
 
             if frame_idx == 1 or frame_idx % 10 == 0:
                 elapsed_s = max(time.perf_counter() - progress_started_at, 1e-9)
                 frame_rate = float(frame_idx) / elapsed_s
-                if video_frame_limit > 0:
-                    progress_pct = 100.0 * float(frame_idx) / float(video_frame_limit)
+                if total_simulation_frames > 0:
+                    progress_pct = 100.0 * float(frame_idx) / float(total_simulation_frames)
                     print(
-                        f"{raster_label}: video frame {frame_idx}/{video_frame_limit} "
+                        f"{raster_label}: frame {frame_idx}/{total_simulation_frames} "
                         f"({progress_pct:5.1f}%) | elapsed {elapsed_s:7.1f}s | "
                         f"{frame_rate:5.2f} frames/s",
                         end="\r",
@@ -2399,59 +1971,6 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                         end="\r",
                         flush=True,
                     )
-
-        if cooldown_max_frames > 0:
-            cooldown_start_frame = thermal_frame_idx
-            cooldown_started_at = time.perf_counter()
-            snapshot_frames = sorted(
-                frame for frame in heatmap_snapshot_lookup
-                if frame > thermal_frame_idx
-            )
-            snapshot_cursor = 0
-            zero_power_elec = torch.zeros(n_elec, dtype=torch.float32, device=device)
-            if current_peak_dT_C() <= cooldown_baseline_tolerance_C:
-                cooldown_stop_reason = "baseline"
-            while cooldown_thermal_frames < cooldown_max_frames and cooldown_stop_reason != "baseline":
-                frames_remaining = cooldown_max_frames - cooldown_thermal_frames
-                segment_frames = min(configured_thermal_update_interval, frames_remaining)
-                if snapshot_cursor < len(snapshot_frames):
-                    next_snapshot_frame = snapshot_frames[snapshot_cursor]
-                    if next_snapshot_frame > thermal_frame_idx:
-                        segment_frames = min(segment_frames, next_snapshot_frame - thermal_frame_idx)
-
-                update_bioheat_from_electrode_power(
-                    zero_power_elec,
-                    dt * float(segment_frames),
-                    include_internal_power=False,
-                )
-                thermal_frame_idx += segment_frames
-                cooldown_thermal_frames += segment_frames
-                current_time_s = thermal_frame_idx * dt
-                for state in mode_states.values():
-                    state["internal_circuit_power_W"].append(0.0)
-                    state["electrode_load_power_W"].append(0.0)
-                    state["device_power_time_s"].append(float(current_time_s))
-
-                snapshot_entry = heatmap_snapshot_lookup.get(thermal_frame_idx)
-                record_thermal_metrics_and_snapshots(snapshot_entry, current_time_s)
-                if snapshot_entry is not None:
-                    snapshot_cursor += 1
-
-                if current_peak_dT_C() <= cooldown_baseline_tolerance_C:
-                    cooldown_stop_reason = "baseline"
-
-                if cooldown_thermal_frames == cooldown_max_frames or (thermal_frame_idx - cooldown_start_frame) % max(configured_thermal_update_interval * 10, 1) == 0:
-                    elapsed_s = max(time.perf_counter() - cooldown_started_at, 1e-9)
-                    progress_pct = 100.0 * float(cooldown_thermal_frames) / float(cooldown_max_frames)
-                    print(
-                        f"{raster_label}: cooldown frame {cooldown_thermal_frames}/{cooldown_max_frames} "
-                        f"({progress_pct:5.1f}%) | elapsed {elapsed_s:7.1f}s",
-                        end="\r",
-                        flush=True,
-                    )
-
-            if cooldown_stop_reason == "not_started":
-                cooldown_stop_reason = "time_limit"
     finally:
         cap.release()
         for state in mode_states.values():
@@ -2459,6 +1978,11 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 state["preview_phosphene_writer"].release()
             if state["preview_comparison_writer"] is not None:
                 state["preview_comparison_writer"].release()
+
+    if frame_idx > 0 and heat_window_frame_count > 0 and heat_window_power_sum_phos is not None:
+        update_bioheat_from_window(heat_window_power_sum_phos, heat_window_frame_count)
+        remove_latest_thermal_metric_samples()
+        record_thermal_metrics_and_snapshots(None)
 
     if frame_idx > 0:
         print()
@@ -2468,98 +1992,82 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
 
     common_metrics = {
         "time_s": np.asarray(time_s, dtype=np.float32),
-        "save_every_n_frames": np.asarray(configured_save_every, dtype=np.int32),
-        "threshold_uA": np.asarray(fixed_firing_threshold_a * 1e6, dtype=np.float32),
-        "cooldown_max_seconds": np.asarray(cooldown_seconds, dtype=np.float32),
-        "cooldown_duration_s": np.asarray(
-            float(cooldown_thermal_frames) * dt,
-            dtype=np.float32,
+        "electrode_time_s": np.asarray(sampled_time_s, dtype=np.float32),
+        "electrode_frame_indices": np.asarray(sampled_frame_indices, dtype=np.int32),
+        "electrode_metrics_save_every_n_frames": np.asarray(configured_save_every, dtype=np.int32),
+        "frame_charge_total_nC": tensor_list_to_numpy(frame_charge_total_nC),
+        "total_charge_per_second_nC": tensor_list_to_numpy(total_charge_per_second_nC),
+        "mean_charge_per_phase_nC": tensor_list_to_numpy(mean_charge_per_phase_nC),
+        "mean_charge_density_uc_cm2": tensor_list_to_numpy(mean_charge_density_uc_cm2),
+        "mean_shannon_k": tensor_list_to_numpy(mean_shannon_k),
+        "mean_charge_per_second_per_electrode_nC_s": tensor_list_to_numpy(
+            mean_charge_per_second_per_electrode_nC_s,
         ),
-        "cooldown_start_s": np.asarray(
-            np.nan if cooldown_max_frames <= 0 else float(frame_idx) * dt,
-            dtype=np.float32,
+        "total_window_nC": tensor_list_to_numpy(total_window_nC),
+        "total_protocol_nC": tensor_list_to_numpy(total_protocol_nC),
+        "final_protocol_charge_per_electrode_nC": scalar_tensor_to_numpy(
+            final_protocol_charge_per_electrode_nC,
         ),
-        "cooldown_baseline_tolerance_C": np.asarray(cooldown_baseline_tolerance_C, dtype=np.float32),
-        "cooldown_stop_reason": np.asarray(cooldown_stop_reason),
-        "cooldown_thermal_frames": np.asarray(
-            cooldown_thermal_frames,
-            dtype=np.int32,
-        ),
-        "raster_mode": np.asarray(raster_label),
-        "raster_mode_normalized": np.asarray(raster_pattern_name),
-        "raster_num_groups": np.asarray(int(groups), dtype=np.int32),
-        "raster_reshuffle_interval_s": np.asarray(
-            float(getattr(sim, "raster_reshuffle_interval_s", 0.0)) if sim.raster_enabled else 0.0,
-            dtype=np.float32,
-        ),
+        "total_protocol_nC_per_grid": {
+            grid_name: tensor_list_to_numpy(series)
+            for grid_name, series in total_protocol_nC_per_grid.items()
+        },
+        "total_charge_per_second_nC_per_grid": {
+            grid_name: tensor_list_to_numpy(series)
+            for grid_name, series in total_charge_per_second_nC_per_grid.items()
+        },
         "electrode_ids": electrode_ids.astype(np.int64),
-        "electrode_base_indices": electrode_base_indices.astype(np.int64),
         "electrode_xy_mm": electrode_xy_mm.astype(np.float32),
         "electrode_impedance_ohm": electrode_impedance_ohm,
         "electrode_grid_ids": np.asarray(electrode_grid_ids, dtype=np.int32),
         "electrode_grid_names": np.asarray([grid_name_by_id[int(grid_id)] for grid_id in electrode_grid_ids]),
+        "active_count": tensor_list_to_numpy(active_count, dtype=np.int32),
+        "stimulated_electrode_count": tensor_list_to_numpy(stimulated_electrode_count, dtype=np.int32),
         "pulse_width_s": np.asarray(pulse_width_s, dtype=np.float32),
         "relative_stim_duration": np.asarray(relative_stim_duration, dtype=np.float32),
+        "charge_window_s": np.asarray(float(sim.safety_tracker.charge_window_s), dtype=np.float32),
         "electrode_surface_area_cm2": np.asarray(electrode_area_cm2, dtype=np.float32),
+        "fixed_firing_threshold_uA": np.asarray(fixed_firing_threshold_a * 1e6, dtype=np.float32),
+        "appearance_threshold_uA": np.asarray(fixed_firing_threshold_a * 1e6, dtype=np.float32),
+        "appearance_threshold_explicit": np.asarray(explicit_appearance_threshold, dtype=np.bool_),
+        "input_binarized_for_safety": np.asarray(binarize_input, dtype=np.bool_),
+        "temporal_dynamics_disabled": np.asarray(
+            bool(simulation_params.get("safety", {}).get("temporal_dynamics_disabled", False)),
+            dtype=np.bool_,
+        ),
+        "trace_increase_rate": np.asarray(
+            float(simulation_params.get("temporal_dynamics", {}).get("trace_increase_rate", np.nan)),
+            dtype=np.float32,
+        ),
+        "activation_threshold_sd": np.asarray(
+            float(simulation_params.get("thresholding", {}).get("activation_threshold_sd", np.nan)),
+            dtype=np.float32,
+        ),
+        "current_amplitude_per_electrode_uA": np.asarray(
+            tensor_rows_to_numpy(current_amplitude_per_electrode_uA),
+            dtype=np.float32,
+        ),
+        "peak_charge_per_phase_nC_exact": np.asarray(
+            scalar_tensor_to_numpy(exact_electrical_peaks["peak_charge_per_phase_nC_exact"]),
+            dtype=np.float32,
+        ),
+        "peak_current_amplitude_uA_exact": np.asarray(
+            scalar_tensor_to_numpy(exact_electrical_peaks["peak_current_amplitude_uA_exact"]),
+            dtype=np.float32,
+        ),
+        "peak_charge_density_uc_cm2_exact": np.asarray(
+            scalar_tensor_to_numpy(exact_electrical_peaks["peak_charge_density_uc_cm2_exact"]),
+            dtype=np.float32,
+        ),
+        "peak_shannon_k_exact": np.asarray(
+            scalar_tensor_to_numpy(exact_electrical_peaks["peak_shannon_k_exact"]),
+            dtype=np.float32,
+        ),
+        "peak_charge_per_second_per_electrode_nC_s_exact": np.asarray(
+            scalar_tensor_to_numpy(exact_electrical_peaks["peak_charge_per_second_per_electrode_nC_s_exact"]),
+            dtype=np.float32,
+        ),
     }
-    if track_electrical:
-        common_metrics.update(
-            {
-                "amplitude_per_electrode_uA": np.asarray(
-                    tensor_rows_to_numpy(amplitude_per_electrode_uA),
-                    dtype=np.float32,
-                ),
-                "charge_per_phase_per_electrode_nC": np.asarray(
-                    tensor_rows_to_numpy(charge_per_phase_per_electrode_nC),
-                    dtype=np.float32,
-                ),
-                "charge_density_per_electrode_uc_cm2": np.asarray(
-                    tensor_rows_to_numpy(charge_density_per_electrode_uc_cm2),
-                    dtype=np.float32,
-                ),
-                "shannon_k_per_electrode": np.asarray(
-                    tensor_rows_to_numpy(shannon_k_per_electrode),
-                    dtype=np.float32,
-                ),
-                "charge_per_second_per_electrode_nC_s": np.asarray(
-                    tensor_rows_to_numpy(charge_per_second_per_electrode_nC_s),
-                    dtype=np.float32,
-                ),
-                "window_charge_per_electrode_nC": np.asarray(
-                    tensor_rows_to_numpy(window_charge_per_electrode_nC),
-                    dtype=np.float32,
-                ),
-                "window_charge_total_nC": tensor_list_to_numpy(window_charge_total_nC),
-                "protocol_charge_per_electrode_nC": scalar_tensor_to_numpy(
-                    final_protocol_charge_per_electrode_nC,
-                ),
-                "power_per_electrode_W": np.asarray(
-                    tensor_rows_to_numpy(power_per_electrode_W),
-                    dtype=np.float32,
-                ),
-                "active_electrode_count": tensor_list_to_numpy(active_electrode_count),
-                "window_exceedance_time_start_s": np.asarray(window_exceedance_time_start_s, dtype=np.float32),
-                "window_exceedance_time_end_s": np.asarray(window_exceedance_time_end_s, dtype=np.float32),
-                "window_exceedance_scope": np.asarray(window_exceedance_scope, dtype="<U16"),
-                "window_exceedance_electrode_id": np.asarray(window_exceedance_electrode_id, dtype=np.int64),
-                "window_exceedance_charge_nC": np.asarray(window_exceedance_charge_nC, dtype=np.float32),
-                "window_exceedance_limit_nC": np.asarray(window_exceedance_limit_nC, dtype=np.float32),
-                "raster_active_group": np.asarray(raster_active_group, dtype=np.int32),
-                "raster_group_assignment_frame_indices": np.asarray(
-                    raster_group_assignment_frame_indices,
-                    dtype=np.int32,
-                ),
-                "raster_group_assignment_times_s": np.asarray(
-                    raster_group_assignment_times_s,
-                    dtype=np.float32,
-                ),
-                "raster_group_assignments": np.asarray(
-                    tensor_rows_to_numpy(raster_group_assignments, dtype=np.int32),
-                    dtype=np.int32,
-                ),
-                "charge_window_s": np.asarray(float(safety_tracker.charge_window_s), dtype=np.float32),
-            }
-        )
 
     for ic_heat_mode, state in mode_states.items():
         if any(grid_state["prev_dT_map"] is None for grid_state in state["grid_heat_states"].values()):
@@ -2567,24 +2075,20 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
 
         thermal_grids = {}
         for grid_name, grid_state in state["grid_heat_states"].items():
-            bio = grid_state["bio"]
             dT_final = grid_state["prev_dT_map"].detach().cpu().numpy().astype(np.float32)
-            final_peak_dT_C = float(np.max(dT_final)) if dT_final.size else float("nan")
-            grid_payload = {
+            stationary_dT_C = float(np.max(dT_final)) if dT_final.size else float("nan")
+            thermal_grids[grid_name] = {
                 "dT_final": dT_final,
-                "extent_mm": bio.extent_mm,
-                "voxel_size_mm": bio.voxel_size_mm,
-                "bioheat_model": str(getattr(bio, "model", "bioheat")),
-                "ic_footprint_pixel_count": bio.ic_footprint_pixel_count,
-                "ic_power_density_W_m3": bio.ic_power_density_W_m3,
-                "final_peak_dT_C": final_peak_dT_C,
-                "final_peak_temperature_C": float(grid_state["baseline_temp"]) + final_peak_dT_C,
+                "extent_mm": grid_state["bio"].extent_mm,
+                "ic_footprint_pixel_count": grid_state["bio"].ic_footprint_pixel_count,
+                "ic_power_density_W_m3": grid_state["bio"].ic_power_density_W_m3,
+                "stationary_dT_C": stationary_dT_C,
+                "stationary_temperature_C": float(grid_state["baseline_temp"]) + stationary_dT_C,
             }
             if enable_cem43:
-                grid_payload["cem43_final"] = (
-                    thermal_projection(grid_state["cem43_map"]).detach().cpu().numpy().astype(np.float32)
+                thermal_grids[grid_name]["cem43_final"] = (
+                    grid_state["cem43_map"].detach().cpu().numpy().astype(np.float32)
                 )
-            thermal_grids[grid_name] = grid_payload
 
         reference_grid_name = max(
             thermal_grids,
@@ -2612,16 +2116,12 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 if snapshot_stack
             }
         thermal_metrics = {
-            "thermal_time_s": np.asarray(state["thermal_time_s"], dtype=np.float32),
             "max_dT": tensor_list_to_numpy(state["max_dT"]),
             "mean_dT": tensor_list_to_numpy(state["mean_dT"]),
             "area_gt1_mm2": tensor_list_to_numpy(state["area_gt1_mm2"]),
             "area_gt2_mm2": tensor_list_to_numpy(state["area_gt2_mm2"]),
             "area_gt3_mm2": tensor_list_to_numpy(state["area_gt3_mm2"]),
             "dT_final": thermal_grids[reference_grid_name]["dT_final"],
-            "device_power_time_s": np.asarray(state["device_power_time_s"], dtype=np.float32),
-            "internal_circuit_power_W": np.asarray(state["internal_circuit_power_W"], dtype=np.float32),
-            "electrode_load_power_W": np.asarray(state["electrode_load_power_W"], dtype=np.float32),
             "max_dT_per_grid": {
                 grid_name: tensor_list_to_numpy(series)
                 for grid_name, series in state["grid_max_dT"].items()
@@ -2709,7 +2209,8 @@ def main():
         choices=list(VALID_PREPROCESS_METHODS),
         help=(
             "Preprocessing variants to run for the requested video. "
-            "The script looks for side-by-side files named like <video_stem>_canny.mp4."
+            "The script looks for either sibling files named like <video_stem>_canny.mp4 "
+            "or nested exports like videos/preprocessed/<video>/<method>/preprocessed.mp4."
         ),
     )
     ap.add_argument(
@@ -2720,17 +2221,10 @@ def main():
         help="Whether to include the internal-circuit heat source. Example: --ic-heat-modes with without",
     )
     ap.add_argument(
-        "--device-constant-power-mw",
-        "--device_constant_power_mw",
         "--internal_circuit_power_mw",
-        dest="device_constant_power_mw",
         type=float,
-        default=None,
-        help=(
-            "Constant per-grid device power in mW. Defaults to "
-            "bioheat.device_constant_power_mw from params.yaml. "
-            "--internal_circuit_power_mw is kept as a legacy alias."
-        ),
+        default=13.0,
+        help="Constant internal-circuit heat source distributed across the full electrode grid.",
     )
     ap.add_argument(
         "--appearance-threshold-uA",
@@ -2755,7 +2249,7 @@ def main():
         default=5.0,
         help=(
             "Legacy option kept for CLI compatibility. The pipeline now saves 20 heatmap "
-            "snapshots, one every 5%% of the simulated duration."
+            "snapshots at 5%% intervals of the simulated duration."
         ),
     )
     ap.add_argument(
@@ -2763,8 +2257,8 @@ def main():
         type=int,
         default=None,
         help=(
-            "Output metadata value recorded as save_every_n_frames. Electrical safety arrays "
-            "are saved per frame."
+            "Persist heavy electrode-wise metrics every N frames while still simulating every frame. "
+            "Defaults to params['safety']['metrics_save_every_n_frames'] or 5."
         ),
     )
     ap.add_argument(
@@ -2787,29 +2281,9 @@ def main():
         type=int,
         default=None,
         help=(
-            "Maximum thermal-only cooldown batch size in video frames. Stimulation bioheat "
-            "updates every video frame using that frame's per-electrode "
-            "dissipated load power."
-        ),
-    )
-    ap.add_argument(
-        "--cooldown-seconds",
-        type=float,
-        default=300.0,
-        help=(
-            "After the input video ends, continue thermal-only cooling with "
-            "all device power off for up to this many seconds."
-        ),
-    )
-    ap.add_argument(
-        "--cooldown-baseline-tolerance-C",
-        "--cooldown-baseline-tolerance-c",
-        dest="cooldown_baseline_tolerance_C",
-        type=float,
-        default=1e-3,
-        help=(
-            "Stop post-video cooling early when the peak temperature rise "
-            "across all thermal grids is at or below this value."
+            "Update the bioheat model every N video frames. Larger values reduce "
+            "thermal compute and temporary memory pressure while still simulating "
+            "electrical safety every frame."
         ),
     )
     ap.add_argument(
@@ -2817,12 +2291,11 @@ def main():
         action="store_true",
         help="Enable CEM43 thermal dose maps and metrics. Disabled by default to keep analysis runs lighter.",
     )
-    ap.add_argument("--force-cpu", action="store_true")
     args = ap.parse_args()
 
     if int(args.groups) <= 0:
         raise ValueError("--groups must be > 0.")
-
+    
     #Define paths
     params_path = (PROJECT_ROOT / args.params).resolve() if not Path(args.params).is_absolute() else Path(args.params)
     safety_path = (PROJECT_ROOT / args.safety_yaml).resolve() if not Path(args.safety_yaml).is_absolute() else Path(args.safety_yaml)
@@ -2834,15 +2307,8 @@ def main():
     preprocessing_methods = normalize_preprocessing_methods(args.preprocessing_methods)
     video_runs = resolve_preprocessed_video_runs(args.video, preprocessing_methods)
 
-    #Load parameters
+    #Load parameters 
     params = load_yaml(params_path)
-    device_constant_power_mw = resolve_device_constant_power_mw(
-        params,
-        args.device_constant_power_mw,
-    )
-    params.setdefault("bioheat", {})
-    params["bioheat"]["device_constant_power_mw"] = float(device_constant_power_mw)
-    params["bioheat"]["internal_circuit_power_mw"] = float(device_constant_power_mw)
     if args.sim_resolution is not None:
         sim_resolution = int(args.sim_resolution)
         if sim_resolution <= 0:
@@ -2870,10 +2336,15 @@ def main():
             f"factor={float(args.stim_scale):.6f} | "
             f"effective={effective_stimulus_scale:.6f}"
         )
-    print(f"device constant power for IC heat mode: {device_constant_power_mw:.6f} mW per grid")
 
     # Respect the project GPU setting when available, but fall back to CPU cleanly.
-    device = configure_runtime_device(params, force_cpu=bool(args.force_cpu))
+    gpu_id = params["run"].get("gpu", None)
+    if gpu_id is None or not torch.cuda.is_available():
+        device = torch.device("cpu")
+        params["run"]["gpu"] = None
+    else:
+        torch.cuda.set_device(int(gpu_id))
+        device = torch.device(f"cuda:{int(gpu_id)}")
 
     raster_modes = normalize_raster_modes(args.raster_modes)
     ic_heat_modes = normalize_ic_heat_modes(args.ic_heat_modes)
@@ -2881,7 +2352,7 @@ def main():
     total_runs = len(video_runs) * len(raster_modes)
     run_index = 0
 
-
+    
     for video_run in video_runs:
         video_path = video_run["video_path"]
         preprocessing_method = str(video_run["preprocessing_method"])
@@ -2911,13 +2382,11 @@ def main():
                     ic_heat_mode=ic_heat_mode,
                     raster_name=raster_name,
                     appearance_threshold_uA=args.appearance_threshold_uA,
-                    internal_circuit_power_mw=device_constant_power_mw if ic_heat_mode == "with" else 0.0,
+                    internal_circuit_power_mw=float(args.internal_circuit_power_mw) if ic_heat_mode == "with" else 0.0,
                     stim_scale=args.stim_scale,
                     stimulus_scale_base=base_stimulus_scale,
                     stimulus_scale_effective=effective_stimulus_scale,
                     phosphene_mode=phosphene_mode,
-                    cooldown_seconds=float(args.cooldown_seconds),
-                    cooldown_baseline_tolerance_C=float(args.cooldown_baseline_tolerance_C),
                     enable_cem43=bool(args.enable_cem43),
                 )
                 preview_out_dir = visuals_method_out_root / sanitize_path_part(ic_heat_mode) / sanitize_path_part(raster_name)
@@ -2943,7 +2412,7 @@ def main():
                 raster_name=raster_name,
                 groups=int(args.groups),
                 max_frames=int(args.max_frames),
-                internal_circuit_power_mw=float(device_constant_power_mw),
+                internal_circuit_power_mw=float(args.internal_circuit_power_mw),
                 preview_seconds=float(args.preview_seconds),
                 snapshot_interval_s=float(args.snapshot_interval_s),
                 save_every_n_frames=int(params["safety"]["metrics_save_every_n_frames"]),
@@ -2951,8 +2420,6 @@ def main():
                 device=device,
                 phosphene_mode=phosphene_mode,
                 thermal_update_interval_frames=args.thermal_update_interval_frames,
-                cooldown_seconds=float(args.cooldown_seconds),
-                cooldown_baseline_tolerance_C=float(args.cooldown_baseline_tolerance_C),
                 appearance_threshold_uA=args.appearance_threshold_uA,
             )
             for out_dir in mode_out_dirs.values():

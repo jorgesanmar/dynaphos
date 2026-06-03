@@ -1,0 +1,36 @@
+defaults:
+  video: videos/SANPO/SANPOdog25min.mp4
+  source_input_label: dog
+  coords_yaml: config/coords_800um.yaml
+  preprocessing_method: dog
+  amplitude_uA: 60.0
+  appearance_threshold_uA: 30.0
+  frequency_hz: 300.0
+  pulse_width_us: 170.0
+  internal_circuit_power_mw: 0.0
+  ic_heat_mode: with
+
+blocks:
+  raster_protocols:
+    description: Compare checkerboard and pseudo-random rastering for DOG preprocessing at 60 uA and 0 mW IC power.
+    run_id_template: "coords_800um__dog__amp_60uA__{raster_mode}__{raster_group}"
+    matrix:
+      raster_mode:
+        - label: checkerboard
+          raster_mode: checkerboard
+        - label: pseudo_random
+          raster_mode: pseudo_random
+
+      raster_group:
+        - label: groups_3_rate_5Hz
+          raster_groups: 3
+          metadata:
+            expected_raster_cycle_rate_hz: 5.0
+        - label: groups_4_rate_3.75Hz
+          raster_groups: 4
+          metadata:
+            expected_raster_cycle_rate_hz: 3.75
+        - label: groups_5_rate_3Hz
+          raster_groups: 5
+          metadata:
+            expected_raster_cycle_rate_hz: 3.0

@@ -182,10 +182,6 @@ class Bioheat2D:
         if self.driver_efficiency <= 0.0 or self.driver_efficiency > 1.0:
             raise ValueError("bioheat.driver_efficiency must be in the range (0, 1].")
 
-        self.source_area_mode = str(bh.get("source_area_mode", "electrode_footprint")).lower()
-        self.ic_source_area_mode = str(
-            bh.get("ic_source_area_mode", self.source_area_mode)
-        ).lower()
         self._configure_grid_sources(elec_xy_mm)
 
         self.dT = torch.zeros((self.H, self.W), dtype=torch.float32, device=self.device)
@@ -223,27 +219,13 @@ class Bioheat2D:
         electrode_footprint = np.zeros((self.H, self.W), dtype=bool)
         electrode_footprint[iy, ix] = True
 
-        if self.ic_source_area_mode in {"whole_domain", "domain"}:
-            footprint = np.ones((self.H, self.W), dtype=bool)
-        elif self.ic_source_area_mode in {"paper_uea", "utah", "uea"}:
-            width_mm = 7.88
-            height_mm = 7.53
-            cx = float(elec_xy_mm[:, 0].mean())
-            cy = float(elec_xy_mm[:, 1].mean())
-            footprint = (
-                (np.abs(grid_xx - cx) <= 0.5 * width_mm)
-                & (np.abs(grid_yy - cy) <= 0.5 * height_mm)
-            )
-        elif self.ic_source_area_mode in {"convex_hull", "hull", "array_footprint"}:
-            hull = _convex_hull(elec_xy_mm)
-            if len(hull) >= 3:
-                footprint = _polygon_mask(grid_xx, grid_yy, hull)
-            else:
-                footprint = electrode_footprint
-
-            if not np.any(footprint):
-                footprint = electrode_footprint
+        hull = _convex_hull(elec_xy_mm)
+        if len(hull) >= 3:
+            footprint = _polygon_mask(grid_xx, grid_yy, hull)
         else:
+            footprint = electrode_footprint
+
+        if not np.any(footprint):
             footprint = electrode_footprint
 
         self.ic_footprint_mask = torch.as_tensor(footprint.astype(np.float32), dtype=torch.float32, device=self.device)
@@ -429,7 +411,6 @@ class Bioheat3D:
         if self.driver_efficiency <= 0.0 or self.driver_efficiency > 1.0:
             raise ValueError("bioheat.driver_efficiency must be in the range (0, 1].")
 
-        self.source_area_mode = str(bh.get("source_area_mode", "electrode_footprint")).lower()
         self.top_heat_transfer_W_m2_K = float(bh.get("top_heat_transfer_W_m2_K", 5.0))
 
         self._configure_material_tensors()
@@ -472,28 +453,16 @@ class Bioheat3D:
         y_centers = self.ymin_mm + (np.arange(self.H, dtype=np.float64) + 0.5) * self.voxel_size_mm
         grid_xx, grid_yy = np.meshgrid(x_centers, y_centers, indexing="xy")
 
-        if self.source_area_mode in {"whole_domain", "domain"}:
-            footprint = np.ones((self.H, self.W), dtype=bool)
-        elif self.source_area_mode in {"paper_uea", "utah", "uea"}:
-            width_mm = 7.88
-            height_mm = 7.53
+        hull = _convex_hull(elec_xy_mm)
+        if len(hull) >= 3:
+            footprint = _polygon_mask(grid_xx, grid_yy, hull)
+        else:
             cx = float(elec_xy_mm[:, 0].mean())
             cy = float(elec_xy_mm[:, 1].mean())
             footprint = (
-                (np.abs(grid_xx - cx) <= 0.5 * width_mm)
-                & (np.abs(grid_yy - cy) <= 0.5 * height_mm)
+                (np.abs(grid_xx - cx) <= 0.5 * self.voxel_size_mm)
+                & (np.abs(grid_yy - cy) <= 0.5 * self.voxel_size_mm)
             )
-        else:
-            hull = _convex_hull(elec_xy_mm)
-            if len(hull) >= 3:
-                footprint = _polygon_mask(grid_xx, grid_yy, hull)
-            else:
-                cx = float(elec_xy_mm[:, 0].mean())
-                cy = float(elec_xy_mm[:, 1].mean())
-                footprint = (
-                    (np.abs(grid_xx - cx) <= 0.5 * self.voxel_size_mm)
-                    & (np.abs(grid_yy - cy) <= 0.5 * self.voxel_size_mm)
-                )
 
         if not np.any(footprint):
             ix = int(np.clip(np.argmin(np.abs(x_centers - float(elec_xy_mm[:, 0].mean()))), 0, self.W - 1))
