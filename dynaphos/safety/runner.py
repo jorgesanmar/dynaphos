@@ -13,6 +13,7 @@ High-level flow:
 """
 
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -68,6 +69,28 @@ HEATMAP_SNAPSHOT_FRACTIONS = (
     )
     / 100.0
 )
+_PROGRESS_LINE_LEN = 0
+
+
+def write_progress_line(message: str) -> None:
+    """Rewrite one terminal line for high-frequency progress updates."""
+    global _PROGRESS_LINE_LEN
+
+    columns = max(shutil.get_terminal_size(fallback=(120, 20)).columns, 20)
+    line = str(message)[: columns - 1]
+    padding = " " * max(_PROGRESS_LINE_LEN - len(line), 0)
+    sys.stderr.write(f"\r{line}{padding}")
+    sys.stderr.flush()
+    _PROGRESS_LINE_LEN = len(line)
+
+
+def finish_progress_line() -> None:
+    global _PROGRESS_LINE_LEN
+
+    if _PROGRESS_LINE_LEN > 0:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        _PROGRESS_LINE_LEN = 0
 
 
 # Plot styling helpers used by all saved figures.
@@ -1208,14 +1231,24 @@ def raster_groups_to_electrodes(
     if not sim.raster_enabled or sim.raster_groups_flat is None:
         return torch.zeros(n_elec, device=inv_map_t.device, dtype=torch.int32)
 
-    phos_groups = sim.raster_groups_flat.reshape(-1).to(inv_map_t.device).to(dtype=torch.long)
-    electrode_groups = torch.full((n_elec,), -1, device=inv_map_t.device, dtype=torch.int32)
-    for electrode_idx in range(n_elec):
-        groups = phos_groups[inv_map_t == electrode_idx]
-        if groups.numel() == 0:
-            continue
-        electrode_groups[electrode_idx] = torch.mode(groups).values.to(dtype=torch.int32)
-    return electrode_groups
+    phos_groups = sim.raster_groups_flat.reshape(-1).to(inv_map_t.device, dtype=torch.long)
+    num_groups = int(sim.raster_num_groups)
+    counts = torch.zeros(
+        (n_elec, num_groups),
+        device=inv_map_t.device,
+        dtype=torch.int32,
+    )
+    counts.scatter_add_(
+        0,
+        inv_map_t.reshape(-1, 1).expand(-1, num_groups),
+        torch.nn.functional.one_hot(phos_groups, num_classes=num_groups).to(dtype=torch.int32),
+    )
+    electrode_groups = torch.argmax(counts, dim=1).to(dtype=torch.int32)
+    return torch.where(
+        counts.sum(dim=1) > 0,
+        electrode_groups,
+        torch.full_like(electrode_groups, -1),
+    )
 
 
 def aggregate_metric(metric: torch.Tensor, inv_map_t: torch.Tensor, n_elec: int) -> np.ndarray:
@@ -1480,6 +1513,7 @@ def save_mode_outputs(
     thermal_grids: dict[str, dict],
     thermal_snapshots: dict[str, object] | None,
     internal_circuit_power_mw: float,
+    electrode_heat_enabled: bool,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     if thermal_grids:
@@ -1578,6 +1612,7 @@ def save_mode_outputs(
         "electrode_grid_ids": common_metrics["electrode_grid_ids"],
         "electrode_grid_names": common_metrics["electrode_grid_names"],
         "internal_circuit_power_total_mW": np.asarray(internal_circuit_power_mw, dtype=np.float32),
+        "electrode_heat_enabled": np.asarray(bool(electrode_heat_enabled)),
         "internal_circuit_footprint_pixels": np.asarray(footprint_pixels, dtype=np.float32),
         "internal_circuit_power_density_W_m3": np.asarray(power_density_w_m3, dtype=np.float32),
     }
@@ -1691,24 +1726,6 @@ def save_mode_outputs(
             save_payload[f"cem43_heatmaps_{suffix}"] = np.asarray(snapshots, dtype=np.float32)
 
     np.savez(out_dir / "safety_metrics.npz", **save_payload)
-    if "active_electrode_count" in common_metrics:
-        plot_device_power_diagnostics(
-            thermal_metrics.get(
-                "device_power_time_s",
-                thermal_metrics.get("thermal_time_s", common_metrics["time_s"]),
-            ),
-            common_metrics["active_electrode_count"],
-            thermal_metrics["internal_circuit_power_W"],
-            thermal_metrics["electrode_load_power_W"],
-            out_dir / "device_power_over_time.png",
-            active_time_s=common_metrics["time_s"],
-        )
-    plot_thermal_response_diagnostics(
-        thermal_metrics.get("thermal_time_s", common_metrics["time_s"]),
-        thermal_metrics["mean_dT"],
-        thermal_metrics["max_dT"],
-        out_dir / "thermal_response_over_time.png",
-    )
 
 
 # Main simulation pass for one video / preprocessing / raster combination.
@@ -1729,7 +1746,8 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                  cooldown_seconds: float = 300.0,
                  cooldown_baseline_tolerance_C: float = 1e-3,
                  appearance_threshold_uA: float | None = None,
-                 track_electrical: bool = True):
+                 track_electrical: bool = True,
+                 electrode_heat_enabled: bool = True):
     _ = snapshot_interval_s  # Legacy CLI option kept for compatibility.
     if not mode_out_dirs:
         raise ValueError("run_one_mode requires at least one IC mode output directory.")
@@ -1953,7 +1971,7 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
     )
     if configured_save_every <= 0:
         raise ValueError("save_every_n_frames must be >= 1.")
-    last_raster_assignment_key: tuple[int, ...] | None = None
+    last_raster_assignment_version: int | None = None
     configured_thermal_update_interval = resolve_thermal_update_interval_frames(
         simulation_params,
         fps=fps,
@@ -2253,6 +2271,8 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 compact_to_reference_t,
                 n_elec,
             )
+            if not electrode_heat_enabled:
+                frame_power_elec = torch.zeros_like(frame_power_elec)
             if track_electrical:
                 # SafetyTracker stores per-phosphene values; aggregate them
                 # back to physical electrodes for the general safety pipeline.
@@ -2352,19 +2372,23 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                     window_exceedance_limit_nC.append(float(safety_tracker.acc_limit_total_nC))
 
                 raster_active_group.append(int(sim.current_raster_group) if sim.raster_enabled else -1)
-                raster_assignment_compact = raster_groups_to_electrodes(sim, inv_map_t, n_elec_surv)
-                raster_assignment = expand_metric_to_reference_tensor(
-                    raster_assignment_compact.to(dtype=torch.float32),
-                    compact_to_reference_t,
-                    n_elec,
-                    fill_value=-1.0,
-                ).to(dtype=torch.int32)
-                raster_assignment_key = tuple(int(value) for value in raster_assignment.detach().cpu().tolist())
-                if raster_assignment_key != last_raster_assignment_key:
+                raster_assignment_version = (
+                    int(getattr(sim, "raster_assignment_version", 0))
+                    if sim.raster_enabled
+                    else -1
+                )
+                if raster_assignment_version != last_raster_assignment_version:
+                    raster_assignment_compact = raster_groups_to_electrodes(sim, inv_map_t, n_elec_surv)
+                    raster_assignment = expand_metric_to_reference_tensor(
+                        raster_assignment_compact.to(dtype=torch.float32),
+                        compact_to_reference_t,
+                        n_elec,
+                        fill_value=-1.0,
+                    ).to(dtype=torch.int32)
                     raster_group_assignment_frame_indices.append(int(frame_idx))
                     raster_group_assignment_times_s.append(float(current_time_s))
                     raster_group_assignments.append(tensor_row_to_numpy(raster_assignment, dtype=np.int32))
-                    last_raster_assignment_key = raster_assignment_key
+                    last_raster_assignment_version = raster_assignment_version
 
             snapshot_entry = heatmap_snapshot_lookup.get(frame_idx)
             record_thermal_metrics_and_snapshots(snapshot_entry, current_time_s)
@@ -2385,19 +2409,15 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 frame_rate = float(frame_idx) / elapsed_s
                 if video_frame_limit > 0:
                     progress_pct = 100.0 * float(frame_idx) / float(video_frame_limit)
-                    print(
+                    write_progress_line(
                         f"{raster_label}: video frame {frame_idx}/{video_frame_limit} "
                         f"({progress_pct:5.1f}%) | elapsed {elapsed_s:7.1f}s | "
-                        f"{frame_rate:5.2f} frames/s",
-                        end="\r",
-                        flush=True,
+                        f"{frame_rate:5.2f} frames/s"
                     )
                 else:
-                    print(
+                    write_progress_line(
                         f"{raster_label}: frame {frame_idx} | elapsed {elapsed_s:7.1f}s | "
-                        f"{frame_rate:5.2f} frames/s",
-                        end="\r",
-                        flush=True,
+                        f"{frame_rate:5.2f} frames/s"
                     )
 
         if cooldown_max_frames > 0:
@@ -2443,11 +2463,9 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 if cooldown_thermal_frames == cooldown_max_frames or (thermal_frame_idx - cooldown_start_frame) % max(configured_thermal_update_interval * 10, 1) == 0:
                     elapsed_s = max(time.perf_counter() - cooldown_started_at, 1e-9)
                     progress_pct = 100.0 * float(cooldown_thermal_frames) / float(cooldown_max_frames)
-                    print(
+                    write_progress_line(
                         f"{raster_label}: cooldown frame {cooldown_thermal_frames}/{cooldown_max_frames} "
-                        f"({progress_pct:5.1f}%) | elapsed {elapsed_s:7.1f}s",
-                        end="\r",
-                        flush=True,
+                        f"({progress_pct:5.1f}%) | elapsed {elapsed_s:7.1f}s"
                     )
 
             if cooldown_stop_reason == "not_started":
@@ -2461,7 +2479,7 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 state["preview_comparison_writer"].release()
 
     if frame_idx > 0:
-        print()
+        finish_progress_line()
 
     if frame_idx == 0:
         raise RuntimeError("No frames were read from the input video.")
@@ -2647,6 +2665,7 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             thermal_grids=thermal_grids,
             thermal_snapshots=thermal_snapshots,
             internal_circuit_power_mw=state["internal_circuit_power_mw"],
+            electrode_heat_enabled=electrode_heat_enabled,
         )
         summary_text = build_run_summary_text(
             video_path=video_path,

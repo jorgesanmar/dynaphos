@@ -10,7 +10,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dynaphos.safety.experiments import build_cases
 from dynaphos.safety.ic_power_visualize import write_ic_power_temperature_visuals
-from dynaphos.safety.io import add_common_cli, resolve_repo_path, run_cases, sanitize_path_part
+from dynaphos.safety.io import (
+    SimulationCase,
+    add_common_cli,
+    resolve_repo_path,
+    run_cases,
+    sanitize_path_part,
+)
 
 
 DEFAULT_CONFIG = "config/safety_experiments_phase2_ic_power.yaml"
@@ -25,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     add_common_cli(parser)
     parser.set_defaults(
         output_root=DEFAULT_OUTPUT_ROOT,
-        visuals_root=str(DEFAULT_IC_POWER_ROOT / "previews"),
+        visuals_root=str(DEFAULT_IC_POWER_ROOT),
         preview_seconds=0.0,
         preview_policy="none",
         phosphene_mode="safety_centers",
@@ -39,11 +45,33 @@ def parse_args() -> argparse.Namespace:
         help="Re-run cases even when safety_metrics.npz already exists.",
     )
     parser.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help="Run only the 21 IC-only linearity-fit cases.",
+    )
+    parser.add_argument(
         "--visuals-output-root",
-        default=str(DEFAULT_IC_POWER_ROOT / "visuals"),
+        default=str(DEFAULT_IC_POWER_ROOT / "comparative_visuals"),
         help="Directory for temperature-only IC-power comparison figures.",
     )
     parser.add_argument("--format", default="png", choices=("png", "pdf", "svg"))
+    parser.add_argument(
+        "--phase1-input-root",
+        default=str(Path(DEFAULT_OUTPUT_ROOT) / "amplitude_grid_preprocessing"),
+        help="Completed phase 1 results used to calculate the remaining mean-temperature budget.",
+    )
+    parser.add_argument(
+        "--temperature-limit-C",
+        type=float,
+        default=2.0,
+        help="Maximum allowed spatial mean temperature rise in degrees C.",
+    )
+    parser.add_argument(
+        "--power-derating-factor",
+        type=float,
+        default=0.9,
+        help="Multiplier applied to the mathematical maximum IC power recommendation.",
+    )
     parser.add_argument("--no-visuals", action="store_true")
     return parser.parse_args()
 
@@ -52,10 +80,27 @@ def case_output_dir(output_parent: Path, block: str, run_id: str) -> Path:
     return output_parent / sanitize_path_part(block) / sanitize_path_part(run_id)
 
 
+def select_cases(
+    cases: list[SimulationCase],
+    *,
+    baseline_only: bool,
+) -> list[SimulationCase]:
+    if not baseline_only:
+        return cases
+    return [case for case in cases if not case.electrode_heat_enabled]
+
+
 def main() -> None:
     args = parse_args()
+    if args.temperature_limit_C <= 0.0:
+        raise ValueError("--temperature-limit-C must be > 0.")
+    if not 0.0 < args.power_derating_factor <= 1.0:
+        raise ValueError("--power-derating-factor must be in the interval (0, 1].")
     args.track_electrical = False
-    cases = build_cases(blocks=("ic_power",), matrix_path=args.matrix_config)
+    cases = select_cases(
+        build_cases(blocks=("ic_power",), matrix_path=args.matrix_config),
+        baseline_only=bool(getattr(args, "baseline_only", False)),
+    )
     output_parent = resolve_repo_path(args.output_root)
     pending = []
     skipped = []
@@ -85,6 +130,9 @@ def main() -> None:
         image_format=args.format,
         overwrite=True,
         safety_yaml=args.safety_yaml,
+        phase1_input_root=args.phase1_input_root,
+        temperature_limit_C=args.temperature_limit_C,
+        power_derating_factor=args.power_derating_factor,
     )
     print(f"Wrote {len(written)} IC-power temperature output(s) under: {resolve_repo_path(args.visuals_output_root)}")
 

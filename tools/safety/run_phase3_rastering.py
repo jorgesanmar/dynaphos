@@ -8,46 +8,49 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dynaphos.safety import visualize
 from dynaphos.safety.experiments import (
     available_blocks,
     build_cases,
     normalize_block_selection,
 )
-from dynaphos.safety.io import add_common_cli, resolve_repo_path, run_cases
+from dynaphos.safety.io import add_common_cli, resolve_repo_path, run_cases, sanitize_path_part
+from dynaphos.safety.raster_effects import (
+    remove_obsolete_phase3_plots,
+    write_raster_effect_outputs,
+)
 
 
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "safety_experiments_phase3_rastering.yaml"
 DEFAULT_BLOCKS = ("raster_protocols",)
 DEFAULT_OUTPUT_ROOT = "results/safety/simulation_pipeline"
-DEFAULT_VISUALS_ROOT = "results/safety/simulation_pipeline/raster_protocols/visuals"
+DEFAULT_VISUALS_ROOT = "results/safety/simulation_pipeline/raster_protocols"
+DEFAULT_IC_POWER_LINEARITY_SUMMARY = (
+    Path(DEFAULT_OUTPUT_ROOT) / "ic_power" / "comparative_visuals" / "ic_power_linearity_summary.csv"
+)
 
 
 def run_visualizer(args: argparse.Namespace) -> None:
     input_root = resolve_repo_path(args.output_root) / "raster_protocols"
-    output_root = resolve_repo_path(args.visuals_root)
-    safety_yaml = resolve_repo_path(args.safety_yaml)
-    records = visualize.discover_records(input_root, safety_yaml)
-    if not records:
-        print(f"No safety_metrics.npz files found under: {input_root}; skipping visualizer.")
-        return
-
-    print(f"Running raster protocol visualizer for {len(records)} completed simulation(s).")
-    visualize.set_plot_safety_limits(visualize.load_safety_limits(safety_yaml))
-    comparative_root = output_root / "comparative_visuals"
-    visualize.write_summary_csv(records, output_root)
-    visualize.plot_ratio_breakdown(records, comparative_root, "png", overwrite=True)
-    visualize.plot_all_block_summaries(records, comparative_root, "png", overwrite=True)
-    visualize.plot_comparative_suites(records, comparative_root, "png", overwrite=True)
-    visualize.write_single_case_overviews(records, "png", overwrite=True, output_root=output_root)
-    visualize.write_per_protocol_visuals(records, "png", overwrite=True, output_root=output_root)
+    visuals_root = resolve_repo_path(args.visuals_root)
+    output_root = visuals_root / "comparative_visuals"
+    remove_obsolete_phase3_plots(output_root)
+    written = write_raster_effect_outputs(
+        input_root,
+        args.phase1_input_root,
+        output_root,
+        ic_power_linearity_summary=args.ic_power_linearity_summary,
+        temperature_limit_C=args.temperature_limit_C,
+        power_derating_factor=args.power_derating_factor,
+        image_format=args.format,
+        overwrite=True,
+    )
+    print(f"Wrote {len(written)} raster-effect output(s) under: {output_root}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the phase-3 raster protocol safety matrix for DOG preprocessing "
-            "at 60 uA and 0 mW internal-circuit power."
+            "Run phase 3 raster protocols and compare them with matched phase 1 baselines."
         )
     )
     add_common_cli(parser)
@@ -79,16 +82,67 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only write safety_metrics.npz outputs; skip summary and plot generation.",
     )
+    parser.add_argument(
+        "--include-existing",
+        action="store_true",
+        help="Re-run cases even when safety_metrics.npz already exists.",
+    )
+    parser.add_argument(
+        "--phase1-input-root",
+        default=str(Path(DEFAULT_OUTPUT_ROOT) / "amplitude_grid_preprocessing"),
+        help="Completed phase 1 raster-off results used as matched baselines.",
+    )
+    parser.add_argument(
+        "--ic-power-linearity-summary",
+        default=str(DEFAULT_IC_POWER_LINEARITY_SUMMARY),
+        help="Phase 2 grid-specific IC thermal slopes used for old/new IC power budgets.",
+    )
+    parser.add_argument(
+        "--temperature-limit-C",
+        type=float,
+        default=2.0,
+        help="Maximum allowed spatial mean temperature rise in degrees C.",
+    )
+    parser.add_argument(
+        "--power-derating-factor",
+        type=float,
+        default=0.9,
+        help="Multiplier used for the recommended IC power budget columns.",
+    )
+    parser.add_argument("--format", default="png", choices=("png", "pdf", "svg"))
     return parser.parse_args()
+
+
+def case_output_dir(output_parent: Path, block: str, run_id: str) -> Path:
+    return output_parent / sanitize_path_part(block) / sanitize_path_part(run_id)
 
 
 def main() -> None:
     args = parse_args()
+    if args.temperature_limit_C <= 0.0:
+        raise ValueError("--temperature-limit-C must be > 0.")
+    if not 0.0 < args.power_derating_factor <= 1.0:
+        raise ValueError("--power-derating-factor must be in the interval (0, 1].")
     cases = build_cases(
         blocks=normalize_block_selection(args.blocks),
         matrix_path=args.matrix_config,
     )
-    run_cases(cases, args)
+    output_parent = resolve_repo_path(args.output_root)
+    pending = [
+        case
+        for case in cases
+        if args.include_existing
+        or not (case_output_dir(output_parent, case.block, case.run_id) / "safety_metrics.npz").exists()
+    ]
+    skipped = [case for case in cases if case not in pending]
+    if skipped:
+        print(f"Skipping {len(skipped)} completed raster protocol case(s):")
+        for case in skipped:
+            print(f"  {case.run_id}")
+    if pending:
+        run_cases(pending, args)
+    else:
+        print("No raster protocol simulations to run.")
     if not args.dry_run and not args.skip_visualizer:
         run_visualizer(args)
 

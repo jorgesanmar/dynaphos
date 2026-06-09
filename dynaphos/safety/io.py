@@ -68,6 +68,7 @@ class SimulationCase:
     source_input_label: str = "SANPO_groundtruth"
     internal_circuit_power_mw: float = 0.0
     ic_heat_mode: str = "without"
+    electrode_heat_enabled: bool = True
     metadata: dict[str, object] = field(default_factory=dict)
 
 
@@ -156,6 +157,7 @@ def write_manifest(
         "source_input_label": case.source_input_label,
         "internal_circuit_power_mw": float(case.internal_circuit_power_mw),
         "ic_heat_mode": case.ic_heat_mode,
+        "electrode_heat_enabled": bool(case.electrode_heat_enabled),
         "params": str(params_path),
         "safety_yaml": str(safety_yaml),
         "output_root": str(output_root),
@@ -262,7 +264,8 @@ def iter_case_lines(cases: Iterable[SimulationCase]) -> Iterable[str]:
             f"pw={case.pulse_width_us:g}us threshold="
             f"{'default' if case.appearance_threshold_uA is None else f'{case.appearance_threshold_uA:g}uA'} "
             f"raster={case.raster_mode} groups={case.raster_groups if case.raster_groups is not None else 'cli'} "
-            f"ic={case.internal_circuit_power_mw:g}mW"
+            f"ic={case.internal_circuit_power_mw:g}mW "
+            f"electrode_heat={'on' if case.electrode_heat_enabled else 'off'}"
         )
 
 
@@ -321,7 +324,6 @@ def run_one_case(
     device = configure_device(base_params, force_cpu=bool(args_dict["force_cpu"]))
 
     out_dir = output_root / case.block / sanitize_path_part(case.run_id)
-    preview_dir = visuals_root / case.block / sanitize_path_part(case.run_id)
     params, stimulus_scale = build_params_for_case(base_params, case, safety_yaml)
     groups = case_raster_groups(case, int(args_dict["groups"]))
     sim_resolution = args_dict.get("sim_resolution")
@@ -349,6 +351,11 @@ def run_one_case(
         if should_write_preview(case, str(args_dict["preview_policy"]), float(args_dict["preview_seconds"]))
         else 0.0
     )
+    preview_dir = (
+        visuals_root / case.block / sanitize_path_part(case.run_id)
+        if preview_seconds > 0.0
+        else out_dir
+    )
     print(
         f"[{index}/{total}] {case.run_id}\n"
         f"  video={Path(case.video).name} | grid={Path(case.coords_yaml).stem} | "
@@ -356,7 +363,9 @@ def run_one_case(
         f"pw={case.pulse_width_us:g} us | threshold="
         f"{'default' if case.appearance_threshold_uA is None else f'{case.appearance_threshold_uA:g} uA'} | "
         f"raster={case.raster_mode} groups={groups} | "
-        f"ic={case.internal_circuit_power_mw:g} mW | preview={preview_seconds:g}s | "
+        f"ic={case.internal_circuit_power_mw:g} mW | "
+        f"electrode_heat={'on' if case.electrode_heat_enabled else 'off'} | "
+        f"preview={preview_seconds:g}s | "
         f"cooldown={float(args_dict['cooldown_seconds']):g}s"
     )
     try:
@@ -383,6 +392,7 @@ def run_one_case(
             phosphene_mode=str(args_dict["phosphene_mode"]),
             enable_cem43=bool(args_dict["enable_cem43"]),
             track_electrical=bool(args_dict.get("track_electrical", True)),
+            electrode_heat_enabled=bool(case.electrode_heat_enabled),
             device=device,
         )
     finally:
@@ -486,32 +496,60 @@ def safety_value_to_nC(section: dict, *, default_factor: float) -> float:
 
 def load_safety_limits(safety_yaml: str | Path = DEFAULT_SAFETY) -> dict[str, float]:
     cfg = load_yaml(safety_yaml)
+    thresholds = cfg.get("thresholds", {}) or {}
+    thermal = cfg.get("thermal", {}) or {}
     guidelines = cfg.get("stimulation_safety_guidelines", {}) or {}
     acc = guidelines.get("accumulated_charge", {}) or {}
     acc_limits = acc.get("limits", {}) or {}
     temp = guidelines.get("temperature", {}) or {}
     temp_inc = temp.get("temperature_increase", {}) or {}
     chronic = cfg.get("chronic", {}) or {}
-    return {
-        "charge_per_phase_nC": float((guidelines.get("charge_per_phase", {}) or {}).get("value", np.inf)),
-        "window_charge_per_electrode_nC": safety_value_to_nC(
-            acc_limits.get("per_electrode", {}) or {},
-            default_factor=1.0,
-        ),
-        "window_charge_total_nC": safety_value_to_nC(
+
+    total_charge_limit_nC = float(thresholds.get("accumulated_charge_limit_mc_per_second", np.inf)) * 1e6
+    if not np.isfinite(total_charge_limit_nC):
+        total_charge_limit_nC = safety_value_to_nC(
             acc_limits.get("total_all_electrodes", {}) or {},
             default_factor=1e3,
+        )
+
+    return {
+        "charge_per_phase_nC": float(
+            thresholds.get(
+                "charge_per_phase_max_nc",
+                (guidelines.get("charge_per_phase", {}) or {}).get("value", np.inf),
+            )
         ),
+        "window_charge_per_electrode_nC": float(
+            thresholds.get(
+                "accumulated_charge_per_electrode_nc_per_s",
+                safety_value_to_nC(acc_limits.get("per_electrode", {}) or {}, default_factor=1.0),
+            )
+        ),
+        "window_charge_total_nC": total_charge_limit_nC,
         "simultaneous_activation_pct": float(
-            ((guidelines.get("simultaneous_activation", {}) or {}).get("max_percentage_of_electrodes", {}) or {}).get(
-                "value",
-                np.inf,
+            thresholds.get(
+                "simultaneous_activation_max_percentage",
+                (
+                    (guidelines.get("simultaneous_activation", {}) or {}).get(
+                        "max_percentage_of_electrodes",
+                        {},
+                    )
+                    or {}
+                ).get("value", np.inf),
             )
         ),
         "temperature_increase_C": float(
-            (temp_inc.get("absolute_max_temperature_increase", {}) or {}).get("value", np.inf)
+            thermal.get(
+                "max_temp_rise",
+                (temp_inc.get("absolute_max_temperature_increase", {}) or {}).get("value", np.inf),
+            )
         ),
-        "cem43_min": float((temp.get("cem43", {}) or {}).get("value", np.inf)),
+        "cem43_min": float(
+            thermal.get(
+                "cem43_limit_min",
+                (temp.get("cem43", {}) or {}).get("value", np.inf),
+            )
+        ),
         "session_charge_limit_mC": float(chronic.get("session_charge_limit_c", np.inf)) * 1e3,
     }
 
@@ -660,5 +698,6 @@ def load_case_from_manifest(manifest_path: Path, *, block: str, run_id: str) -> 
         source_input_label=str(manifest.get("source_input_label", manifest.get("preprocessing_method", "groundtruth"))),
         internal_circuit_power_mw=float(manifest.get("internal_circuit_power_mw", 0.0)),
         ic_heat_mode=str(manifest.get("ic_heat_mode", "without")),
+        electrode_heat_enabled=bool(manifest.get("electrode_heat_enabled", True)),
         metadata={"source_manifest": str(manifest_path)},
     )

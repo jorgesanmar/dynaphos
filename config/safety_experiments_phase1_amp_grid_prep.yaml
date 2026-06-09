@@ -46,6 +46,6 @@ blocks:
           source_input_label: canny
           preprocessing_method: canny
         - label: gt
-          video: videos/SANPO/SANPO25min.mp4
+          video: videos/SANPO/SANPOgt25min.mp4
           source_input_label: gt
           preprocessing_method: groundtruth

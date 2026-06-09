@@ -99,14 +99,25 @@ class SafetyTracker:
         acc_limits = accumulated_charge.get("limits", {}) or {}
         per_e = acc_limits.get("per_electrode", {}) or {}
         total = acc_limits.get("total_all_electrodes", {}) or {}
+        threshold_total_nC = self._to_float(
+            thresholds.get("accumulated_charge_limit_mc_per_second"),
+            float("inf"),
+        ) * 1e6
+        if not np.isfinite(threshold_total_nC):
+            threshold_total_nC = self._to_float(
+                thresholds.get("accumulated_charge_limit_uc_per_second"),
+                float("inf"),
+            ) * 1e3
         self.acc_limit_per_electrode_nC = (
             self._to_float(per_e.get("value"), thresholds.get("accumulated_charge_per_electrode_nc_per_s", float("inf")))
             * self._unit_to_nC_factor(per_e.get("unit"), default=1.0)
         )
-        self.acc_limit_total_nC = (
-            self._to_float(total.get("value"), thresholds.get("accumulated_charge_limit_uc_per_second", float("inf")))
-            * self._unit_to_nC_factor(total.get("unit"), default=1e3)
-        )
+        self.acc_limit_total_nC = threshold_total_nC
+        if not np.isfinite(self.acc_limit_total_nC):
+            self.acc_limit_total_nC = (
+                self._to_float(total.get("value"), float("inf"))
+                * self._unit_to_nC_factor(total.get("unit"), default=1e3)
+            )
         self.acc_limit_per_electrode_nC = self._to_float(
             safety_params.get("window_charge_limit_per_electrode_nC", self.acc_limit_per_electrode_nC),
             self.acc_limit_per_electrode_nC,
@@ -150,16 +161,26 @@ class SafetyTracker:
 
         sim_activation = guidelines.get("simultaneous_activation", {}) or {}
         pct = sim_activation.get("max_percentage_of_electrodes", {}) or {}
-        self.max_active_pct = self._to_float(pct.get("value"), float("inf"))
+        self.max_active_pct = self._to_float(
+            thresholds.get("simultaneous_activation_max_percentage", pct.get("value")),
+            float("inf"),
+        )
 
+        thermal = safety_config.get("thermal", {}) or {}
         temp = guidelines.get("temperature", {}) or {}
         temp_inc = temp.get("temperature_increase", guidelines.get("temperature_increase", {})) or {}
         max_dur = temp.get("max_continuous_duration_above_1_c", {}) or {}
         if not max_dur:
             max_dur = temp_inc.get("max_continuous_duration_above_1_c", {}) or {}
         abs_max = temp_inc.get("absolute_max_temperature_increase", {}) or {}
-        self.max_duration_above_1c_s = self._to_float(max_dur.get("value"), float("inf"))
-        self.abs_max_temp_increase_c = self._to_float(abs_max.get("value"), float("inf"))
+        self.max_duration_above_1c_s = self._to_float(
+            thermal.get("max_continuous_duration_above_1_c_s", max_dur.get("value")),
+            float("inf"),
+        )
+        self.abs_max_temp_increase_c = self._to_float(
+            thermal.get("max_temp_rise", abs_max.get("value")),
+            float("inf"),
+        )
 
     def _ensure_device(self, ref: torch.Tensor):
         if self.window_charge_per_electrode_nC.device == ref.device and self.window_charge_per_electrode_nC.dtype == ref.dtype:

@@ -45,16 +45,7 @@ DEFAULT_OUTPUT_ROOT = Path(DEFAULT_VISUALS_ROOT)
 
 MATRIX_BLOCK = "amplitude_grid_preprocessing"
 BLOCK_ORDER = ("amplitude", "electrode_density", "preprocessing", "internal_circuit", "rastering", MATRIX_BLOCK)
-SUMMARY_METRICS = (
-    ("peak_current_uA", "Peak current", "uA"),
-    ("peak_charge_per_phase_nC", "Peak charge per phase", "nC"),
-    ("peak_shannon_k", "Peak Shannon k", ""),
-    ("peak_active_electrodes", "Peak active electrodes", "electrodes"),
-    ("max_active_pct", "Max active electrodes", "%"),
-    ("max_total_charge_rate_mC_s", "Max total charge rate", "mC/s"),
-    ("max_dT_C", "Max focal temperature rise", "deg C"),
-)
-
+THERMAL_CMAP = "hot"
 COLORS = {
     "amplitude": "#1F4E79",
     "electrode_density": "#2E8B57",
@@ -215,10 +206,11 @@ def add_limit_line(
     *,
     label: str = "safety.yaml limit",
     color: str = "#8B1E3F",
+    linestyle: str = "--",
 ) -> bool:
     if not np.isfinite(value) or value <= 0.0:
         return False
-    ax.axhline(value, color=color, linestyle="--", linewidth=1.15, label=label)
+    ax.axhline(value, color=color, linestyle=linestyle, linewidth=1.15, label=label)
     return True
 
 
@@ -1115,13 +1107,7 @@ def should_use_cloud_for_case(manifest: dict) -> bool:
 
 
 def case_visuals_dir(record: MatrixRecord) -> Path:
-    if _CASE_VISUALS_ROOT is not None:
-        return (
-            _CASE_VISUALS_ROOT
-            / sanitize_path_part(record.block)
-            / sanitize_path_part(record.run_id)
-        )
-    return record.npz_path.parent / "visuals"
+    return record.npz_path.parent
 
 
 def protocol_color(record: MatrixRecord) -> str:
@@ -1220,18 +1206,20 @@ def annotate_mean_max(
     mean_label: str = "mean",
     max_label: str = "max",
     unit: str = "",
+    above_axes: bool = False,
 ) -> None:
     suffix = f" {unit}" if unit else ""
     ax.text(
         0.02,
-        0.98,
+        1.02 if above_axes else 0.98,
         f"{mean_label} {format_summary_number(mean_value)}{suffix}\n"
         f"{max_label} {format_summary_number(max_value)}{suffix}",
         transform=ax.transAxes,
         ha="left",
-        va="top",
+        va="bottom" if above_axes else "top",
         fontsize=8.5,
         color="#111827",
+        clip_on=False,
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "none", "alpha": 0.82},
     )
 
@@ -1270,7 +1258,8 @@ def plot_protocol_metric_distribution(
             else:
                 x, y = series
                 ax.plot(x, y, color=color, linewidth=1.9, label=record.label)
-                ax.legend(frameon=False, fontsize=8)
+                if metric not in {"amplitude", "shannon"}:
+                    ax.legend(frameon=False, fontsize=8)
                 style_axes(ax)
                 valid = finite_summary_values(y, positive_only=False)
                 summary_mean = finite_nanmean(valid)
@@ -1287,7 +1276,8 @@ def plot_protocol_metric_distribution(
                 use_cloud=should_use_cloud_for_case(manifest),
                 empty_value=0.0 if metric == "amplitude" and positive_only else None,
             )
-            ax.legend(frameon=False, fontsize=8)
+            if metric not in {"amplitude", "shannon"}:
+                ax.legend(frameon=False, fontsize=8)
             style_axes(ax)
             row_values = finite_summary_values(rows, positive_only=positive_only)
             summary_mean = finite_nanmean(mean_trace)
@@ -1329,6 +1319,7 @@ def plot_protocol_activated_electrodes(
                 max_value=finite_nanmax(active[1]),
                 mean_label="mean active",
                 max_label="max active",
+                above_axes=True,
             )
             plotted = True
         stimulated = series_from_key(data, "stimulated_electrode_count", max_points=PER_PROTOCOL_SERIES_POINTS)
@@ -1336,11 +1327,10 @@ def plot_protocol_activated_electrodes(
             ax.plot(stimulated[0], stimulated[1], color="#C05621", linewidth=1.4, label="stimulated")
             plotted = True
         if plotted:
-            ax.legend(frameon=False, fontsize=8)
             style_axes(ax)
         else:
             add_no_data(ax, "No electrode counts")
-        ax.set_title("Activated Electrodes Over Time")
+        ax.set_title("Activated Electrodes Over Time", pad=42)
         ax.set_xlabel(TIME_AXIS_LABEL)
         ax.set_ylabel("electrodes")
         save_figure(fig, out_path, overwrite=overwrite)
@@ -1435,6 +1425,7 @@ def plot_protocol_charge_per_second(
                     mean_label="mean",
                     max_label="max",
                     unit="uC/s",
+                    above_axes=True,
                 )
                 style_axes(axes[0])
         else:
@@ -1444,7 +1435,7 @@ def plot_protocol_charge_per_second(
                 axes[0],
                 x,
                 rows_uC_s,
-                label="active electrodes",
+                label="_nolegend_",
                 color=color,
                 positive_only=True,
                 use_cloud=should_use_cloud_for_case(manifest),
@@ -1457,12 +1448,12 @@ def plot_protocol_charge_per_second(
                 mean_label="mean",
                 max_label="max",
                 unit="uC/s",
+                above_axes=True,
             )
-            axes[0].legend(frameon=False, fontsize=8)
             style_axes(axes[0])
-        if add_limit_line(axes[0], per_e_limit):
+        if add_limit_line(axes[0], per_e_limit, label="safety limit", linestyle=":"):
             axes[0].legend(frameon=False, fontsize=8)
-        axes[0].set_title("Mean Across Electrodes")
+        axes[0].set_title("Mean Across Electrodes", pad=42)
         axes[0].set_xlabel(TIME_AXIS_LABEL)
         axes[0].set_ylabel("charge rate (uC/s/electrode)")
 
@@ -1480,11 +1471,12 @@ def plot_protocol_charge_per_second(
                 mean_label="mean",
                 max_label="max",
                 unit="mC/s",
+                above_axes=True,
             )
             style_axes(axes[1])
-        if add_limit_line(axes[1], total_limit):
+        if add_limit_line(axes[1], total_limit, label="safety limit", linestyle=":"):
             axes[1].legend(frameon=False, fontsize=8)
-        axes[1].set_title("Summed Across Electrodes")
+        axes[1].set_title("Summed Across Electrodes", pad=42)
         axes[1].set_xlabel(TIME_AXIS_LABEL)
         axes[1].set_ylabel("charge rate (mC/s)")
 
@@ -1591,8 +1583,7 @@ def plot_protocol_charge_over_protocol(
             add_no_data(axes[1], "No accumulated charge trace")
         else:
             axes[1].plot(total_series[0], total_series[1] / 1e6, color="#8B1E3F", linewidth=1.9)
-            if add_limit_line(axes[1], plot_safety_limit("session_charge_limit_mC"), label="session charge limit"):
-                axes[1].legend(frameon=False, fontsize=8)
+            add_limit_line(axes[1], plot_safety_limit("session_charge_limit_mC"), label="_nolegend_")
             style_axes(axes[1])
         axes[1].set_title("Accumulated Charge")
         axes[1].set_xlabel(TIME_AXIS_LABEL)
@@ -1604,8 +1595,7 @@ def plot_protocol_charge_over_protocol(
             x = cumulative["time_s"]
             axes[2].fill_between(x, cumulative["p05"] / 1e6, cumulative["p95"] / 1e6, color="#1F4E79", alpha=0.14, linewidth=0)
             axes[2].fill_between(x, cumulative["p25"] / 1e6, cumulative["p75"] / 1e6, color="#1F4E79", alpha=0.24, linewidth=0)
-            axes[2].plot(x, cumulative["mean"] / 1e6, color="#1F4E79", linewidth=1.9, label="mean active electrode")
-            axes[2].legend(frameon=False, fontsize=8)
+            axes[2].plot(x, cumulative["mean"] / 1e6, color="#1F4E79", linewidth=1.9)
             style_axes(axes[2])
         axes[2].set_title("Accumulated Charge Per Electrode")
         axes[2].set_xlabel(TIME_AXIS_LABEL)
@@ -1920,7 +1910,7 @@ def plot_temperature_volume_sections(
         downsample_image(volume[source_z]),
         origin="lower",
         extent=(xmin, xmax, ymin, ymax),
-        cmap="inferno",
+        cmap=THERMAL_CMAP,
         vmin=0.0,
         vmax=vmax,
         interpolation="nearest",
@@ -1937,7 +1927,7 @@ def plot_temperature_volume_sections(
         downsample_image(volume[:, max_y, :]),
         origin="lower",
         extent=(xmin, xmax, zmin, zmax),
-        cmap="inferno",
+        cmap=THERMAL_CMAP,
         vmin=0.0,
         vmax=vmax,
         interpolation="nearest",
@@ -1955,7 +1945,7 @@ def plot_temperature_volume_sections(
         downsample_image(volume[:, :, max_x]),
         origin="lower",
         extent=(ymin, ymax, zmin, zmax),
-        cmap="inferno",
+        cmap=THERMAL_CMAP,
         vmin=0.0,
         vmax=vmax,
         interpolation="nearest",
@@ -2017,7 +2007,7 @@ def plot_protocol_temperature_heatmaps(
                         downsample_image(stack[idx]),
                         origin="lower",
                         extent=extent,
-                        cmap="inferno",
+                        cmap=THERMAL_CMAP,
                         vmin=0.0,
                         vmax=vmax,
                         interpolation="nearest",
@@ -2028,11 +2018,14 @@ def plot_protocol_temperature_heatmaps(
                     ax.set_xticks([])
                     ax.set_yticks([])
                 if image is not None:
-                    cbar = fig.colorbar(image, ax=axes.reshape(-1).tolist(), fraction=0.025, pad=0.015)
-                    cbar.set_label("dT (deg C)")
+                    fig.subplots_adjust(top=0.90, right=0.88, hspace=0.28, wspace=0.10)
+                    cbar_ax = fig.add_axes([0.91, 0.14, 0.015, 0.70])
+                    cbar = fig.colorbar(image, cax=cbar_ax)
+                    cbar.set_label("ΔT (°C)")
                     cbar.ax.tick_params(labelsize=8)
                 fig.suptitle(f"Temperature Heatmaps - {grid_name}", fontsize=12, fontweight="bold")
-                fig.subplots_adjust(top=0.90, right=0.92, hspace=0.28, wspace=0.10)
+                if image is None:
+                    fig.subplots_adjust(top=0.90, right=0.96, hspace=0.28, wspace=0.10)
                 save_figure(fig, sheet_path, overwrite=overwrite)
             else:
                 print(f"Skipping existing: {sheet_path}")
@@ -2051,7 +2044,7 @@ def plot_protocol_temperature_heatmaps(
                     downsample_image(heatmap),
                     origin="lower",
                     extent=extent,
-                    cmap="inferno",
+                    cmap=THERMAL_CMAP,
                     vmin=0.0,
                     vmax=vmax,
                     interpolation="nearest",
@@ -2065,7 +2058,7 @@ def plot_protocol_temperature_heatmaps(
                 ax.set_ylabel("y (mm)" if extent is not None else "y pixel")
                 ax.tick_params(labelsize=8)
                 cbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-                cbar.set_label("dT (deg C)")
+                cbar.set_label("ΔT (°C)")
                 cbar.ax.tick_params(labelsize=8)
                 fig.tight_layout()
                 save_figure(fig, out_path, overwrite=overwrite)
@@ -2078,8 +2071,8 @@ def plot_protocol_temperature_series(
     overwrite: bool,
 ) -> None:
     for key, title, ylabel, filename, color in (
-        ("mean_dT", "Mean Î”T Over Time", "mean Î”T (Â°C)", "mean_dT_over_time", "#1F4E79"),
-        ("max_dT", "Max Focal dT Over Time", "max focal dT (deg C)", "max_focal_dT_over_time", "#8B1E3F"),
+        ("mean_dT", "Mean ΔT Over Time", "mean ΔT (°C)", "mean_dT_over_time", "#1F4E79"),
+        ("max_dT", "Max Focal ΔT Over Time", "max focal ΔT (°C)", "max_focal_dT_over_time", "#8B1E3F"),
     ):
         out_path = case_visuals_dir(record) / f"{filename}.{image_format}"
         if out_path.exists() and not overwrite:
@@ -2098,7 +2091,7 @@ def plot_protocol_temperature_series(
                     max_value=finite_nanmax(series[1]),
                     mean_label="mean",
                     max_label="max",
-                    unit="Â°C",
+                    unit="°C",
                 )
                 style_axes(ax)
             ax.set_title(title)
@@ -2121,9 +2114,9 @@ def plot_protocol_temperature_areas(
         fig, ax = plt.subplots(figsize=(8.8, 4.4))
         plotted = False
         for key, label, color in (
-            ("area_gt1_mm2", ">1 Â°C", "#1F4E79"),
-            ("area_gt2_mm2", ">2 Â°C", "#C05621"),
-            ("area_gt3_mm2", ">3 Â°C", "#8B1E3F"),
+            ("area_gt1_mm2", ">1 °C", "#1F4E79"),
+            ("area_gt2_mm2", ">2 °C", "#C05621"),
+            ("area_gt3_mm2", ">3 °C", "#8B1E3F"),
         ):
             series = series_from_key(data, key, max_points=MAX_SERIES_POINTS)
             if series is None:
@@ -2183,7 +2176,7 @@ def write_per_protocol_visuals(
 
 
 def comparison_output_dir(output_root: Path, block: str) -> Path:
-    return output_root / sanitize_path_part(block)
+    return output_root
 
 
 def record_color(index: int, block: str | None = None) -> str:
@@ -2201,6 +2194,7 @@ def plot_records_series(
     title: str,
     ylabel: str,
     getter,
+    show_legend: bool = True,
 ) -> None:
     if not records:
         return
@@ -2227,7 +2221,8 @@ def plot_records_series(
         )
         plotted = True
     if plotted:
-        ax.legend(frameon=False, fontsize=8, ncol=2)
+        if show_legend:
+            ax.legend(frameon=False, fontsize=8, ncol=2)
         style_axes(ax)
     else:
         add_no_data(ax, "No comparable series")
@@ -2490,7 +2485,44 @@ def pairwise_path(
     filename = f"fixed_{fixed_factor}_{sanitize_path_part(fixed_value.key)}"
     if suffix:
         filename = f"{filename}_{sanitize_path_part(suffix)}"
-    return output_root / MATRIX_BLOCK / "pairwise" / metric / pair_name / f"{filename}.{image_format}"
+    return output_root / "pairwise" / metric / pair_name / f"{filename}.{image_format}"
+
+
+def fixed_factor_caption(fixed_factor: str, fixed_value: FactorValue) -> str:
+    if fixed_factor == "preprocessing":
+        return fixed_value.label
+    return f"fixed {fixed_factor.replace('_', ' ')}: {fixed_value.label}"
+
+
+def is_thermal_metric(metric_name: str) -> bool:
+    normalized = metric_name.strip().lower()
+    return "temperature" in normalized or normalized.endswith("_dt")
+
+
+def contrasting_cell_text_color(
+    value: float,
+    *,
+    vmin: float,
+    vmax: float,
+    cmap: str = THERMAL_CMAP,
+) -> str:
+    if not np.isfinite(value):
+        return FALLBACK_COLOR
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or np.isclose(vmin, vmax):
+        normalized = 0.5
+    else:
+        normalized = float(np.clip((value - vmin) / (vmax - vmin), 0.0, 1.0))
+    red, green, blue, _alpha = plt.get_cmap(cmap)(normalized)
+    srgb = np.asarray([red, green, blue], dtype=np.float64)
+    linear = np.where(
+        srgb <= 0.04045,
+        srgb / 12.92,
+        ((srgb + 0.055) / 1.055) ** 2.4,
+    )
+    luminance = float(np.dot(linear, np.asarray([0.2126, 0.7152, 0.0722])))
+    white_contrast = 1.05 / (luminance + 0.05)
+    black_contrast = (luminance + 0.05) / 0.05
+    return "white" if white_contrast >= black_contrast else "black"
 
 
 def matrix_record_for_values(
@@ -2543,8 +2575,8 @@ SCALAR_PAIRWISE_METRICS: tuple[tuple[str, str, str, Callable[[np.lib.npyio.NpzFi
     ("max_shannon_k", "Max Shannon K", "K", scalar_max_shannon_k),
     ("peak_activated_electrodes", "Peak Activated Electrodes", "electrodes", scalar_peak_active_electrodes),
     ("final_total_accumulated_charge", "Final Total Accumulated Charge", "mC", scalar_final_total_charge_mC),
-    ("max_mean_dT", "Max Mean Î”T", "Â°C", scalar_max_mean_dT),
-    ("max_dT", "Max Focal dT", "deg C", scalar_max_dT),
+    ("max_mean_dT", "Max Mean ΔT", "°C", scalar_max_mean_dT),
+    ("max_dT", "Max Focal ΔT", "°C", scalar_max_dT),
 )
 
 
@@ -2597,18 +2629,28 @@ def plot_pairwise_scalar_heatmap(
 
     fig, ax = plt.subplots(figsize=(7.4, 5.8))
     masked = np.ma.masked_invalid(values)
-    image = ax.imshow(masked, cmap="viridis", aspect="auto")
+    cmap = THERMAL_CMAP if is_thermal_metric(metric_name) else "viridis"
+    image = ax.imshow(masked, cmap=cmap, aspect="auto")
+    finite = values[np.isfinite(values)]
+    text_vmin = float(np.min(finite)) if finite.size else 0.0
+    text_vmax = float(np.max(finite)) if finite.size else 1.0
     for row in range(values.shape[0]):
         for col in range(values.shape[1]):
+            value = values[row, col]
             ax.text(
                 col,
                 row,
-                format_scalar_value(values[row, col]),
+                format_scalar_value(value),
                 ha="center",
                 va="center",
-                color="white" if np.isfinite(values[row, col]) else FALLBACK_COLOR,
+                color=contrasting_cell_text_color(
+                    value,
+                    vmin=text_vmin,
+                    vmax=text_vmax,
+                    cmap=cmap,
+                ),
                 fontsize=9,
-                fontweight="bold" if np.isfinite(values[row, col]) else "normal",
+                fontweight="bold" if np.isfinite(value) else "normal",
             )
     ax.set_xticks(range(len(x_values)))
     ax.set_xticklabels([value.label for value in x_values], rotation=30, ha="right")
@@ -2616,7 +2658,7 @@ def plot_pairwise_scalar_heatmap(
     ax.set_yticklabels([value.label for value in y_values])
     ax.set_xlabel(x_factor.replace("_", " "))
     ax.set_ylabel(y_factor.replace("_", " "))
-    ax.set_title(f"{title}\nfixed {fixed_factor.replace('_', ' ')}: {fixed_value.label}")
+    ax.set_title(f"{title}\n{fixed_factor_caption(fixed_factor, fixed_value)}")
     cbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label(unit)
     fig.tight_layout()
@@ -2783,14 +2825,14 @@ TIME_PAIRWISE_METRICS: tuple[
     ),
     (
         "mean_dT_over_time",
-        "Mean Î”T Over Time",
-        "mean Î”T (Â°C)",
+        "Mean ΔT Over Time",
+        "mean ΔT (°C)",
         lambda ax, record, data, color, label: draw_data_series_on_axis(ax, data, "mean_dT", color=color, label=label),
     ),
     (
         "max_focal_dT_over_time",
-        "Max Focal dT Over Time",
-        "max focal dT (deg C)",
+        "Max Focal ΔT Over Time",
+        "max focal ΔT (°C)",
         lambda ax, record, data, color, label: draw_data_series_on_axis(ax, data, "max_dT", color=color, label=label),
     ),
 )
@@ -2853,7 +2895,7 @@ def plot_pairwise_time_sheet(
             if row == len(y_values) - 1:
                 ax.set_xlabel(TIME_AXIS_LABEL)
     fig.suptitle(
-        f"{title}\n{pair_name.replace('_', ' ')} | fixed {fixed_factor.replace('_', ' ')}: {fixed_value.label}",
+        f"{title}\n{pair_name.replace('_', ' ')} | {fixed_factor_caption(fixed_factor, fixed_value)}",
         fontsize=13,
         fontweight="bold",
     )
@@ -2938,7 +2980,8 @@ def plot_pairwise_charge_heatmap_sheet(
         cbar.set_label("charge (mC)")
         cbar.ax.tick_params(labelsize=8)
     fig.suptitle(
-        f"Final Accumulated Charge Heatmap\n{pair_name.replace('_', ' ')} | fixed {fixed_factor.replace('_', ' ')}: {fixed_value.label}",
+        f"Final Accumulated Charge Heatmap\n{pair_name.replace('_', ' ')} | "
+        f"{fixed_factor_caption(fixed_factor, fixed_value)}",
         fontsize=13,
         fontweight="bold",
     )
@@ -3018,13 +3061,13 @@ def plot_pairwise_temperature_heatmap_sheet(
             ax = axes[row, col]
             heatmap = images[(row, col)]
             if heatmap is None:
-                add_no_data(ax, "No Î”T map")
+                add_no_data(ax, "No ΔT map")
             else:
                 image = ax.imshow(
                     downsample_image(heatmap),
                     origin="lower",
                     aspect="equal",
-                    cmap="inferno",
+                    cmap=THERMAL_CMAP,
                     vmin=0.0,
                     vmax=vmax,
                 )
@@ -3035,16 +3078,19 @@ def plot_pairwise_temperature_heatmap_sheet(
             if col == 0:
                 ax.set_ylabel(y_value.label, fontsize=9)
     if image is not None:
-        cbar = fig.colorbar(image, ax=axes.reshape(-1).tolist(), fraction=0.025, pad=0.02)
-        cbar.set_label("Î”T (Â°C)")
+        fig.subplots_adjust(top=0.88, right=0.87, hspace=0.25, wspace=0.12)
+        cbar_ax = fig.add_axes([0.90, 0.14, 0.015, 0.68])
+        cbar = fig.colorbar(image, cax=cbar_ax)
+        cbar.set_label("ΔT (°C)")
         cbar.ax.tick_params(labelsize=8)
     fig.suptitle(
         f"Temperature Heatmaps - {grid_name} - {position_label}\n"
-        f"{pair_name.replace('_', ' ')} | fixed {fixed_factor.replace('_', ' ')}: {fixed_value.label}",
+        f"{pair_name.replace('_', ' ')} | {fixed_factor_caption(fixed_factor, fixed_value)}",
         fontsize=13,
         fontweight="bold",
     )
-    fig.subplots_adjust(top=0.88, right=0.92, hspace=0.25, wspace=0.12)
+    if image is None:
+        fig.subplots_adjust(top=0.88, right=0.96, hspace=0.25, wspace=0.12)
     save_figure(fig, path, overwrite=overwrite)
 
 
@@ -3074,7 +3120,6 @@ def summary_grid_path(
 ) -> Path:
     return (
         output_root
-        / MATRIX_BLOCK
         / "summary_grids"
         / sanitize_path_part(metric_name)
         / f"{sanitize_path_part(stat_name)}_{sanitize_path_part(pair_name)}.{image_format}"
@@ -3083,15 +3128,19 @@ def summary_grid_path(
 
 def title_with_charge_limit(title: str, metric_name: str, unit: str) -> str:
     limit = math.nan
+    limit_label = "limit"
     if metric_name == "charge_per_second":
         limit = plot_safety_limit("window_charge_per_electrode_nC") / 1e3
+        limit_label = "per-electrode limit"
     elif metric_name == "summed_charge_per_second":
         limit = plot_safety_limit("window_charge_total_nC") / 1e6
+        limit_label = "total-array limit"
     elif metric_name == "total_charge":
         limit = plot_safety_limit("session_charge_limit_mC")
+        limit_label = "session limit"
     if not np.isfinite(limit) or limit <= 0.0:
         return title
-    return f"{title} (limit {format_summary_number(limit)} {unit})"
+    return f"{title} ({limit_label}: {format_summary_number(limit)} {unit})"
 
 
 def matrix_summary_values(
@@ -3352,10 +3401,11 @@ def plot_matrix_summary_grid(
         vmin -= delta
         vmax += delta
 
-    fig, axes = plt.subplots(1, len(fixed_values), figsize=(5.1 * len(fixed_values), 4.5), squeeze=False)
+    fig, axes = plt.subplots(1, len(fixed_values), figsize=(5.8 * len(fixed_values), 4.7), squeeze=False)
     image = None
+    cmap = THERMAL_CMAP if is_thermal_metric(metric_name) else "viridis"
     for idx, (ax, fixed_value, values) in enumerate(zip(axes.reshape(-1), fixed_values, grids)):
-        image = ax.imshow(np.ma.masked_invalid(values), cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax)
+        image = ax.imshow(np.ma.masked_invalid(values), cmap=cmap, aspect="auto", vmin=vmin, vmax=vmax)
         for row in range(values.shape[0]):
             for col in range(values.shape[1]):
                 value = values[row, col]
@@ -3365,7 +3415,12 @@ def plot_matrix_summary_grid(
                     format_summary_number(value),
                     ha="center",
                     va="center",
-                    color="white" if np.isfinite(value) else FALLBACK_COLOR,
+                    color=contrasting_cell_text_color(
+                        value,
+                        vmin=vmin,
+                        vmax=vmax,
+                        cmap=cmap,
+                    ),
                     fontsize=8.5,
                     fontweight="bold" if np.isfinite(value) else "normal",
                 )
@@ -3378,14 +3433,17 @@ def plot_matrix_summary_grid(
             ax.set_ylabel(factor_display_name(y_factor))
         else:
             ax.set_ylabel("")
-        ax.set_title(f"fixed {factor_display_name(fixed_factor)}\n{fixed_value.label}", fontsize=10)
+        if fixed_factor == "preprocessing":
+            ax.set_title(fixed_value.label, fontsize=10)
+        else:
+            ax.set_title(f"fixed {factor_display_name(fixed_factor)}\n{fixed_value.label}", fontsize=10)
 
     fig.suptitle(
         f"{title_with_charge_limit(title, metric_name, unit)} - {pair_name.replace('_', ' ')}",
         fontsize=13,
         fontweight="bold",
     )
-    fig.subplots_adjust(left=0.07, right=0.86, bottom=0.20, top=0.80, wspace=0.35)
+    fig.subplots_adjust(left=0.06, right=0.90, bottom=0.22, top=0.80, wspace=0.55)
     if image is not None:
         cbar = fig.colorbar(image, ax=axes.reshape(-1).tolist(), fraction=0.025, pad=0.05)
         cbar.set_label(unit)
@@ -3418,25 +3476,19 @@ def plot_matrix_active_electrode_errorbars(
     )
     if amplitude_value is None:
         return
-    path = output_root / MATRIX_BLOCK / "active_electrodes" / f"active_electrodes_by_grid_preprocessing.{image_format}"
-    if path.exists() and not overwrite:
-        print(f"Skipping existing: {path}")
-        return
+    for grid_value in grid_values:
+        path = (
+            output_root
+            / "active_electrodes"
+            / f"active_electrodes_{sanitize_path_part(grid_value.key)}.{image_format}"
+        )
+        if path.exists() and not overwrite:
+            print(f"Skipping existing: {path}")
+            continue
 
-    x_positions: list[float] = []
-    means: list[float] = []
-    upper_errors: list[float] = []
-    colors: list[str] = []
-    markers: list[str] = []
-    prep_labels: list[str] = []
-    grid_centers: list[tuple[float, str]] = []
-    separators: list[float] = []
-    plotted = False
-
-    position = 1.0
-    for grid_index, grid_value in enumerate(grid_values):
-        grid_start = position
-        for prep_index, preprocessing_value in enumerate(preprocessing_values):
+        means: list[float] = []
+        upper_errors: list[float] = []
+        for preprocessing_value in preprocessing_values:
             record = matrix_record_for_values(
                 records_by_key,
                 {
@@ -3447,69 +3499,49 @@ def plot_matrix_active_electrode_errorbars(
             )
             mean_value = mean_values_by_run_id.get(record.run_id, math.nan) if record is not None else math.nan
             max_value = max_values_by_run_id.get(record.run_id, math.nan) if record is not None else math.nan
-            x_positions.append(position)
             means.append(mean_value)
             upper_errors.append(max(0.0, max_value - mean_value) if np.isfinite(mean_value) and np.isfinite(max_value) else math.nan)
-            colors.append(LINE_COLORS[prep_index % len(LINE_COLORS)])
-            markers.append(MATRIX_MARKERS[prep_index % len(MATRIX_MARKERS)])
-            prep_labels.append(preprocessing_value.label)
-            plotted = plotted or np.isfinite(mean_value)
-            position += 1.0
-        grid_centers.append(((grid_start + position - 1.0) / 2.0, grid_value.label))
-        if grid_index < len(grid_values) - 1:
-            separators.append(position - 0.5)
-        position += 0.85
 
-    fig, ax = plt.subplots(figsize=(max(8.4, 0.55 * len(x_positions) + 3.2), 4.9))
-    if plotted:
-        for x, mean_value, upper_error, color, marker in zip(x_positions, means, upper_errors, colors, markers):
-            if not np.isfinite(mean_value):
-                continue
-            yerr = np.asarray([[0.0], [upper_error if np.isfinite(upper_error) else 0.0]], dtype=np.float64)
-            ax.errorbar(
-                [x],
-                [mean_value],
-                yerr=yerr,
-                fmt=marker,
-                markersize=6.0,
-                markerfacecolor="white",
-                markeredgewidth=1.1,
-                color=color,
-                ecolor=color,
-                elinewidth=1.4,
-                capsize=4.0,
-                capthick=1.2,
+        x = np.arange(len(preprocessing_values), dtype=np.float64)
+        means_array = np.asarray(means, dtype=np.float64)
+        upper_errors_array = np.asarray(upper_errors, dtype=np.float64)
+        plotted = bool(np.any(np.isfinite(means_array)))
+        fig, ax = plt.subplots(figsize=(6.8, 4.9))
+        if plotted:
+            valid = np.isfinite(means_array)
+            bar_colors = [LINE_COLORS[index % len(LINE_COLORS)] for index in range(len(preprocessing_values))]
+            ax.bar(
+                x[valid],
+                means_array[valid],
+                width=0.68,
+                yerr=np.vstack(
+                    [
+                        np.zeros(np.count_nonzero(valid), dtype=np.float64),
+                        np.nan_to_num(upper_errors_array[valid], nan=0.0),
+                    ]
+                ),
+                color=np.asarray(bar_colors, dtype=object)[valid].tolist(),
+                edgecolor="#111827",
+                linewidth=0.8,
+                error_kw={
+                    "ecolor": "#111827",
+                    "elinewidth": 1.4,
+                    "capsize": 5.0,
+                    "capthick": 1.2,
+                },
                 zorder=3,
             )
-        style_axes(ax)
-    else:
-        add_no_data(ax, "No active electrode data")
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(prep_labels, rotation=90, fontsize=8)
-    for separator in separators:
-        ax.axvline(separator, color=GRID_COLOR, linewidth=1.0)
-    for center, label in grid_centers:
-        ax.text(center, -0.22, label, transform=ax.get_xaxis_transform(), ha="center", va="top", fontsize=8)
-    ax.set_ylabel("number of electrodes")
-    ax.set_xlabel("electrode grid and preprocessing")
-    ax.set_title(f"{amplitude_value.label}: point = mean, upper error = max")
-    legend_handles = [
-        plt.Line2D(
-            [0],
-            [0],
-            color=LINE_COLORS[index % len(LINE_COLORS)],
-            marker=MATRIX_MARKERS[index % len(MATRIX_MARKERS)],
-            linestyle="none",
-            markerfacecolor="white",
-            markeredgewidth=1.1,
-            label=value.label,
-        )
-        for index, value in enumerate(preprocessing_values)
-    ]
-    ax.legend(handles=legend_handles, title="preprocessing", frameon=False, fontsize=8, title_fontsize=8, loc="upper right")
-    fig.suptitle(f"Activated Electrodes by Grid and Preprocessing ({STANDARD_AMPLITUDE_UA:g} uA)", fontsize=13, fontweight="bold")
-    fig.subplots_adjust(bottom=0.36, left=0.09, right=0.98, top=0.84)
-    save_figure(fig, path, overwrite=overwrite)
+            style_axes(ax)
+        else:
+            add_no_data(ax, "No active electrode data")
+        ax.set_xticks(x)
+        ax.set_xticklabels([value.label for value in preprocessing_values], rotation=20, ha="right")
+        ax.set_ylabel("number of electrodes")
+        ax.set_xlabel("preprocessing")
+        ax.set_title(f"{amplitude_value.label}: bar = mean, upper error = max")
+        fig.suptitle(f"Activated Electrodes - {grid_value.label}", fontsize=13, fontweight="bold")
+        fig.subplots_adjust(bottom=0.20, left=0.12, right=0.97, top=0.82)
+        save_figure(fig, path, overwrite=overwrite)
 
 
 def plot_matrix_shannon_amplitude_lines(
@@ -3529,7 +3561,7 @@ def plot_matrix_shannon_amplitude_lines(
     if not amplitude_values or not grid_values or not preprocessing_values:
         return
 
-    path = output_root / MATRIX_BLOCK / "shannon_k" / f"{sanitize_path_part(stat_name)}_by_amplitude.{image_format}"
+    path = output_root / "shannon_k" / f"{sanitize_path_part(stat_name)}_by_amplitude.{image_format}"
     if path.exists() and not overwrite:
         print(f"Skipping existing: {path}")
         return
@@ -3602,7 +3634,7 @@ def plot_matrix_charge_distribution_boxplots(
     preprocessing_values = sorted_factor_values(factors_by_run_id, "preprocessing")
     if not amplitude_values or not grid_values or not preprocessing_values:
         return
-    path = output_root / MATRIX_BLOCK / "total_charge" / f"electrode_distribution_boxplots.{image_format}"
+    path = output_root / "total_charge" / f"electrode_distribution_boxplots.{image_format}"
     if path.exists() and not overwrite:
         print(f"Skipping existing: {path}")
         return
@@ -3763,6 +3795,260 @@ def plot_matrix_pairwise_comparisons(
     )
 
 
+def raster_protocol_grid_position(manifest: Mapping[str, Any]) -> tuple[int, int]:
+    mode = str(manifest.get("raster_mode", "none")).strip().lower().replace("-", "_")
+    if mode in {"none", "off"}:
+        return 0, 0
+    mode_row = {
+        "checkerboard": 1,
+        "random": 2,
+        "pseudo_random": 2,
+        "pseudorandom": 2,
+    }.get(mode)
+    groups = int(manifest.get("raster_groups", 0) or 0)
+    group_col = {3: 1, 4: 2, 5: 3}.get(groups)
+    if mode_row is None or group_col is None:
+        raise ValueError(f"Unsupported raster protocol: mode={mode!r}, groups={groups!r}")
+    return mode_row, group_col
+
+
+def plot_raster_protocol_metric_grid(
+    records: list[MatrixRecord],
+    output_root: Path,
+    image_format: str,
+    *,
+    filename: str,
+    title: str,
+    unit: str,
+    getter: Callable[[np.lib.npyio.NpzFile | Mapping[str, Any]], float],
+    ic_power_mw: float | None = None,
+    overwrite: bool,
+) -> None:
+    selected = records_by_block(records, "raster_protocols")
+    if ic_power_mw is not None:
+        selected = [
+            record
+            for record in selected
+            if np.isclose(
+                float(manifest_for_record(record).get("internal_circuit_power_mw", 0.0)),
+                float(ic_power_mw),
+            )
+        ]
+    if not selected:
+        return
+    values = np.full((3, 4), np.nan, dtype=np.float64)
+    for record in selected:
+        row, col = raster_protocol_grid_position(manifest_for_record(record))
+        if np.isfinite(values[row, col]):
+            raise ValueError(f"Duplicate raster protocol grid cell for: {record.run_id}")
+        with np.load(record.npz_path, allow_pickle=True) as data:
+            values[row, col] = getter(data)
+
+    finite = values[np.isfinite(values)]
+    vmin = float(np.min(finite)) if finite.size else 0.0
+    vmax = float(np.max(finite)) if finite.size else 1.0
+    if np.isclose(vmin, vmax):
+        delta = max(abs(vmin) * 0.05, 1e-6)
+        vmin -= delta
+        vmax += delta
+
+    fig, ax = plt.subplots(figsize=(8.8, 4.8))
+    image = ax.imshow(np.ma.masked_invalid(values), cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax)
+    for row in range(values.shape[0]):
+        for col in range(values.shape[1]):
+            value = values[row, col]
+            ax.text(
+                col,
+                row,
+                format_summary_number(value) if np.isfinite(value) else "",
+                ha="center",
+                va="center",
+                color=contrasting_cell_text_color(
+                    value,
+                    vmin=vmin,
+                    vmax=vmax,
+                    cmap="viridis",
+                ),
+                fontsize=9,
+                fontweight="bold",
+            )
+    ax.set_xticks(range(4))
+    ax.set_xticklabels(("off", "3 groups\n5 Hz", "4 groups\n3.75 Hz", "5 groups\n3 Hz"))
+    ax.set_yticks(range(3))
+    ax.set_yticklabels(("raster off", "checkerboard", "pseudo random"))
+    ax.set_xlabel("protocol grouping")
+    ax.set_ylabel("raster mode")
+    ax.set_title(title)
+    cbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(unit)
+    save_figure(
+        fig,
+        output_root / f"{sanitize_path_part(filename)}.{image_format}",
+        overwrite=overwrite,
+    )
+
+
+def raster_protocol_metric_values(
+    records: list[MatrixRecord],
+    getter: Callable[[np.lib.npyio.NpzFile | Mapping[str, Any]], float],
+    *,
+    ic_power_mw: float,
+) -> np.ndarray:
+    values = np.full((3, 4), np.nan, dtype=np.float64)
+    for record in records_by_block(records, "raster_protocols"):
+        manifest = manifest_for_record(record)
+        power = float(manifest.get("internal_circuit_power_mw", 0.0))
+        if not np.isclose(power, float(ic_power_mw)):
+            continue
+        row, col = raster_protocol_grid_position(manifest)
+        if np.isfinite(values[row, col]):
+            raise ValueError(
+                f"Duplicate raster protocol grid cell at {power:g} mW for: {record.run_id}"
+            )
+        with np.load(record.npz_path, allow_pickle=True) as data:
+            values[row, col] = getter(data)
+    return values
+
+
+def plot_raster_protocol_temperature_grid(
+    records: list[MatrixRecord],
+    output_root: Path,
+    image_format: str,
+    *,
+    filename: str,
+    title: str,
+    getter: Callable[[np.lib.npyio.NpzFile | Mapping[str, Any]], float],
+    overwrite: bool,
+) -> None:
+    powers = sorted(
+        {
+            float(manifest_for_record(record).get("internal_circuit_power_mw", 0.0))
+            for record in records_by_block(records, "raster_protocols")
+        }
+    )
+    if not powers:
+        return
+    grids = [
+        raster_protocol_metric_values(records, getter, ic_power_mw=power)
+        for power in powers
+    ]
+    finite = np.concatenate([grid[np.isfinite(grid)] for grid in grids])
+    vmin = float(np.min(finite)) if finite.size else 0.0
+    vmax = float(np.max(finite)) if finite.size else 1.0
+    if np.isclose(vmin, vmax):
+        delta = max(abs(vmin) * 0.05, 1e-6)
+        vmin -= delta
+        vmax += delta
+
+    fig, axes = plt.subplots(
+        1,
+        len(powers),
+        figsize=(4.7 * len(powers), 4.8),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    image = None
+    for index, (ax, power, values) in enumerate(zip(axes.reshape(-1), powers, grids)):
+        image = ax.imshow(
+            np.ma.masked_invalid(values),
+            cmap=THERMAL_CMAP,
+            aspect="auto",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        for row in range(values.shape[0]):
+            for col in range(values.shape[1]):
+                value = values[row, col]
+                if np.isfinite(value):
+                    ax.text(
+                        col,
+                        row,
+                        format_summary_number(value),
+                        ha="center",
+                        va="center",
+                        color=contrasting_cell_text_color(
+                            value,
+                            vmin=vmin,
+                            vmax=vmax,
+                            cmap=THERMAL_CMAP,
+                        ),
+                        fontsize=8.5,
+                        fontweight="bold",
+                    )
+        ax.set_xticks(range(4))
+        ax.set_xticklabels(("off", "3 groups\n5 Hz", "4 groups\n3.75 Hz", "5 groups\n3 Hz"))
+        ax.set_yticks(range(3))
+        ax.set_yticklabels(("raster off", "checkerboard", "pseudo random"))
+        ax.set_xlabel("protocol grouping")
+        if index == 0:
+            ax.set_ylabel("raster mode")
+        ax.set_title(f"{power:g} mW IC power")
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    fig.subplots_adjust(left=0.06, right=0.94, bottom=0.18, top=0.80, wspace=0.12)
+    if image is not None:
+        cbar = fig.colorbar(image, ax=axes.reshape(-1).tolist(), fraction=0.018, pad=0.02)
+        cbar.set_label("C")
+    save_figure(
+        fig,
+        output_root / f"{sanitize_path_part(filename)}.{image_format}",
+        overwrite=overwrite,
+    )
+
+
+def plot_raster_protocol_comparison_grids(
+    records: list[MatrixRecord],
+    output_root: Path,
+    image_format: str,
+    *,
+    overwrite: bool,
+) -> None:
+    specs = (
+        (
+            "summed_charge_per_second_grid",
+            "Mean Summed Charge Per Second Across Raster Protocols",
+            "mC/s",
+            summary_total_charge_rate_mean_mC_s,
+        ),
+        (
+            "summed_total_protocol_charge_grid",
+            "Summed Total Protocol Charge Across Raster Protocols",
+            "mC",
+            total_protocol_charge_mC,
+        ),
+    )
+    for filename, title, unit, getter in specs:
+        plot_raster_protocol_metric_grid(
+            records,
+            output_root,
+            image_format,
+            filename=filename,
+            title=title,
+            unit=unit,
+            getter=getter,
+            ic_power_mw=0.0,
+            overwrite=overwrite,
+        )
+    plot_raster_protocol_temperature_grid(
+        records,
+        output_root,
+        image_format,
+        filename="max_mean_temperature_grid",
+        title="Maximum Mean Temperature Rise Across Raster Protocols and IC Power",
+        getter=lambda data: max_of_series_key(data, "mean_dT"),
+        overwrite=overwrite,
+    )
+    plot_raster_protocol_temperature_grid(
+        records,
+        output_root,
+        image_format,
+        filename="max_focal_temperature_grid",
+        title="Maximum Focal Temperature Rise Across Raster Protocols and IC Power",
+        getter=scalar_max_dT,
+        overwrite=overwrite,
+    )
+
+
 def plot_block_comparative_suite(
     records: list[MatrixRecord],
     block: str,
@@ -3785,6 +4071,7 @@ def plot_block_comparative_suite(
             title=f"Current Amplitude Over Time - {block.replace('_', ' ')}",
             ylabel="mean active current (uA)",
             getter=lambda data: mean_metric_series(data, "amplitude", max_points=MAX_SERIES_POINTS),
+            show_legend=False,
         )
         plot_records_series(
             selected,
@@ -3794,6 +4081,7 @@ def plot_block_comparative_suite(
             title=f"Activated Electrodes Over Time - {block.replace('_', ' ')}",
             ylabel="active electrodes",
             getter=lambda data: active_count_series(data, max_points=MAX_SERIES_POINTS),
+            show_legend=False,
         )
         plot_records_series(
             selected,
@@ -3803,6 +4091,7 @@ def plot_block_comparative_suite(
             title=f"Shannon K Over Time - {block.replace('_', ' ')}",
             ylabel="mean active Shannon K",
             getter=lambda data: mean_metric_series(data, "shannon", max_points=MAX_SERIES_POINTS),
+            show_legend=False,
         )
         plot_records_bar(
             selected,
@@ -3834,7 +4123,7 @@ def plot_block_comparative_suite(
         image_format=image_format,
         overwrite=overwrite,
         title=f"Maximum Mean Temperature Rise - {block.replace('_', ' ')}",
-        ylabel="max mean Î”T (Â°C)",
+        ylabel="max mean ΔT (°C)",
         getter=lambda data: max_of_series_key(data, "mean_dT"),
         color=COLORS.get(block, FALLBACK_COLOR),
     )
@@ -3844,7 +4133,7 @@ def plot_block_comparative_suite(
         image_format=image_format,
         overwrite=overwrite,
         title=f"Mean Temperature Evolution - {block.replace('_', ' ')}",
-        ylabel="mean Î”T (Â°C)",
+        ylabel="mean ΔT (°C)",
         getter=lambda data: series_from_key(data, "mean_dT", max_points=MAX_SERIES_POINTS),
     )
     plot_records_series(
@@ -3853,7 +4142,7 @@ def plot_block_comparative_suite(
         image_format=image_format,
         overwrite=overwrite,
         title=f"Max Focal Temperature Evolution - {block.replace('_', ' ')}",
-        ylabel="max focal dT (deg C)",
+        ylabel="max focal ΔT (°C)",
         getter=lambda data: series_from_key(data, "max_dT", max_points=MAX_SERIES_POINTS),
     )
     if block == THERMAL_BLOCK:
@@ -3863,7 +4152,7 @@ def plot_block_comparative_suite(
             image_format=image_format,
             overwrite=overwrite,
             title="Maximum Focal Temperature Rise - internal circuit",
-            ylabel="max focal dT (deg C)",
+            ylabel="max focal ΔT (°C)",
             getter=lambda data: max_of_series_key(data, "max_dT"),
             color=COLORS.get(block, FALLBACK_COLOR),
         )
@@ -3902,7 +4191,7 @@ def plot_amplitude_grid_double_comparisons(
         image_format=image_format,
         overwrite=overwrite,
         title="Maximum Mean Temperature - amplitude and electrode grids",
-        ylabel="max mean Î”T (Â°C)",
+        ylabel="max mean ΔT (°C)",
         getter=lambda data: max_of_series_key(data, "mean_dT"),
         color="#2E8B57",
     )
@@ -3912,7 +4201,7 @@ def plot_amplitude_grid_double_comparisons(
         image_format=image_format,
         overwrite=overwrite,
         title="Maximum Focal Temperature - amplitude and electrode grids",
-        ylabel="max focal dT (deg C)",
+        ylabel="max focal ΔT (°C)",
         getter=lambda data: max_of_series_key(data, "max_dT"),
         color="#8B1E3F",
     )
@@ -3922,7 +4211,7 @@ def plot_amplitude_grid_double_comparisons(
         image_format=image_format,
         overwrite=overwrite,
         title="Mean Temperature Evolution - amplitude and electrode grids",
-        ylabel="mean Î”T (Â°C)",
+        ylabel="mean ΔT (°C)",
         getter=lambda data: series_from_key(data, "mean_dT", max_points=MAX_SERIES_POINTS),
     )
     plot_records_series(
@@ -3931,7 +4220,7 @@ def plot_amplitude_grid_double_comparisons(
         image_format=image_format,
         overwrite=overwrite,
         title="Max Focal Temperature Evolution - amplitude and electrode grids",
-        ylabel="max focal dT (deg C)",
+        ylabel="max focal ΔT (°C)",
         getter=lambda data: series_from_key(data, "max_dT", max_points=MAX_SERIES_POINTS),
     )
 
@@ -3950,45 +4239,6 @@ def plot_comparative_suites(
             continue
         plot_block_comparative_suite(records, block, comparison_root, image_format, overwrite=overwrite)
     plot_amplitude_grid_double_comparisons(records, comparison_root, image_format, overwrite=overwrite)
-
-
-def plot_block_metric(records: list[MatrixRecord], block: str, metric_key: str, title: str, unit: str, output_root: Path, image_format: str, *, overwrite: bool) -> None:
-    selected = records_by_block(records, block)
-    if not selected:
-        return
-    values = [record.metrics.get(metric_key, math.nan) for record in selected]
-    labels = [record.label for record in selected]
-    color = COLORS.get(block, FALLBACK_COLOR)
-
-    width = max(6.5, 0.75 * len(selected) + 2.5)
-    fig, ax = plt.subplots(figsize=(width, 4.2))
-    ax.bar(range(len(selected)), values, color=color, alpha=0.9)
-    if metric_key == "peak_charge_per_phase_nC":
-        add_limit_line(ax, plot_safety_limit("charge_per_phase_nC"))
-    elif metric_key == "max_total_charge_rate_mC_s":
-        add_limit_line(ax, plot_safety_limit("window_charge_total_nC") / 1e6)
-    if ax.get_legend_handles_labels()[0]:
-        ax.legend(frameon=False, fontsize=8)
-    ax.set_xticks(range(len(selected)))
-    ax.set_xticklabels(labels, rotation=0, ha="center")
-    ylabel = title if not unit else f"{title} ({unit})"
-    ax.set_ylabel(ylabel)
-    ax.set_title(f"{title} - {block.replace('_', ' ')}")
-    ax.grid(axis="y", alpha=0.25, linewidth=0.7)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    if metric_key == "safety_margin":
-        ax.axhline(1.0, color="#8B1E3F", linestyle="--", linewidth=1.2, label="limit")
-        ax.legend(frameon=False)
-
-    path = output_root / block / f"{sanitize_path_part(metric_key)}.{image_format}"
-    save_figure(fig, path, overwrite=overwrite)
-
-
-def plot_all_block_summaries(records: list[MatrixRecord], output_root: Path, image_format: str, *, overwrite: bool) -> None:
-    for block in sorted({record.block for record in records}, key=block_index):
-        for metric_key, title, unit in SUMMARY_METRICS:
-            plot_block_metric(records, block, metric_key, title, unit, output_root, image_format, overwrite=overwrite)
 
 
 def plot_overall_safety(records: list[MatrixRecord], output_root: Path, image_format: str, *, overwrite: bool) -> None:
@@ -4010,31 +4260,6 @@ def plot_overall_safety(records: list[MatrixRecord], output_root: Path, image_fo
     ax.spines["right"].set_visible(False)
     ax.legend(frameon=False)
     save_figure(fig, output_root / f"overall_safety_margin.{image_format}", overwrite=overwrite)
-
-
-def plot_ratio_breakdown(records: list[MatrixRecord], output_root: Path, image_format: str, *, overwrite: bool) -> None:
-    ratio_keys = ("charge_per_phase", "window_charge_per_electrode", "window_charge_total", "active_percentage", "temperature")
-    for block in sorted({record.block for record in records}, key=block_index):
-        selected = records_by_block(records, block)
-        if not selected:
-            continue
-        x = np.arange(len(selected), dtype=np.float64)
-        width = 0.8 / len(ratio_keys)
-        fig, ax = plt.subplots(figsize=(max(7.5, 0.85 * len(selected) + 2.5), 4.8))
-        for idx, key in enumerate(ratio_keys):
-            offset = (idx - (len(ratio_keys) - 1) / 2.0) * width
-            values = [record.ratios.get(key, math.nan) for record in selected]
-            ax.bar(x + offset, values, width=width, label=key.replace("_", " "))
-        ax.axhline(1.0, color="#8B1E3F", linestyle="--", linewidth=1.2)
-        ax.set_xticks(x)
-        ax.set_xticklabels([record.label for record in selected])
-        ax.set_ylabel("Ratio to configured limit")
-        ax.set_title(f"Safety-limit ratio breakdown - {block.replace('_', ' ')}")
-        ax.grid(axis="y", alpha=0.25, linewidth=0.7)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.legend(frameon=False, fontsize=8, ncol=2)
-        save_figure(fig, output_root / block / f"limit_ratio_breakdown.{image_format}", overwrite=overwrite)
 
 
 def write_summary_csv(records: list[MatrixRecord], output_root: Path) -> None:
@@ -4104,8 +4329,6 @@ def main() -> None:
     set_plot_safety_limits(load_safety_limits(safety_yaml))
     comparative_root = output_root / "comparative_visuals"
     write_summary_csv(records, output_root)
-    plot_ratio_breakdown(records, comparative_root, args.format, overwrite=bool(args.overwrite))
-    plot_all_block_summaries(records, comparative_root, args.format, overwrite=bool(args.overwrite))
     plot_comparative_suites(records, comparative_root, args.format, overwrite=bool(args.overwrite))
     write_single_case_overviews(records, args.format, overwrite=bool(args.overwrite), output_root=output_root)
     write_per_protocol_visuals(records, args.format, overwrite=bool(args.overwrite), output_root=output_root)

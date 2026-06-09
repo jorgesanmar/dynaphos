@@ -41,12 +41,6 @@ DEFAULT_OUTPUT_ROOT = Path(DEFAULT_VISUALS_ROOT) / "experiment_matrix_summary"
 BLOCK_ORDER = ("amplitude", "electrode_density", "preprocessing", "internal_circuit", "rastering")
 SUMMARY_METRICS = (
     ("safety_margin", "Worst safety-limit ratio", "ratio"),
-    ("peak_current_uA", "Peak current", "uA"),
-    ("peak_charge_per_phase_nC", "Peak charge per phase", "nC"),
-    ("peak_shannon_k", "Peak Shannon k", ""),
-    ("max_active_pct", "Max active electrodes", "%"),
-    ("max_total_charge_rate_uC_s", "Max total charge rate", "uC/s"),
-    ("max_dT_C", "Max temperature increase", "C"),
 )
 
 COLORS = {
@@ -307,31 +301,6 @@ def plot_overall_safety(records: list[MatrixRecord], output_root: Path, image_fo
     save_figure(fig, output_root / f"overall_safety_margin.{image_format}", overwrite=overwrite)
 
 
-def plot_ratio_breakdown(records: list[MatrixRecord], output_root: Path, image_format: str, *, overwrite: bool) -> None:
-    ratio_keys = ("charge_per_phase", "window_charge_per_electrode", "window_charge_total", "active_percentage", "temperature")
-    for block in sorted({record.block for record in records}, key=block_index):
-        selected = records_by_block(records, block)
-        if not selected:
-            continue
-        x = np.arange(len(selected), dtype=np.float64)
-        width = 0.8 / len(ratio_keys)
-        fig, ax = plt.subplots(figsize=(max(7.5, 0.85 * len(selected) + 2.5), 4.8))
-        for idx, key in enumerate(ratio_keys):
-            offset = (idx - (len(ratio_keys) - 1) / 2.0) * width
-            values = [record.ratios.get(key, math.nan) for record in selected]
-            ax.bar(x + offset, values, width=width, label=key.replace("_", " "))
-        ax.axhline(1.0, color="#8B1E3F", linestyle="--", linewidth=1.2)
-        ax.set_xticks(x)
-        ax.set_xticklabels([record.label for record in selected])
-        ax.set_ylabel("Ratio to configured limit")
-        ax.set_title(f"Safety-limit ratio breakdown - {block.replace('_', ' ')}")
-        ax.grid(axis="y", alpha=0.25, linewidth=0.7)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.legend(frameon=False, fontsize=8, ncol=2)
-        save_figure(fig, output_root / block / f"limit_ratio_breakdown.{image_format}", overwrite=overwrite)
-
-
 def write_summary_csv(records: list[MatrixRecord], output_root: Path) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     path = output_root / "matrix_summary.csv"
@@ -371,7 +340,6 @@ def main() -> None:
     print(f"Discovered {len(records)} matrix runs under: {input_root}")
     write_summary_csv(records, output_root)
     plot_overall_safety(records, output_root, args.format, overwrite=bool(args.overwrite))
-    plot_ratio_breakdown(records, output_root, args.format, overwrite=bool(args.overwrite))
     plot_all_block_summaries(records, output_root, args.format, overwrite=bool(args.overwrite))
 
 

@@ -26,9 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 ACADEMIC_BLUE = "#1F4E79"
 ACADEMIC_RED = "#8B1E3F"
-ACADEMIC_GREEN = "#2E8B57"
 ACADEMIC_ORANGE = "#C05621"
-ACADEMIC_PURPLE = "#5B5EA6"
 ACADEMIC_GRAY = "#6B7280"
 GRID_COLOR = "#D7DBE0"
 TIME_AXIS_LABEL = "time (min)"
@@ -388,29 +386,6 @@ def current_summaries(data: dict[str, np.ndarray]) -> tuple[np.ndarray | None, n
     return max_current, mean_active, positive_count
 
 
-def fallback_mean_charge_per_phase(data: dict[str, np.ndarray]) -> np.ndarray | None:
-    charge = get_array(data, "charge_per_phase_per_electrode_nC")
-    if charge is None:
-        charge = get_array(data, "charge_per_phase_nC")
-    if charge is None:
-        return None
-    arr = np.asarray(charge, dtype=np.float64)
-    if arr.size == 0:
-        return None
-    if arr.ndim == 1:
-        return arr.reshape(-1)
-    rows = arr.reshape(arr.shape[0], -1)
-    positive = np.isfinite(rows) & (rows > 0.0)
-    positive_sum = np.sum(np.where(positive, rows, 0.0), axis=1)
-    positive_count = np.sum(positive, axis=1).astype(np.float64)
-    return np.divide(
-        positive_sum,
-        positive_count,
-        out=np.zeros_like(positive_sum, dtype=np.float64),
-        where=positive_count > 0,
-    )
-
-
 def format_number(value: float, suffix: str = "", *, precision: int = 3) -> str:
     if not np.isfinite(value):
         return "n/a"
@@ -454,12 +429,9 @@ def manifest_text(manifest: dict[str, Any], data: dict[str, np.ndarray], npz_pat
 def plot_current_panel(
     ax: plt.Axes,
     data: dict[str, np.ndarray],
-    manifest: dict[str, Any],
+    _manifest: dict[str, Any],
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     max_current, mean_active, active_count_from_current = current_summaries(data)
-    threshold = metric_float(data, manifest, "threshold_uA")
-    if not np.isfinite(threshold):
-        threshold = metric_float(data, manifest, "appearance_threshold_uA")
     if max_current is None or mean_active is None:
         add_no_data(ax, "No current trace")
         ax.set_title("Delivered Current", fontsize=11)
@@ -473,27 +445,9 @@ def plot_current_panel(
         color=ACADEMIC_BLUE,
         prefer_electrode_time=True,
     )
-    plot_line(
-        ax,
-        data,
-        mean_active,
-        label="mean active",
-        color=ACADEMIC_GREEN,
-        prefer_electrode_time=True,
-        linewidth=1.5,
-    )
-    if np.isfinite(threshold):
-        ax.axhline(
-            threshold,
-            color=ACADEMIC_RED,
-            linestyle="--",
-            linewidth=1.1,
-            label="appearance threshold",
-        )
     ax.set_title("Delivered Current", fontsize=11)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("current (uA)")
-    ax.legend(fontsize=8, frameon=False, loc="best")
     style_axes(ax)
     return max_current, mean_active, active_count_from_current
 
@@ -518,20 +472,16 @@ def plot_count_panel(
         _, xlabel = plot_line(ax, data, stimulated_count, label="stimulated", color=ACADEMIC_ORANGE)
         plotted = True
 
-    ax.set_title("Electrode Counts", fontsize=11)
+    ax.set_title("Active Electrode Counts", fontsize=11)
     if plotted:
         ax.set_xlabel(xlabel)
         ax.set_ylabel("electrodes")
-        ax.legend(fontsize=8, frameon=False, loc="best")
         style_axes(ax)
     else:
         add_no_data(ax, "No electrode counts")
 
 
 def plot_charge_panel(ax: plt.Axes, data: dict[str, np.ndarray]) -> None:
-    charge_phase = series_1d(data, "charge_per_phase_mean_nC")
-    if charge_phase is None:
-        charge_phase = fallback_mean_charge_per_phase(data)
     charge_rate_total = None
     charge_rate = get_array(data, "charge_per_second_per_electrode_nC_s")
     if charge_rate is not None:
@@ -545,40 +495,21 @@ def plot_charge_panel(ax: plt.Axes, data: dict[str, np.ndarray]) -> None:
 
     plotted = False
     xlabel = TIME_AXIS_LABEL
-    line_handles = []
-    line_labels = []
-
-    if charge_phase is not None:
-        _, xlabel = plot_line(
-            ax,
-            data,
-            charge_phase,
-            label="mean phase charge",
-            color=ACADEMIC_BLUE,
-            prefer_electrode_time=True,
-        )
-        plotted = True
-        line_handles.extend(ax.lines[-1:])
-        line_labels.append("mean phase charge")
-    ax.set_ylabel("charge per phase (nC)")
-
-    twin = None
     if charge_rate_total is not None:
-        twin = ax.twinx()
         rate_uC_s = np.asarray(charge_rate_total, dtype=np.float64) / 1e3
         x, _ = time_axis(data, rate_uC_s.size)
-        twin.plot(x, rate_uC_s, label="total charge rate", color=ACADEMIC_RED, linewidth=1.6)
-        twin.set_ylabel("total charge rate (uC/s)")
-        twin.tick_params(labelsize=9, width=0.8)
-        twin.spines["top"].set_visible(False)
+        ax.plot(x, rate_uC_s, label="total charge rate", color=ACADEMIC_RED, linewidth=1.6)
         plotted = True
-        line_handles.extend(twin.lines[-1:])
-        line_labels.append("total charge rate")
 
-    ax.set_title("Charge", fontsize=11)
+    ax.set_title("Total Charge Rate", fontsize=11)
     if plotted:
         ax.set_xlabel(xlabel)
-        ax.legend(line_handles, line_labels, fontsize=8, frameon=False, loc="best")
+        ax.set_ylabel("total charge rate (uC/s)")
+        ax.legend(
+            fontsize=8,
+            frameon=False,
+            loc="upper right",
+        )
         style_axes(ax)
     else:
         add_no_data(ax, "No charge metrics")

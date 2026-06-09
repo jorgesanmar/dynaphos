@@ -3,9 +3,11 @@ from __future__ import annotations
 from itertools import product
 from pathlib import Path
 from argparse import Namespace
+from types import SimpleNamespace
 import sys
 
 import numpy as np
+import pytest
 import torch
 import yaml
 
@@ -20,7 +22,14 @@ from dynaphos.safety.io import (
 )
 from dynaphos.safety.experiments import build_cases
 from dynaphos.safety.ic_power_visualize import (
+    FIT_POWER_LEVELS_MW,
+    FIT_ROLE,
+    VALIDATION_ROLE,
+    analyze_ic_power,
+    build_phase1_budget_rows,
     discover_ic_power_records,
+    discover_phase1_records,
+    fit_origin_linearity,
     write_ic_power_temperature_visuals,
 )
 from dynaphos.safety.runner import (
@@ -37,18 +46,35 @@ from dynaphos.safety.runner import (
     expand_metric_to_reference_tensor,
     resolve_cooldown_frame_count,
     resolve_thermal_update_interval_frames,
+    raster_groups_to_electrodes,
+)
+from dynaphos.safety.raster_effects import (
+    baseline_mismatch_reasons,
+    build_raster_comparison_table_rows,
+    build_raster_effect_rows,
+    discover_phase1_runs,
+    discover_raster_runs,
+    remove_obsolete_phase3_plots,
+    write_raster_effect_outputs,
 )
 from dynaphos.safety.tracking import SafetyTracker
 from dynaphos.safety import visualize
 from dynaphos.simulator import GaussianSimulator, apply_appearance_threshold
 from dynaphos.pipeline import render_phosphene_frame_from_state
 from dynaphos.utils import Map
-from tools.safety import run_phase1
+from tools.safety import run_phase1_amp_grid_prep as run_phase1
 from tools.safety import run_phase2_ic_power
 from tools.safety import run_phase3_rastering
 
 
-def write_fake_matrix_record(root: Path, *, amplitude: float, grid_um: int, preprocessing: str) -> None:
+def write_fake_matrix_record(
+    root: Path,
+    *,
+    amplitude: float,
+    grid_um: int,
+    preprocessing: str,
+    internal_circuit_power_mw: float = 15.0,
+) -> None:
     run_id = f"coords_{grid_um}um__{preprocessing}__amp_{amplitude:g}uA"
     run_dir = root / "amplitude_grid_preprocessing" / run_id
     run_dir.mkdir(parents=True)
@@ -98,12 +124,22 @@ def write_fake_matrix_record(root: Path, *, amplitude: float, grid_um: int, prep
             {
                 "block": "amplitude_grid_preprocessing",
                 "run_id": run_id,
+                "video": str(
+                    Path(
+                        f"videos/SANPO/SANPO{'gt' if preprocessing == 'gt' else preprocessing}25min.mp4"
+                    ).resolve()
+                ),
                 "amplitude_uA": amplitude,
                 "appearance_threshold_uA": amplitude / 2.0,
                 "coords_yaml": f"config/coords_{grid_um}um.yaml",
                 "preprocessing_method": "groundtruth" if preprocessing == "gt" else preprocessing,
                 "source_input_label": preprocessing,
-                "internal_circuit_power_mw": 15.0,
+                "frequency_hz": 300.0,
+                "pulse_width_us": 170.0,
+                "raster_mode": "none",
+                "raster_mode_normalized": "none",
+                "raster_groups": 1,
+                "internal_circuit_power_mw": internal_circuit_power_mw,
             }
         ),
         encoding="utf-8",
@@ -119,25 +155,48 @@ def write_fake_matrix_records(root: Path) -> None:
         write_fake_matrix_record(root, amplitude=amplitude, grid_um=grid_um, preprocessing=preprocessing)
 
 
-def write_fake_ic_power_record(root: Path, *, preprocessing: str, power_mw: float) -> None:
-    run_id = f"coords_800um__{preprocessing}__amp_60uA_{power_mw:g}mW"
+def write_fake_ic_power_record(
+    root: Path,
+    *,
+    preprocessing: str,
+    power_mw: float,
+    grid_um: int = 800,
+    amplitude_uA: float = 60.0,
+    electrode_heat_enabled: bool = True,
+    analysis_role: str | None = None,
+    mean_slope: float = 0.015,
+    mean_offset: float | None = None,
+) -> None:
+    suffix = "" if electrode_heat_enabled else "__ic_only"
+    run_id = f"coords_{grid_um}um__{preprocessing}__amp_{amplitude_uA:g}uA_{power_mw:g}mW{suffix}"
     run_dir = root / run_id
     run_dir.mkdir(parents=True)
+    role = analysis_role or (VALIDATION_ROLE if electrode_heat_enabled else FIT_ROLE)
+    offset = (0.05 if electrode_heat_enabled else 0.0) if mean_offset is None else mean_offset
     np.savez(
         run_dir / "safety_metrics.npz",
         time_s=np.asarray([0.0, 60.0, 120.0], dtype=np.float32),
         electrode_grid_ids=np.arange(3, dtype=np.int32),
-        max_dT=np.asarray([0.01, 0.02, 0.03], dtype=np.float32) * (power_mw + 1.0),
-        mean_dT=np.asarray([0.005, 0.01, 0.015], dtype=np.float32) * (power_mw + 1.0),
+        thermal_time_s=np.asarray([0.0, 60.0, 120.0], dtype=np.float32),
+        max_dT=(
+            np.asarray([0.01, 0.02, 0.03], dtype=np.float32) * power_mw
+            + (0.1 if electrode_heat_enabled else 0.0)
+        ),
+        mean_dT=(
+            np.asarray([mean_slope / 3.0, mean_slope * 2.0 / 3.0, mean_slope], dtype=np.float32)
+            * power_mw
+            + offset
+        ),
+        internal_circuit_power_total_mW=np.asarray(power_mw * 2.0, dtype=np.float32),
     )
     (run_dir / "run_manifest.yaml").write_text(
         yaml.safe_dump(
             {
                 "block": "ic_power",
                 "run_id": run_id,
-                "amplitude_uA": 60.0,
-                "appearance_threshold_uA": 30.0,
-                "coords_yaml": "config/coords_800um.yaml",
+                "amplitude_uA": amplitude_uA,
+                "appearance_threshold_uA": amplitude_uA / 2.0,
+                "coords_yaml": f"config/coords_{grid_um}um.yaml",
                 "preprocessing_method": "groundtruth" if preprocessing == "gt" else preprocessing,
                 "source_input_label": preprocessing,
                 "internal_circuit_power_mw": power_mw,
@@ -145,6 +204,67 @@ def write_fake_ic_power_record(root: Path, *, preprocessing: str, power_mw: floa
                 "pulse_width_us": 170.0,
                 "raster_mode": "none",
                 "ic_heat_mode": "with",
+                "electrode_heat_enabled": electrode_heat_enabled,
+                "metadata": {"analysis_role": role},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_fake_raster_record(
+    root: Path,
+    *,
+    baseline_run_id: str,
+    grid_um: int,
+    preprocessing: str,
+    amplitude: float,
+    mode: str,
+    groups: int,
+    ratio: float,
+    role: str = "transfer_panel",
+    internal_circuit_power_mw: float = 0.0,
+) -> None:
+    normalized_mode = "random" if mode == "pseudo_random" else mode
+    run_id = f"{role}__{baseline_run_id}__{mode}__groups_{groups}"
+    run_dir = root / run_id
+    run_dir.mkdir(parents=True)
+    np.savez(
+        run_dir / "safety_metrics.npz",
+        time_s=np.asarray([0.0, 1.0, 2.0], dtype=np.float32),
+        electrode_grid_ids=np.arange(4, dtype=np.int32),
+        protocol_charge_per_electrode_nC=np.full(4, amplitude * 30.0 * ratio, dtype=np.float32),
+        window_charge_total_nC=np.full(3, amplitude * 40.0 * ratio, dtype=np.float32),
+        window_charge_per_electrode_nC=np.full((3, 4), amplitude * 10.0 * ratio, dtype=np.float32),
+        mean_dT=np.asarray([0.01, 0.02, 0.03], dtype=np.float32) * amplitude * ratio,
+        max_dT=np.asarray([0.02, 0.04, 0.06], dtype=np.float32) * amplitude * ratio,
+        active_electrode_count=np.asarray([1, 1, 1], dtype=np.int32),
+        raster_rate_hz=np.asarray(15.0 / groups, dtype=np.float32),
+    )
+    video_label = "gt" if preprocessing == "gt" else preprocessing
+    (run_dir / "run_manifest.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "block": "raster_protocols",
+                "run_id": run_id,
+                "video": str(Path(f"videos/SANPO/SANPO{video_label}25min.mp4").resolve()),
+                "coords_yaml": f"config/coords_{grid_um}um.yaml",
+                "preprocessing_method": "groundtruth" if preprocessing == "gt" else preprocessing,
+                "source_input_label": preprocessing,
+                "amplitude_uA": amplitude,
+                "appearance_threshold_uA": amplitude / 2.0,
+                "frequency_hz": 300.0,
+                "pulse_width_us": 170.0,
+                "raster_mode": mode,
+                "raster_mode_normalized": normalized_mode,
+                "raster_groups": groups,
+                "internal_circuit_power_mw": internal_circuit_power_mw,
+                "metadata": {
+                    "analysis_role": role,
+                    "matched_phase1_run_id": baseline_run_id,
+                    "expected_duty_fraction": 1.0 / groups,
+                    "expected_raster_cycle_rate_hz": 15.0 / groups,
+                },
             }
         ),
         encoding="utf-8",
@@ -182,7 +302,7 @@ def test_safety_experiment_matrix_expands_expected_cases() -> None:
         for case in cases
     }
     assert set(preprocessing_inputs) == {"groundtruth", "canny", "dog"}
-    assert preprocessing_inputs["groundtruth"] == "videos/SANPO/SANPO25min.mp4"
+    assert preprocessing_inputs["groundtruth"] == "videos/SANPO/SANPOgt25min.mp4"
     assert preprocessing_inputs["canny"] == "videos/SANPO/SANPOcanny25min.mp4"
     assert preprocessing_inputs["dog"] == "videos/SANPO/SANPOdog25min.mp4"
 
@@ -206,40 +326,53 @@ def test_safety_experiment_matrix_expands_expected_cases() -> None:
 
 def test_ic_power_phase_config_expands_expected_cases() -> None:
     cases = build_cases(matrix_path="config/safety_experiments_phase2_ic_power.yaml")
+    validation = [case for case in cases if case.metadata["analysis_role"] == VALIDATION_ROLE]
+    fit_cases = [case for case in cases if case.metadata["analysis_role"] == FIT_ROLE]
 
-    assert len(cases) == 12
+    assert len(cases) == 27
     assert {case.block for case in cases} == {"ic_power"}
-    assert {case.amplitude_uA for case in cases} == {60.0}
-    assert {case.appearance_threshold_uA for case in cases} == {30.0}
-    assert {Path(case.coords_yaml).name for case in cases} == {"coords_800um.yaml"}
-    assert {case.preprocessing_method for case in cases} == {"dog", "canny", "groundtruth"}
-    assert {case.internal_circuit_power_mw for case in cases} == {0.0, 10.0, 20.0, 50.0}
+    assert len(fit_cases) == 21
+    assert len(validation) == 6
+    assert all(not case.electrode_heat_enabled for case in fit_cases)
+    assert all(case.electrode_heat_enabled for case in validation)
+    assert {Path(case.coords_yaml).name for case in cases} == {
+        "coords_400um.yaml",
+        "coords_800um.yaml",
+        "coords_1200um.yaml",
+    }
+    assert {case.internal_circuit_power_mw for case in fit_cases} == set(FIT_POWER_LEVELS_MW)
+    assert {case.internal_circuit_power_mw for case in validation} == {5.0, 50.0}
+    assert {(case.preprocessing_method, case.amplitude_uA) for case in validation} == {("canny", 120.0)}
     assert {case.ic_heat_mode for case in cases} == {"with"}
     assert {case.raster_mode for case in cases} == {"none"}
 
 
 def test_rastering_phase_config_expands_expected_cases() -> None:
     cases = build_cases(matrix_path="config/safety_experiments_phase3_rastering.yaml")
+    screen = [case for case in cases if case.metadata["analysis_role"] == "worst_case_screen"]
+    transfer = [case for case in cases if case.metadata["analysis_role"] == "transfer_panel"]
 
-    assert len(cases) == 6
+    assert len(cases) == 26
     assert {case.block for case in cases} == {"raster_protocols"}
-    assert {case.video for case in cases} == {"videos/SANPO/SANPOdog25min.mp4"}
-    assert {Path(case.coords_yaml).name for case in cases} == {"coords_800um.yaml"}
-    assert {case.preprocessing_method for case in cases} == {"dog"}
-    assert {case.amplitude_uA for case in cases} == {60.0}
-    assert {case.appearance_threshold_uA for case in cases} == {30.0}
+    assert len(screen) == 6
+    assert len(transfer) == 20
+    assert {Path(case.coords_yaml).name for case in cases} == {
+        "coords_400um.yaml",
+        "coords_800um.yaml",
+        "coords_1200um.yaml",
+    }
+    assert {case.preprocessing_method for case in cases} == {"canny", "dog", "groundtruth"}
+    assert {case.amplitude_uA for case in cases} == {60.0, 120.0}
     assert {case.internal_circuit_power_mw for case in cases} == {0.0}
     assert {case.ic_heat_mode for case in cases} == {"with"}
     assert {case.raster_mode for case in cases} == {"checkerboard", "pseudo_random"}
-    assert {case.raster_groups for case in cases} == {3, 4, 5}
+    assert {case.raster_groups for case in screen} == {3, 4, 5}
+    assert {case.raster_groups for case in transfer} == {4, 5}
 
     expected = {
-        ("checkerboard", 3, 5.0),
-        ("checkerboard", 4, 3.75),
-        ("checkerboard", 5, 3.0),
-        ("pseudo_random", 3, 5.0),
-        ("pseudo_random", 4, 3.75),
-        ("pseudo_random", 5, 3.0),
+        (mode, groups, rate)
+        for mode in ("checkerboard", "pseudo_random")
+        for groups, rate in ((3, 5.0), (4, 3.75), (5, 3.0))
     }
     actual = {
         (
@@ -247,10 +380,213 @@ def test_rastering_phase_config_expands_expected_cases() -> None:
             case.raster_groups,
             case.metadata["expected_raster_cycle_rate_hz"],
         )
-        for case in cases
+        for case in screen
     }
     assert actual == expected
-    assert len({case.run_id for case in cases}) == 6
+    assert len({case.run_id for case in cases}) == 26
+    assert all(np.isclose(case.metadata["expected_duty_fraction"], 1.0 / case.raster_groups) for case in cases)
+    assert all(case.metadata["matched_phase1_run_id"].startswith("coords_") for case in cases)
+
+
+def test_matrix_axis_metadata_is_merged() -> None:
+    cases = build_cases(matrix_path="config/safety_experiments_phase3_rastering.yaml")
+    case = next(case for case in cases if case.run_id.endswith("pseudo_random__groups_5"))
+
+    assert case.metadata["analysis_role"] in {"worst_case_screen", "transfer_panel"}
+    assert case.metadata["raster_pattern"] == "pseudo_random"
+    assert case.metadata["expected_duty_fraction"] == 0.2
+    assert case.metadata["expected_raster_cycle_rate_hz"] == 3.0
+    assert case.metadata["protocol_id"] == "random__groups_5"
+
+
+def test_raster_effects_match_phase1_and_calculate_reductions(tmp_path: Path) -> None:
+    baseline_id = "coords_400um__canny__amp_120uA"
+    write_fake_matrix_record(
+        tmp_path / "phase1",
+        amplitude=120.0,
+        grid_um=400,
+        preprocessing="canny",
+        internal_circuit_power_mw=0.0,
+    )
+    for mode in ("checkerboard", "pseudo_random"):
+        write_fake_raster_record(
+            tmp_path / "phase3",
+            baseline_run_id=baseline_id,
+            grid_um=400,
+            preprocessing="canny",
+            amplitude=120.0,
+            mode=mode,
+            groups=4,
+            ratio=0.25,
+            role="worst_case_screen",
+        )
+
+    phase1 = discover_phase1_runs(tmp_path / "phase1")
+    raster = discover_raster_runs(tmp_path / "phase3")
+    rows = build_raster_effect_rows(raster, phase1)
+
+    assert len(rows) == 2
+    assert all(row["baseline_match_valid"] for row in rows)
+    assert all(np.isclose(row["total_protocol_charge_ratio"], 0.25) for row in rows)
+    assert all(np.isclose(row["mean_temperature_ratio"], 0.25) for row in rows)
+    assert all(np.isclose(row["focal_temperature_reduction_fraction"], 0.75) for row in rows)
+    assert all(np.isclose(row["total_protocol_charge_ratio_vs_other_mode"], 0.0) for row in rows)
+    table = build_raster_comparison_table_rows(rows, {"400um": 0.02})
+    assert np.isclose(table[0]["old_raw_ic_power_budget_mW"], 0.0)
+    assert np.isclose(table[0]["new_raw_ic_power_budget_mW"], 55.0)
+    assert np.isclose(table[0]["charge_reduction_percent"], 75.0)
+    assert np.isclose(table[0]["temperature_reduction_percent"], 75.0)
+
+
+def test_raster_baseline_matching_rejects_protocol_and_power_mismatches(tmp_path: Path) -> None:
+    baseline_id = "coords_400um__canny__amp_120uA"
+    write_fake_matrix_record(
+        tmp_path / "phase1",
+        amplitude=120.0,
+        grid_um=400,
+        preprocessing="canny",
+        internal_circuit_power_mw=0.0,
+    )
+    write_fake_raster_record(
+        tmp_path / "phase3",
+        baseline_run_id=baseline_id,
+        grid_um=400,
+        preprocessing="canny",
+        amplitude=120.0,
+        mode="checkerboard",
+        groups=4,
+        ratio=0.25,
+        internal_circuit_power_mw=10.0,
+    )
+
+    baseline = discover_phase1_runs(tmp_path / "phase1")[baseline_id]
+    raster = discover_raster_runs(tmp_path / "phase3")[0]
+    reasons = baseline_mismatch_reasons(raster, baseline)
+
+    assert "internal_circuit_power_mw" in reasons
+    assert "raster_ic_power" in reasons
+    assert build_raster_effect_rows([raster], {baseline_id: baseline})[0]["status"] == "baseline_mismatch"
+
+
+def test_raster_discovery_ignores_stale_records_without_analysis_role(tmp_path: Path) -> None:
+    write_fake_raster_record(
+        tmp_path,
+        baseline_run_id="coords_400um__canny__amp_120uA",
+        grid_um=400,
+        preprocessing="canny",
+        amplitude=120.0,
+        mode="checkerboard",
+        groups=4,
+        ratio=0.25,
+    )
+    manifest_path = next(tmp_path.rglob("run_manifest.yaml"))
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["metadata"].pop("analysis_role")
+    manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+
+    assert discover_raster_runs(tmp_path) == []
+
+
+def test_raster_effects_handle_zero_baseline_metrics(tmp_path: Path) -> None:
+    baseline_id = "coords_400um__canny__amp_0uA"
+    write_fake_matrix_record(
+        tmp_path / "phase1",
+        amplitude=0.0,
+        grid_um=400,
+        preprocessing="canny",
+        internal_circuit_power_mw=0.0,
+    )
+    write_fake_raster_record(
+        tmp_path / "phase3",
+        baseline_run_id=baseline_id,
+        grid_um=400,
+        preprocessing="canny",
+        amplitude=0.0,
+        mode="checkerboard",
+        groups=4,
+        ratio=0.25,
+    )
+
+    rows = build_raster_effect_rows(
+        discover_raster_runs(tmp_path / "phase3"),
+        discover_phase1_runs(tmp_path / "phase1"),
+    )
+
+    assert rows[0]["baseline_match_valid"]
+    assert np.isnan(rows[0]["total_protocol_charge_ratio"])
+    assert np.isnan(rows[0]["mean_temperature_ratio"])
+
+
+def test_raster_effect_visualizer_writes_comparison_outputs(tmp_path: Path) -> None:
+    baseline_id = "coords_400um__canny__amp_120uA"
+    write_fake_matrix_record(
+        tmp_path / "phase1",
+        amplitude=120.0,
+        grid_um=400,
+        preprocessing="canny",
+        internal_circuit_power_mw=0.0,
+    )
+    for mode in ("checkerboard", "pseudo_random"):
+        write_fake_raster_record(
+            tmp_path / "phase3",
+            baseline_run_id=baseline_id,
+            grid_um=400,
+            preprocessing="canny",
+            amplitude=120.0,
+            mode=mode,
+            groups=4,
+            ratio=0.25,
+            role="worst_case_screen",
+        )
+
+    written = write_raster_effect_outputs(
+        tmp_path / "phase3",
+        tmp_path / "phase1",
+        tmp_path / "visuals",
+    )
+
+    assert (tmp_path / "visuals" / "raster_effect_summary.csv").exists()
+    assert (tmp_path / "visuals" / "raster_effect_budget_table.csv").exists()
+    assert (tmp_path / "visuals" / "raster_effect_budget_table.png").exists()
+    assert (tmp_path / "visuals" / "worst_case_temperature_evolution.png").exists()
+    assert (tmp_path / "visuals" / "duty_fraction_comparison.png").exists()
+    assert (tmp_path / "visuals" / "charge_temperature_tradeoff.png").exists()
+    assert (tmp_path / "visuals" / "raster_effect_summary.yaml").exists()
+    assert len(written) == 12
+
+
+def test_phase3_visualizer_removes_obsolete_plots(tmp_path: Path) -> None:
+    obsolete = tmp_path / "nested" / "mean_temperature_evolution.png"
+    retained = tmp_path / "nested" / "charge_temperature_tradeoff.png"
+    obsolete.parent.mkdir(parents=True)
+    obsolete.write_bytes(b"old")
+    retained.write_bytes(b"keep")
+
+    removed = remove_obsolete_phase3_plots(tmp_path)
+
+    assert removed == [obsolete]
+    assert not obsolete.exists()
+    assert retained.exists()
+
+
+def test_charge_grid_titles_use_current_safety_limits() -> None:
+    visualize.set_plot_safety_limits(visualize.load_safety_limits("config/safety.yaml"))
+
+    assert visualize.title_with_charge_limit(
+        "Mean Charge Per Second Per Electrode",
+        "charge_per_second",
+        "uC/s/electrode",
+    ).endswith("(per-electrode limit: 2 uC/s/electrode)")
+    assert visualize.title_with_charge_limit(
+        "Mean Summed Charge Per Second",
+        "summed_charge_per_second",
+        "mC/s",
+    ).endswith("(total-array limit: 150.0 mC/s)")
+    assert visualize.title_with_charge_limit(
+        "Summed Total Charge",
+        "total_charge",
+        "mC",
+    ).endswith("(session limit: 938.0 mC)")
 
 
 def test_matrix_representative_preview_policy_selects_eleven_cases() -> None:
@@ -325,8 +661,10 @@ def test_matrix_comparative_visuals_are_summary_only(tmp_path: Path) -> None:
     out_root = tmp_path / "visuals"
     visualize.plot_comparative_suites(records, out_root, "png", overwrite=True)
 
-    matrix_root = out_root / "amplitude_grid_preprocessing"
-    assert (matrix_root / "active_electrodes" / "active_electrodes_by_grid_preprocessing.png").exists()
+    matrix_root = out_root
+    for grid_um in (400, 800, 1200):
+        assert (matrix_root / "active_electrodes" / f"active_electrodes_{grid_um}um.png").exists()
+    assert not (matrix_root / "active_electrodes" / "active_electrodes_by_grid_preprocessing.png").exists()
     assert not (matrix_root / "active_electrodes" / "mean_active_electrodes_by_grid.png").exists()
     assert not (matrix_root / "active_electrodes" / "max_active_electrodes_by_grid.png").exists()
     assert (matrix_root / "shannon_k" / "mean_shannon_k_by_amplitude.png").exists()
@@ -367,6 +705,15 @@ def test_amplitude_mean_series_uses_zero_for_no_active_electrodes() -> None:
     assert series is not None
     np.testing.assert_allclose(series[0], np.asarray([1.0, 2.0, 3.0], dtype=np.float32) / 60.0)
     np.testing.assert_allclose(series[1], np.asarray([0.0, 60.0, 0.0], dtype=np.float32))
+
+
+def test_hot_grid_text_color_tracks_cell_luminance() -> None:
+    assert visualize.contrasting_cell_text_color(0.0, vmin=0.0, vmax=1.0, cmap="hot") == "white"
+    assert visualize.contrasting_cell_text_color(1.0, vmin=0.0, vmax=1.0, cmap="hot") == "black"
+    assert visualize.contrasting_cell_text_color(0.0, vmin=0.0, vmax=1.0, cmap="viridis") == "white"
+    assert visualize.contrasting_cell_text_color(1.0, vmin=0.0, vmax=1.0, cmap="viridis") == "black"
+    assert visualize.contrasting_cell_text_color(0.5, vmin=0.0, vmax=1.0, cmap="RdYlGn") == "black"
+    assert visualize.contrasting_cell_text_color(np.nan, vmin=0.0, vmax=1.0, cmap="hot") == visualize.FALLBACK_COLOR
 
 
 def test_amplitude_downsampling_preserves_instantaneous_currents() -> None:
@@ -423,6 +770,44 @@ def test_raster_aliases_normalize_to_random() -> None:
     assert normalize_raster_mode("pseudo_random") == "random"
     assert normalize_raster_mode("pseudorandom") == "random"
     assert normalize_raster_mode("random") == "random"
+
+
+def test_raster_groups_to_electrodes_vectorized_mode_and_missing_values() -> None:
+    sim = SimpleNamespace(
+        raster_enabled=True,
+        raster_num_groups=3,
+        raster_groups_flat=torch.tensor([2, 1, 2, 2, 1], dtype=torch.long),
+    )
+    inv_map = torch.tensor([0, 0, 1, 1, 1], dtype=torch.long)
+
+    groups = raster_groups_to_electrodes(sim, inv_map, n_elec=3)
+
+    assert torch.equal(groups, torch.tensor([1, 2, -1], dtype=torch.int32))
+
+
+def test_pseudo_random_reshuffle_increments_assignment_version() -> None:
+    sim = SimpleNamespace(
+        raster_groups_flat=torch.tensor([0, 1, 2], dtype=torch.long),
+        raster_num_groups=3,
+        raster_assignment_version=0,
+        _raster_group_pool=[
+            torch.tensor([0, 1, 2], dtype=torch.long),
+            torch.tensor([2, 0, 1], dtype=torch.long),
+        ],
+        _raster_group_pool_index=0,
+        _sorted_raster_coords=None,
+        raster_schedule=[
+            torch.zeros((3, 1, 1)),
+            torch.zeros((3, 1, 1)),
+            torch.zeros((3, 1, 1)),
+        ],
+        shape=(3, 1, 1),
+    )
+
+    GaussianSimulator._reshuffle_random_pattern(sim)
+
+    assert sim.raster_assignment_version == 1
+    assert torch.equal(sim.raster_groups_flat, torch.tensor([2, 0, 1]))
 
 
 def test_bioheat_power_vectors_follow_aligned_electrode_coordinates() -> None:
@@ -547,6 +932,7 @@ def test_manifest_records_threshold_raster_and_source_metadata(tmp_path: Path) -
     assert manifest["raster_mode"] == "pseudo_random"
     assert manifest["raster_mode_normalized"] == "random"
     assert manifest["source_input_label"] == "SANPO_groundtruth"
+    assert manifest["electrode_heat_enabled"] is True
     assert manifest["metadata"]["experiment_block"] == "rastering"
     assert manifest["cooldown_seconds"] == 300.0
     assert manifest["cooldown_baseline_tolerance_C"] == 1e-3
@@ -872,16 +1258,40 @@ def test_phase3_rastering_defaults_metrics_only(monkeypatch) -> None:
     assert args.phosphene_mode == "safety_centers"
     assert args.cooldown_seconds == 300.0
     assert args.cooldown_baseline_tolerance_C == 1e-3
+    assert args.phase1_input_root.endswith("amplitude_grid_preprocessing")
+    assert args.format == "png"
+
+
+def test_ic_power_phase_defaults_to_all_cases(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_phase2_ic_power.py", "--dry-run"])
+
+    args = run_phase2_ic_power.parse_args()
+
+    assert args.baseline_only is False
+    assert args.phase1_input_root.endswith("amplitude_grid_preprocessing")
+    assert args.temperature_limit_C == 2.0
+    assert args.power_derating_factor == 0.9
+
+
+def test_ic_power_baseline_only_selects_twenty_one_cases() -> None:
+    cases = build_cases(matrix_path="config/safety_experiments_phase2_ic_power.yaml")
+
+    selected = run_phase2_ic_power.select_cases(cases, baseline_only=True)
+
+    assert len(selected) == 21
+    assert all(not case.electrode_heat_enabled for case in selected)
+    assert {case.internal_circuit_power_mw for case in selected} == set(FIT_POWER_LEVELS_MW)
 
 
 def test_experiment_matrix_runs_visualizer_after_simulations(monkeypatch, tmp_path: Path) -> None:
     calls: list[str] = []
     args = Namespace(
         blocks=None,
-        matrix_config="config/safety_experiments_phase1.yaml",
+        matrix_config="config/safety_experiments_phase1_amp_grid_prep.yaml",
         output_root=str(tmp_path / "runs"),
         visuals_root=str(tmp_path / "visuals"),
         safety_yaml="config/safety.yaml",
+        include_existing=False,
         dry_run=False,
     )
 
@@ -889,7 +1299,15 @@ def test_experiment_matrix_runs_visualizer_after_simulations(monkeypatch, tmp_pa
     monkeypatch.setattr(
         run_phase1,
         "build_cases",
-        lambda *, blocks, matrix_path: calls.append("build_cases") or ["case"],
+        lambda *, blocks, matrix_path: calls.append("build_cases") or [
+            SimulationCase(
+                block="amplitude_grid_preprocessing",
+                run_id="case",
+                video="video.mp4",
+                coords_yaml="coords.yaml",
+                preprocessing_method="canny",
+            )
+        ],
     )
     monkeypatch.setattr(
         run_phase1,
@@ -904,8 +1322,6 @@ def test_experiment_matrix_runs_visualizer_after_simulations(monkeypatch, tmp_pa
 
     for name, function_name in (
         ("summary_csv", "write_summary_csv"),
-        ("ratio_breakdown", "plot_ratio_breakdown"),
-        ("block_summaries", "plot_all_block_summaries"),
         ("comparative_suites", "plot_comparative_suites"),
         ("single_case_overviews", "write_single_case_overviews"),
         ("per_protocol_visuals", "write_per_protocol_visuals"),
@@ -923,8 +1339,6 @@ def test_experiment_matrix_runs_visualizer_after_simulations(monkeypatch, tmp_pa
         "simulations",
         "discover",
         "summary_csv",
-        "ratio_breakdown",
-        "block_summaries",
         "comparative_suites",
         "single_case_overviews",
         "per_protocol_visuals",
@@ -933,7 +1347,7 @@ def test_experiment_matrix_runs_visualizer_after_simulations(monkeypatch, tmp_pa
 
 def test_ic_power_phase_skips_completed_zero_mw(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
-    zero_dir = tmp_path / "runs" / "ic_power" / "coords_800um__gt__amp_60uA_0mW"
+    zero_dir = tmp_path / "runs" / "ic_power" / "coords_800um__ic_only__0mW"
     zero_dir.mkdir(parents=True)
     np.savez(zero_dir / "safety_metrics.npz", max_dT=np.asarray([0.0]), mean_dT=np.asarray([0.0]))
 
@@ -961,6 +1375,9 @@ def test_ic_power_phase_skips_completed_zero_mw(monkeypatch, tmp_path: Path) -> 
         force_cpu=True,
         enable_cem43=False,
         format="png",
+        phase1_input_root=str(tmp_path / "phase1"),
+        temperature_limit_C=2.0,
+        power_derating_factor=0.9,
     )
 
     monkeypatch.setattr(run_phase2_ic_power, "parse_args", lambda: args)
@@ -973,14 +1390,30 @@ def test_ic_power_phase_skips_completed_zero_mw(monkeypatch, tmp_path: Path) -> 
     run_phase2_ic_power.main()
 
     assert len(calls) == 1
-    assert "coords_800um__gt__amp_60uA_0mW" not in calls[0]
-    assert len(calls[0]) == 11
+    assert "coords_800um__ic_only__0mW" not in calls[0]
+    assert len(calls[0]) == 26
 
 
 def test_ic_power_temperature_visuals_are_temperature_only(tmp_path: Path) -> None:
-    for preprocessing in ("dog", "canny", "gt"):
-        for power_mw in (0.0, 10.0):
-            write_fake_ic_power_record(tmp_path / "ic_power", preprocessing=preprocessing, power_mw=power_mw)
+    for grid_um in (400, 800, 1200):
+        write_fake_matrix_record(tmp_path / "phase1", amplitude=120.0, grid_um=grid_um, preprocessing="canny")
+        for power_mw in FIT_POWER_LEVELS_MW:
+            write_fake_ic_power_record(
+                tmp_path / "ic_power",
+                preprocessing="baseline",
+                grid_um=grid_um,
+                power_mw=power_mw,
+                electrode_heat_enabled=False,
+            )
+        for power_mw in (5.0, 50.0):
+            write_fake_ic_power_record(
+                tmp_path / "ic_power",
+                preprocessing="canny",
+                grid_um=grid_um,
+                amplitude_uA=120.0,
+                power_mw=power_mw,
+                mean_offset=3.6,
+            )
 
     records = discover_ic_power_records(tmp_path / "ic_power", "config/safety.yaml")
     out_root = tmp_path / "visuals"
@@ -990,19 +1423,146 @@ def test_ic_power_temperature_visuals_are_temperature_only(tmp_path: Path) -> No
         image_format="png",
         overwrite=True,
         safety_yaml="config/safety.yaml",
+        phase1_input_root=tmp_path / "phase1",
     )
 
-    assert len(records) == 6
-    assert {record.ic_power_mw for record in records} == {0.0, 10.0}
-    assert {record.preprocessing for record in records} == {"dog", "canny", "gt"}
-    assert (out_root / "temperature_evolution_dog.png").exists()
-    assert (out_root / "temperature_evolution_canny.png").exists()
-    assert (out_root / "temperature_evolution_gt.png").exists()
+    assert len(records) == 27
+    assert {record.grid for record in records} == {"400um", "800um", "1200um"}
+    assert (out_root / "temperature_evolution_400um_canny_amp_120uA.png").exists()
+    assert (out_root / "ic_only_temperature_evolution_400um.png").exists()
+    assert (out_root / "ic_only_temperature_evolution_800um.png").exists()
+    assert (out_root / "ic_only_temperature_evolution_1200um.png").exists()
+    assert (out_root / "ic_power_linearity_800um.png").exists()
+    assert (out_root / "ic_power_linearity_summary.csv").exists()
+    assert (out_root / "phase1_ic_power_budget.csv").exists()
+    assert (out_root / "phase1_ic_power_budget.png").exists()
+    assert (out_root / "ic_power_safety_summary.yaml").exists()
     assert (out_root / "max_focal_temperature_grid.png").exists()
     assert (out_root / "max_mean_temperature_grid.png").exists()
     assert (out_root / "temperature_summary.csv").exists()
+    assert (out_root / "joule_heating_offset_summary.csv").exists()
+    assert (out_root / "joule_heating_offset_800um_canny_amp_120uA.png").exists()
     assert not (out_root / "charge_over_whole_protocol.png").exists()
-    assert len(written) == 6
+    assert len(written) == 21
+
+
+def test_ic_power_origin_fit_uses_configured_per_ic_power(tmp_path: Path) -> None:
+    for power_mw in FIT_POWER_LEVELS_MW:
+        write_fake_ic_power_record(
+            tmp_path,
+            preprocessing="baseline",
+            power_mw=power_mw,
+            electrode_heat_enabled=False,
+            mean_slope=0.02,
+        )
+
+    records = discover_ic_power_records(tmp_path)
+    result = fit_origin_linearity(records)
+
+    assert np.isclose(result.slope_C_per_mW, 0.02, rtol=1e-6)
+    assert result.linearity_pass
+    assert all(np.isclose(record.reported_total_power_mw, 2.0 * record.ic_power_mw) for record in records)
+
+
+def test_ic_power_fit_reports_nonzero_intercept_and_rejects_nonlinearity(tmp_path: Path) -> None:
+    for power_mw in FIT_POWER_LEVELS_MW:
+        write_fake_ic_power_record(
+            tmp_path,
+            preprocessing="baseline",
+            power_mw=power_mw,
+            electrode_heat_enabled=False,
+            mean_slope=0.02 if power_mw != 35.0 else 0.03,
+            mean_offset=0.1,
+        )
+
+    result = fit_origin_linearity(discover_ic_power_records(tmp_path))
+
+    assert result.free_intercept_C > 0.0
+    assert not result.linearity_pass
+    assert result.status == "linearity_failed"
+
+
+def test_ic_power_fit_marks_missing_power_coverage_invalid(tmp_path: Path) -> None:
+    for power_mw in FIT_POWER_LEVELS_MW[:-1]:
+        write_fake_ic_power_record(
+            tmp_path,
+            preprocessing="baseline",
+            power_mw=power_mw,
+            electrode_heat_enabled=False,
+        )
+
+    result = fit_origin_linearity(discover_ic_power_records(tmp_path))
+
+    assert not result.coverage_complete
+    assert not result.linearity_pass
+    assert result.status == "incomplete_power_coverage"
+
+
+def test_ic_power_fit_rejects_duplicate_grid_power_records(tmp_path: Path) -> None:
+    write_fake_ic_power_record(
+        tmp_path / "a",
+        preprocessing="baseline",
+        power_mw=10.0,
+        electrode_heat_enabled=False,
+    )
+    write_fake_ic_power_record(
+        tmp_path / "b",
+        preprocessing="baseline",
+        power_mw=10.0,
+        electrode_heat_enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="Duplicate IC-only fit record"):
+        fit_origin_linearity(discover_ic_power_records(tmp_path))
+
+
+def test_ic_power_discovery_ignores_records_without_analysis_role(tmp_path: Path) -> None:
+    write_fake_ic_power_record(
+        tmp_path,
+        preprocessing="baseline",
+        power_mw=10.0,
+        electrode_heat_enabled=False,
+    )
+    manifest_path = next(tmp_path.rglob("run_manifest.yaml"))
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("metadata")
+    manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+
+    assert discover_ic_power_records(tmp_path) == []
+
+
+def test_phase1_budget_uses_grid_fit_and_clamps_over_limit_to_zero(tmp_path: Path) -> None:
+    for power_mw in FIT_POWER_LEVELS_MW:
+        write_fake_ic_power_record(
+            tmp_path / "ic_power",
+            preprocessing="baseline",
+            power_mw=power_mw,
+            electrode_heat_enabled=False,
+            mean_slope=0.02,
+        )
+    write_fake_matrix_record(tmp_path / "phase1", amplitude=120.0, grid_um=800, preprocessing="canny")
+    phase1_records = discover_phase1_records(tmp_path / "phase1")
+    fit = fit_origin_linearity(discover_ic_power_records(tmp_path / "ic_power"))
+    valid_fit = fit.__class__(
+        **{
+            **fit.__dict__,
+            "additivity_pass": True,
+            "analysis_valid": True,
+            "status": "pass",
+        }
+    )
+
+    rows = build_phase1_budget_rows(
+        phase1_records,
+        [valid_fit],
+        temperature_limit_C=2.0,
+        power_derating_factor=0.9,
+    )
+
+    assert rows[0]["status"] == "mean_limit_already_reached"
+    assert rows[0]["raw_max_ic_power_mW"] == 0.0
+    assert rows[0]["recommended_max_ic_power_mW"] == 0.0
+    assert rows[0]["focal_limit_exceeded"] is True
 
 
 def test_thermal_update_defaults_to_one_video_frame() -> None:
@@ -1091,7 +1651,7 @@ def test_safety_visualization_writes_summary_plot(tmp_path: Path) -> None:
     visualize.write_per_protocol_visuals(records, "png", overwrite=True, output_root=out_root)
 
     assert not (out_root / "overall_safety_margin.png").exists()
-    assert (comparative_root / "amplitude" / "shannon_k_over_time.png").exists()
-    assert (out_root / "amplitude" / "case" / "charge_over_whole_protocol.png").exists()
-    assert (out_root / "amplitude" / "case" / "temperature_heatmaps_left.png").exists()
-    assert len(list((out_root / "amplitude" / "case" / "temperature_heatmaps_left").glob("*.png"))) == 2
+    assert (comparative_root / "shannon_k_over_time.png").exists()
+    assert (run_dir / "charge_over_whole_protocol.png").exists()
+    assert (run_dir / "temperature_heatmaps_left.png").exists()
+    assert len(list((run_dir / "temperature_heatmaps_left").glob("*.png"))) == 2

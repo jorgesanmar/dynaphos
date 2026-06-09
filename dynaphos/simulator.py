@@ -656,6 +656,7 @@ class GaussianSimulator:
                 # Reshape to match the spatial dimensions (Channels, Height, Width)
                 mask = mask.reshape(self.shape[-3:])
                 self.raster_schedule.append(mask)
+            self.raster_assignment_version = 0
 
             # Initialize raster state
             self.current_raster_group = 0
@@ -673,6 +674,7 @@ class GaussianSimulator:
             self.raster_groups = None
             self.raster_groups_flat = None
             self.raster_schedule = None
+            self.raster_assignment_version = 0
             self._raster_group_pool = None
             self._raster_group_pool_index = 0
             self.current_raster_group = 0
@@ -1163,6 +1165,7 @@ class GaussianSimulator:
             )
             new_groups = raster_groups.reshape(-1)[:num_electrodes]
         self.raster_groups_flat = new_groups
+        self.raster_assignment_version += 1
 
         # Update schedule masks (all on GPU)
         for group_idx in range(self.raster_num_groups):

@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dynaphos.safety.io import add_common_cli, resolve_repo_path, run_cases
+from dynaphos.safety.io import add_common_cli, resolve_repo_path, run_cases, sanitize_path_part
 from dynaphos.safety.experiments import (
     available_blocks,
     build_cases,
@@ -17,12 +17,16 @@ from dynaphos.safety.experiments import (
 from dynaphos.safety import visualize
 
 
-DEFAULT_PHASE1_CONFIG = PROJECT_ROOT / "config" / "safety_experiments_phase1.yaml"
+DEFAULT_PHASE1_CONFIG = PROJECT_ROOT / "config" / "safety_experiments_phase1_amp_grid_prep.yaml"
+
+
+def case_output_dir(output_parent: Path, block: str, run_id: str) -> Path:
+    return output_parent / sanitize_path_part(block) / sanitize_path_part(run_id)
 
 
 def run_visualizer(args: argparse.Namespace) -> None:
-    input_root = resolve_repo_path(args.output_root)
-    output_root = resolve_repo_path(args.visuals_root)
+    input_root = resolve_repo_path(args.output_root) / "amplitude_grid_preprocessing"
+    output_root = input_root
     safety_yaml = resolve_repo_path(args.safety_yaml)
     records = visualize.discover_records(input_root, safety_yaml)
     if not records:
@@ -32,9 +36,7 @@ def run_visualizer(args: argparse.Namespace) -> None:
     print(f"Running safety visualizer for {len(records)} completed simulation(s).")
     visualize.set_plot_safety_limits(visualize.load_safety_limits(safety_yaml))
     comparative_root = output_root / "comparative_visuals"
-    visualize.write_summary_csv(records, output_root)
-    visualize.plot_ratio_breakdown(records, comparative_root, "png", overwrite=True)
-    visualize.plot_all_block_summaries(records, comparative_root, "png", overwrite=True)
+    visualize.write_summary_csv(records, comparative_root)
     visualize.plot_comparative_suites(records, comparative_root, "png", overwrite=True)
     visualize.write_single_case_overviews(records, "png", overwrite=True, output_root=output_root)
     visualize.write_per_protocol_visuals(records, "png", overwrite=True, output_root=output_root)
@@ -44,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a declarative safety experiment matrix.")
     add_common_cli(parser)
     parser.set_defaults(
+        output_root="results/safety/simulation_pipeline",
+        visuals_root="results/safety/simulation_pipeline/amplitude_grid_preprocessing",
         preview_seconds=0.0,
         preview_policy="none",
         phosphene_mode="safety_centers",
@@ -64,6 +68,11 @@ def parse_args() -> argparse.Namespace:
             f"Available in the default config: {', '.join(available_blocks(DEFAULT_PHASE1_CONFIG))}."
         ),
     )
+    parser.add_argument(
+        "--include-existing",
+        action="store_true",
+        help="Re-run cases even when safety_metrics.npz already exists.",
+    )
     return parser.parse_args()
 
 
@@ -73,7 +82,25 @@ def main() -> None:
         blocks=normalize_block_selection(args.blocks),
         matrix_path=args.matrix_config,
     )
-    run_cases(cases, args)
+    output_parent = resolve_repo_path(args.output_root)
+    pending = []
+    skipped = []
+    for case in cases:
+        out_dir = case_output_dir(output_parent, case.block, case.run_id)
+        if not args.include_existing and (out_dir / "safety_metrics.npz").exists():
+            skipped.append(case)
+        else:
+            pending.append(case)
+
+    if skipped:
+        print(f"Skipping {len(skipped)} completed phase-1 case(s):")
+        for case in skipped:
+            print(f"  {case.run_id}")
+    if pending:
+        run_cases(pending, args)
+    else:
+        print("No phase-1 simulations to run.")
+
     if not args.dry_run:
         run_visualizer(args)
 

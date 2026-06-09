@@ -6,12 +6,12 @@
 #
 # Area conversion:
 #   Utah array area      = 16 mm^2
-#   Coords grid area     = 200 mm^2
-#   Conversion factor    = 200 / 16 = 12.5
+#   Coords grid area     = 300 mm^2
+#   Conversion factor    = 300 / 16 = 18.75
 #
 # Total accepted charge per second:
-#   Utah array limit     = 8 uC/s
-#   Coords grid limit    = 8 * 12.5 = 100 uC/s
+#   Utah array limit     = 8 mC/s
+#   Coords grid limit    = 8 * 18.75 = 150 mC/s
 #
 # Important:
 #   Per-electrode limits are NOT scaled by array area.
@@ -23,7 +23,7 @@ scaling:
   source_area_mm2: 16.0
   target_array: coords_grid
   target_area_mm2: 300.0
-  area_conversion_factor: 12.5
+  area_conversion_factor: 18.75
 
 geometry:
   electrode_surface_area_cm2: 3.0e-5
@@ -116,10 +116,11 @@ thresholds:
   # Total accumulated charge rate across the full FOV grid.
   #
   # Scaled from Utah-array total limit:
-  #   8 uC/s * 12.5 = 100 uC/s
-  #   100 uC/s = 1.0e-4 C/s
-  accumulated_charge_limit_uc_per_second: 100.0
-  accumulated_charge_limit_coulombs_per_second: 1.0e-4
+  #   8 mC/s * 18.75 = 150 mC/s
+  accumulated_charge_limit_mc_per_second: 150.0
+
+  # Maximum percentage of electrodes active simultaneously.
+  simultaneous_activation_max_percentage: 20.0
 
   # --------------------------------------------
   # Thermal / power limits
@@ -139,8 +140,8 @@ chronic:
   # Maximum total charge delivered in a session.
   #
   # Scaled from Utah-array session limit:
-  #   0.05 C * 93.75 = 4.6875 C
-  session_charge_limit_c: 0.625
+  #   0.05 C * 18.75 = 0.9375 C
+  session_charge_limit_c: 0.938
 
   session_max_duration_s: 3600.0
   warning_threshold_fraction: 0.8
@@ -156,6 +157,8 @@ thermal:
   # Cumulative equivalent minutes at 43 C.
   cem43_limit_min: 2.0
 
+  max_continuous_duration_above_1_c_s: 90.0
+
 hardware:
   compliance_voltage_limit_v: 8.0
   max_electrode_impedance_ohm: 100000.0
@@ -165,79 +168,3 @@ electrode_materials:
   porous_pt_charge_density_limit_uc_per_cm2: 125.0
   irox_charge_density_limit_uc_per_cm2: 600.0
   tin_charge_density_limit_uc_per_cm2: 90.0
-
-stimulation_safety_guidelines:
-  charge_per_phase:
-    value: 100.0
-    unit: nC
-    description: Per-electrode charge-per-phase limit; unchanged from Utah-array limits.
-
-  charge_density:
-    value: 4000.0
-    unit: uC/cm2
-    description: Per-electrode charge-density limit; unchanged from Utah-array limits.
-
-  shannon_k:
-    value: 1.85
-    unit: dimensionless
-    description: Reference Shannon k warning threshold.
-
-  amplitude:
-    min:
-      value: 1.0
-      unit: uA
-    max:
-      value: 120.0
-      unit: uA
-    step:
-      value: 1.0
-      unit: uA
-
-  pulse_width:
-    min:
-      value: 50.0
-      unit: us
-    max:
-      value: 800.0
-      unit: us
-
-  frequency:
-    min:
-      value: 0.5
-      unit: Hz
-    max:
-      value: 300.0
-      unit: Hz
-
-  accumulated_charge:
-    time_window:
-      value: 1.0
-      unit: s
-    limits:
-      per_electrode:
-        value: 2000.0
-        unit: nC/s
-        description: Per-electrode accumulated charge rate; unchanged.
-      total_all_electrodes:
-        value: 100.0
-        unit: uC/s
-        equivalent_value_coulombs_per_second: 1e-4
-        description: Scaled from 8 uC/s using area factor 12.5.
-
-  simultaneous_activation:
-    max_percentage_of_electrodes:
-      value: 20.0
-      unit: "%"
-
-  temperature:
-    cem43:
-      value: 2.0
-      unit: min
-    temperature_increase:
-      absolute_max_temperature_increase:
-        value: 2.0
-        unit: C
-        rule: Must never be reached.
-      max_continuous_duration_above_1_c:
-        value: 90.0
-        unit: s

@@ -7,9 +7,7 @@ from dynaphos.cortex_models import get_cortex_coordinates_default, get_cortex_co
 from dynaphos.safety.visualize import (
     collect_metrics as collect_safety_metrics,
     discover_records as discover_safety_records,
-    plot_all_block_summaries,
     plot_overall_safety,
-    plot_ratio_breakdown,
 )
 
 

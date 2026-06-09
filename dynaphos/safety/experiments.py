@@ -14,7 +14,7 @@ from dynaphos.safety.io import (
 )
 
 
-DEFAULT_MATRIX_CONFIG = PROJECT_ROOT / "config" / "safety_experiments_phase1.yaml"
+DEFAULT_MATRIX_CONFIG = PROJECT_ROOT / "config" / "safety_experiments_phase1_amp_grid_prep.yaml"
 
 
 def load_experiment_matrix(path: str | Path = DEFAULT_MATRIX_CONFIG) -> dict:
@@ -88,17 +88,30 @@ def _expand_matrix_cases(block_cfg: dict) -> list[dict]:
     for combination in product(*axis_variants):
         values: dict = {}
         labels: dict[str, str] = {}
-        metadata: dict[str, object] = {}
+        metadata: dict[str, object] = dict(block_cfg.get("metadata", {}) or {})
         for axis_name, (label, variant_values) in zip(axis_names, combination):
             labels[axis_name] = label
+            variant_values = dict(variant_values)
+            variant_metadata = dict(variant_values.pop("metadata", {}) or {})
             values.update(variant_values)
             metadata[f"{axis_name}_label"] = label
+            metadata.update(variant_metadata)
 
         values["run_id"] = run_id_template.format(**labels)
         if metadata:
-            values["metadata"] = {**metadata, **dict(values.get("metadata", {}) or {})}
+            values["metadata"] = metadata
         cases.append(values)
 
+    return cases
+
+
+def _expand_all_matrix_cases(block_cfg: dict) -> list[dict]:
+    cases = _expand_matrix_cases(block_cfg)
+    for matrix_cfg in block_cfg.get("matrices", []) or []:
+        merged_cfg = {**block_cfg, **dict(matrix_cfg or {})}
+        merged_cfg.pop("matrices", None)
+        merged_cfg.pop("cases", None)
+        cases.extend(_expand_matrix_cases(merged_cfg))
     return cases
 
 
@@ -111,6 +124,11 @@ def _case_from_values(block_name: str, block_cfg: dict, values: dict) -> Simulat
 
     raster_mode = str(values.get("raster_mode", "none"))
     metadata.setdefault("raster_mode_normalized", normalize_raster_mode(raster_mode))
+    if raster_mode != "none" and values.get("raster_groups") is not None:
+        metadata.setdefault(
+            "protocol_id",
+            f"{normalize_raster_mode(raster_mode)}__groups_{int(values['raster_groups'])}",
+        )
 
     return SimulationCase(
         block=block_name,
@@ -127,6 +145,7 @@ def _case_from_values(block_name: str, block_cfg: dict, values: dict) -> Simulat
         source_input_label=str(values.get("source_input_label", values["preprocessing_method"])),
         internal_circuit_power_mw=_float_value(values, "internal_circuit_power_mw"),
         ic_heat_mode=str(values["ic_heat_mode"]),
+        electrode_heat_enabled=bool(values.get("electrode_heat_enabled", True)),
         metadata=metadata,
     )
 
@@ -156,7 +175,7 @@ def build_cases(
     for block_name in block_names:
         block_cfg = block_cfgs[block_name] or {}
         raw_cases = [
-            *_expand_matrix_cases(block_cfg),
+            *_expand_all_matrix_cases(block_cfg),
             *(block_cfg.get("cases", []) or []),
         ]
         for raw_case in raw_cases:
