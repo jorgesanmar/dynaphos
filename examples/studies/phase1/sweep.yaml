@@ -1,0 +1,47 @@
+experiment: base.yaml
+matrix:
+  protocol:
+    - label: amp_10uA
+      value:
+        amplitude_uA: 10
+        appearance_threshold_uA: 5
+        pulse_width_us: 170
+        frequency_hz: 300
+        relative_stim_duration: 1.0
+        internal_circuit_power_mW: 0
+    - label: amp_60uA
+      value:
+        amplitude_uA: 60
+        appearance_threshold_uA: 30
+        pulse_width_us: 170
+        frequency_hz: 300
+        relative_stim_duration: 1.0
+        internal_circuit_power_mW: 0
+    - label: amp_120uA
+      value:
+        amplitude_uA: 120
+        appearance_threshold_uA: 60
+        pulse_width_us: 170
+        frequency_hz: 300
+        relative_stim_duration: 1.0
+        internal_circuit_power_mW: 0
+  electrode_array.builtin:
+    - coords_400um
+    - coords_800um
+    - coords_1200um
+  input:
+    - label: dog
+      value:
+        path: ../../../videos/SANPO/SANPOdog25min.mp4
+        stage: preprocessed
+        preprocessing_method: dog
+    - label: canny
+      value:
+        path: ../../../videos/SANPO/SANPOcanny25min.mp4
+        stage: preprocessed
+        preprocessing_method: canny
+    - label: groundtruth
+      value:
+        path: ../../../videos/SANPO/SANPOgt25min.mp4
+        stage: preprocessed
+        preprocessing_method: groundtruth

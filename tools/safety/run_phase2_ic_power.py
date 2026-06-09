@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -91,6 +92,12 @@ def select_cases(
 
 
 def main() -> None:
+    warnings.warn(
+        "run_phase2_ic_power.py is deprecated; use the sweep files under "
+        "examples/studies/phase2/.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     args = parse_args()
     if args.temperature_limit_C <= 0.0:
         raise ValueError("--temperature-limit-C must be > 0.")

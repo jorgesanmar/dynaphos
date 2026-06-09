@@ -1,0 +1,22 @@
+experiment: base.yaml
+matrix:
+  electrode_array.builtin: [coords_400um, coords_800um, coords_1200um]
+  protocol:
+    - label: amp_120uA__5mW
+      value:
+        amplitude_uA: 120
+        appearance_threshold_uA: 60
+        pulse_width_us: 170
+        frequency_hz: 300
+        relative_stim_duration: 1.0
+        internal_circuit_power_mW: 5
+    - label: amp_120uA__50mW
+      value:
+        amplitude_uA: 120
+        appearance_threshold_uA: 60
+        pulse_width_us: 170
+        frequency_hz: 300
+        relative_stim_duration: 1.0
+        internal_circuit_power_mW: 50
+  safety.electrode_heat_enabled: [true]
+  safety.track_electrical: [true]

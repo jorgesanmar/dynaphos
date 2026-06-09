@@ -39,5 +39,15 @@ dev = [
 [project.urls]
 "Homepage" = "https://github.com/neuralcodinglab/dynaphos.git"
 
+[project.scripts]
+dynaphos = "dynaphos.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["dynaphos*"]
+
+[tool.setuptools.package-data]
+dynaphos = [
+  "data/defaults/*.yaml",
+  "data/electrodes/*.yaml",
+  "data/fixtures/*",
+]

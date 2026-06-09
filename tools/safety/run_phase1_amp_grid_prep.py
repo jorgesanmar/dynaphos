@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -77,6 +78,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    warnings.warn(
+        "run_phase1_amp_grid_prep.py is deprecated; use "
+        "'dynaphos sweep examples/studies/phase1/sweep.yaml'.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     args = parse_args()
     cases = build_cases(
         blocks=normalize_block_selection(args.blocks),

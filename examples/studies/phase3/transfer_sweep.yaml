@@ -1,0 +1,39 @@
+experiment: base.yaml
+matrix:
+  $condition:
+    - label: coords_400um__canny__amp_60uA
+      patch:
+        electrode_array.builtin: coords_400um
+        protocol:
+          amplitude_uA: 60
+          appearance_threshold_uA: 30
+          pulse_width_us: 170
+          frequency_hz: 300
+          relative_stim_duration: 1.0
+          internal_circuit_power_mW: 0
+    - label: coords_400um__dog__amp_120uA
+      patch:
+        input:
+          path: ../../../videos/SANPO/SANPOdog25min.mp4
+          stage: preprocessed
+          preprocessing_method: dog
+        electrode_array.builtin: coords_400um
+    - label: coords_400um__gt__amp_120uA
+      patch:
+        input:
+          path: ../../../videos/SANPO/SANPOgt25min.mp4
+          stage: preprocessed
+          preprocessing_method: groundtruth
+        electrode_array.builtin: coords_400um
+    - label: coords_800um__canny__amp_120uA
+      patch:
+        electrode_array.builtin: coords_800um
+    - label: coords_1200um__canny__amp_120uA
+      patch:
+        electrode_array.builtin: coords_1200um
+  strategy.name: [checkerboard, pseudo_random]
+  strategy.options:
+    - label: groups_4
+      value: {groups: 4}
+    - label: groups_5
+      value: {groups: 5}

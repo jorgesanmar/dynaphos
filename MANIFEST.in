@@ -1,0 +1,6 @@
+include config/params.yaml
+include config/safety.yaml
+include config/coords_400um.yaml
+include config/coords_800um.yaml
+include config/coords_1200um.yaml
+include examples/cat.jpg

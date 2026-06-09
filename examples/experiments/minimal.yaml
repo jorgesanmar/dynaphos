@@ -1,0 +1,35 @@
+input:
+  builtin: cat
+  stage: original
+  preprocessing_method: dog
+
+electrode_array:
+  builtin: coords_800um
+
+protocol:
+  amplitude_uA: 60
+  appearance_threshold_uA: 30
+  pulse_width_us: 170
+  frequency_hz: 300
+  relative_stim_duration: 1.0
+  internal_circuit_power_mW: 0
+
+strategy:
+  name: checkerboard
+  options:
+    groups: 4
+
+simulation:
+  force_cpu: true
+  resolution: 128
+  max_frames: 1
+  preview_seconds: 0
+  phosphene_mode: safety_centers
+  cooldown_seconds: 30
+  enable_cem43: false
+
+output:
+  root: ../../results
+  run_id: minimal_example
+  overwrite: true
+  write_figures: true

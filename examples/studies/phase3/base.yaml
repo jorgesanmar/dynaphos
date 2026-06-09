@@ -1,0 +1,24 @@
+input:
+  path: ../../../videos/SANPO/SANPOcanny25min.mp4
+  stage: preprocessed
+  preprocessing_method: canny
+electrode_array:
+  builtin: coords_400um
+protocol:
+  amplitude_uA: 120
+  appearance_threshold_uA: 60
+  pulse_width_us: 170
+  frequency_hz: 300
+  internal_circuit_power_mW: 0
+strategy:
+  name: checkerboard
+  options:
+    groups: 4
+simulation:
+  phosphene_mode: safety_centers
+  preview_seconds: 0
+  cooldown_seconds: 300
+output:
+  root: ../../../results/safety/simulation_pipeline/raster_protocols
+  run_id: phase3
+  write_figures: false

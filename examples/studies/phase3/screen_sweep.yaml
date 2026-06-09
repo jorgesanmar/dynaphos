@@ -1,0 +1,10 @@
+experiment: base.yaml
+matrix:
+  strategy.name: [checkerboard, pseudo_random]
+  strategy.options:
+    - label: groups_3
+      value: {groups: 3}
+    - label: groups_4
+      value: {groups: 4}
+    - label: groups_5
+      value: {groups: 5}

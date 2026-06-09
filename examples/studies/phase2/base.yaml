@@ -1,0 +1,25 @@
+input:
+  path: ../../../videos/SANPO/SANPOcanny25min.mp4
+  stage: preprocessed
+  preprocessing_method: canny
+electrode_array:
+  builtin: coords_800um
+protocol:
+  amplitude_uA: 0
+  appearance_threshold_uA: 0
+  pulse_width_us: 170
+  frequency_hz: 300
+  internal_circuit_power_mW: 0
+strategy:
+  name: direct
+simulation:
+  phosphene_mode: safety_centers
+  preview_seconds: 0
+  cooldown_seconds: 300
+safety:
+  track_electrical: false
+  electrode_heat_enabled: false
+output:
+  root: ../../../results/safety/simulation_pipeline/ic_power
+  run_id: phase2_ic_only
+  write_figures: false

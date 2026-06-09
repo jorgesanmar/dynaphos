@@ -37,8 +37,10 @@ from dynaphos.utils import Map
 from dynaphos.pipeline import (
     build_comparison_frame,
     open_video_writer,
+    prepare_stimulus_frame,
     render_phosphene_frame_from_state,
 )
+from dynaphos.strategies.base import StrategyContext, StrategyInput
 
 
 ACADEMIC_COLORS = {
@@ -1626,6 +1628,8 @@ def save_mode_outputs(
         "window_charge_total_nC",
         "protocol_charge_per_electrode_nC",
         "power_per_electrode_W",
+        "pulse_width_per_electrode_s",
+        "pulse_frequency_per_electrode_hz",
         "active_electrode_count",
         "window_exceedance_time_start_s",
         "window_exceedance_time_end_s",
@@ -1747,7 +1751,10 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                  cooldown_baseline_tolerance_C: float = 1e-3,
                  appearance_threshold_uA: float | None = None,
                  track_electrical: bool = True,
-                 electrode_heat_enabled: bool = True):
+                 electrode_heat_enabled: bool = True,
+                 strategy=None,
+                 input_stage: str = "preprocessed",
+                 preprocessing_options: dict | None = None):
     _ = snapshot_interval_s  # Legacy CLI option kept for compatibility.
     if not mode_out_dirs:
         raise ValueError("run_one_mode requires at least one IC mode output directory.")
@@ -1911,6 +1918,10 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
     if not track_electrical:
         print("Electrical tracking disabled; saving thermal metrics only.")
     target_res = tuple(int(v) for v in simulation_params["run"]["resolution"])
+    input_stage = str(input_stage).strip().lower()
+    if input_stage not in {"original", "preprocessed"}:
+        raise ValueError("input_stage must be either 'original' or 'preprocessed'.")
+    preprocessing_options = dict(preprocessing_options or {})
     binarize_input = should_binarize_preprocessed_input(preprocessing_method)
     preview_max_frames = max(0, int(round(float(preview_seconds) * fps)))
     if phosphene_mode != "visual":
@@ -1930,6 +1941,8 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
     window_charge_per_electrode_nC = []
     window_charge_total_nC = []
     power_per_electrode_W = []
+    pulse_width_per_electrode_s = []
+    pulse_frequency_per_electrode_hz = []
     active_electrode_count = []
     raster_active_group = []
     raster_group_assignment_frame_indices = []
@@ -1962,6 +1975,18 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
         compact_to_reference_t,
         n_elec,
     ).detach().cpu().numpy().astype(np.float32)
+    strategy_rng = np.random.default_rng(int(simulation_params.get("run", {}).get("seed", 42)))
+    strategy_context = None
+    if strategy is not None:
+        strategy_context = StrategyContext(
+            electrode_ids=electrode_ids.copy(),
+            electrode_xy_mm=electrode_xy_mm.copy(),
+            default_pulse_width_s=pulse_width_s.copy(),
+            default_frequency_hz=pulse_frequency_hz.copy(),
+            fps=fps,
+            seed=int(simulation_params.get("run", {}).get("seed", 42)),
+        )
+        strategy.initialize(strategy_context)
     electrode_area_cm2 = float(simulation_params["safety"]["electrode_surface_area_cm2"])
     relative_stim_duration = float(simulation_params.get("default_stim", {}).get("relative_stim_duration", 1.0))
     configured_save_every = (
@@ -2193,16 +2218,77 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             frame_idx += 1
             thermal_frame_idx = frame_idx
 
-            gray = prepare_frame(frame, target_res)
-            if binarize_input:
-                gray = restore_binary_preprocessed_frame(gray)
+            if input_stage == "original":
+                _input_frame, gray = prepare_stimulus_frame(
+                    frame,
+                    input_stage="original",
+                    render_resolution_xy=target_res,
+                    preprocessing_method=preprocessing_method,
+                    dog_sigma_low=float(preprocessing_options.get("dog_sigma_low", 2.0)),
+                    dog_sigma_high=float(preprocessing_options.get("dog_sigma_high", 6.0)),
+                    canny_low=float(preprocessing_options.get("canny_low", 75.0)),
+                    canny_high=float(preprocessing_options.get("canny_high", 170.0)),
+                    use_cuda=bool(preprocessing_options.get("use_cuda", False)),
+                )
+            else:
+                gray = prepare_frame(frame, target_res)
+                if binarize_input:
+                    gray = restore_binary_preprocessed_frame(gray)
             stim_raw = sim.sample_stimulus(gray, rescale=True).reshape(-1).to(device)
 
             stim = apply_appearance_threshold(stim_raw, fixed_firing_threshold_a)
+            pulse_width_command = None
+            frequency_command = None
+            if strategy is not None:
+                baseline_compact = aggregate_metric_tensor(
+                    stim,
+                    inv_map_t,
+                    n_elec_surv,
+                ).to(dtype=torch.float32)
+                baseline_electrode = expand_metric_to_reference_tensor(
+                    baseline_compact,
+                    compact_to_reference_t,
+                    n_elec,
+                )
+                command = strategy.step(
+                    StrategyInput(
+                        time_s=float((frame_idx - 1) * dt),
+                        frame_index=int(frame_idx),
+                        stimulus_image=np.asarray(gray, dtype=np.float32) / 255.0,
+                        baseline_amplitude_A=baseline_electrode.detach().cpu().numpy(),
+                        electrode_ids=electrode_ids.copy(),
+                        electrode_xy_mm=electrode_xy_mm.copy(),
+                        rng=strategy_rng,
+                    )
+                ).validated(strategy_context)
+                amplitude_reference = torch.as_tensor(
+                    command.amplitude_A,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                pulse_width_reference = torch.as_tensor(
+                    command.pulse_width_s,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                frequency_reference = torch.as_tensor(
+                    command.frequency_hz,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                stim = amplitude_reference[compact_to_reference_t][inv_map_t]
+                pulse_width_command = pulse_width_reference[compact_to_reference_t][inv_map_t]
+                frequency_command = frequency_reference[compact_to_reference_t][inv_map_t]
 
             # The phosphene simulation is shared across IC modes, so delivered
             # current and raster state are updated only once per frame.
-            sim.update(stim, dt=dt, temperature_increase=None)
+            sim.update(
+                stim,
+                pulse_width=pulse_width_command,
+                frequency=frequency_command,
+                dt=dt,
+                temperature_increase=None,
+            )
             if track_electrical:
                 safety_tracker.update(
                     charge_per_s=sim.delivered_charge_per_second,
@@ -2252,6 +2338,26 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             )
             current_amplitude_elec = expand_metric_to_reference_tensor(
                 current_amplitude_compact,
+                compact_to_reference_t,
+                n_elec,
+            )
+            current_pulse_width_compact = aggregate_metric_tensor(
+                sim.current_pulse_width.reshape(-1),
+                inv_map_t,
+                n_elec_surv,
+            ).to(dtype=torch.float32)
+            current_frequency_compact = aggregate_metric_tensor(
+                sim.current_frequency.reshape(-1),
+                inv_map_t,
+                n_elec_surv,
+            ).to(dtype=torch.float32)
+            current_pulse_width_elec = expand_metric_to_reference_tensor(
+                current_pulse_width_compact,
+                compact_to_reference_t,
+                n_elec,
+            )
+            current_frequency_elec = expand_metric_to_reference_tensor(
+                current_frequency_compact,
                 compact_to_reference_t,
                 n_elec,
             )
@@ -2316,8 +2422,8 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 charge_rate_compact_nC_s = (
                     2.0
                     * current_amplitude_compact
-                    * pulse_width_s_compact_t
-                    * pulse_frequency_hz_compact_t
+                    * current_pulse_width_compact
+                    * current_frequency_compact
                     * relative_stim_duration
                     * 1e3
                 )
@@ -2402,6 +2508,8 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 window_charge_per_electrode_nC.append(tensor_row_to_numpy(q_window_elec))
                 window_charge_total_nC.append(tensor_scalar_to_float(total_window_charge_nC))
                 power_per_electrode_W.append(tensor_row_to_numpy(frame_power_elec))
+                pulse_width_per_electrode_s.append(tensor_row_to_numpy(current_pulse_width_elec))
+                pulse_frequency_per_electrode_hz.append(tensor_row_to_numpy(current_frequency_elec))
             time_s.append(current_time_s)
 
             if frame_idx == 1 or frame_idx % 10 == 0:
@@ -2553,6 +2661,14 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 ),
                 "power_per_electrode_W": np.asarray(
                     tensor_rows_to_numpy(power_per_electrode_W),
+                    dtype=np.float32,
+                ),
+                "pulse_width_per_electrode_s": np.asarray(
+                    tensor_rows_to_numpy(pulse_width_per_electrode_s),
+                    dtype=np.float32,
+                ),
+                "pulse_frequency_per_electrode_hz": np.asarray(
+                    tensor_rows_to_numpy(pulse_frequency_per_electrode_hz),
                     dtype=np.float32,
                 ),
                 "active_electrode_count": tensor_list_to_numpy(active_electrode_count),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -118,6 +119,12 @@ def case_output_dir(output_parent: Path, block: str, run_id: str) -> Path:
 
 
 def main() -> None:
+    warnings.warn(
+        "run_phase3_rastering.py is deprecated; use the sweep files under "
+        "examples/studies/phase3/.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     args = parse_args()
     if args.temperature_limit_C <= 0.0:
         raise ValueError("--temperature-limit-C must be > 0.")
