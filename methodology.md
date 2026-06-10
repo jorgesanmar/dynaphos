@@ -27,7 +27,7 @@ At a high level, each video frame passes through the following steps:
 6. `GaussianSimulator` updates the phosphene state, delivered charge, and
    impedance-based power.
 7. Per-phosphene safety values are aggregated back to physical electrodes.
-8. Electrical metrics and thermal metrics are written to `safety_metrics.npz`
+8. Electrical metrics and thermal metrics are written to `metrics.npz`
    for later plotting and comparison.
 
 ## Safety Simulation Pipeline Design
@@ -387,7 +387,7 @@ of everyday navigation or activity. The main experimental factors are:
 - internal-circuit heat assumptions, such as 0, 10, 50, or 100 mW.
 
 For each run, the simulator stores the electrical and thermal time series in
-`safety_metrics.npz`, alongside run metadata such as FPS, raster timing, pulse
+`metrics.npz`, alongside run metadata such as FPS, raster timing, pulse
 width, pulse frequency, electrode positions, impedance values, and final thermal
 maps. These outputs allow the safety contribution to be evaluated both as
 instantaneous per-frame constraints, such as charge per phase and Shannon K, and

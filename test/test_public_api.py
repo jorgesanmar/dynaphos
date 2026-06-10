@@ -64,14 +64,16 @@ def test_tiny_cpu_experiment_writes_public_output_contract(tmp_path: Path) -> No
     assert result.run_dir == tmp_path / "tiny"
     for name in (
         "manifest.yaml",
-        "run_manifest.yaml",
         "report.html",
         "report.json",
         "summary.csv",
         "metrics.npz",
     ):
         assert (result.run_dir / name).exists()
-    assert (result.run_dir / "safety_metrics.npz").exists()
+    assert not (result.run_dir / "run_manifest.yaml").exists()
+    assert not (result.run_dir / "safety_metrics.npz").exists()
+    assert not (result.run_dir / "summary.txt").exists()
     with np.load(result.metrics_path) as data:
+        assert int(data["save_every_n_frames"]) == 1
         assert np.isclose(np.max(data["pulse_width_per_electrode_s"]), 50e-6)
         assert np.isclose(np.max(data["pulse_frequency_per_electrode_hz"]), 20.0)

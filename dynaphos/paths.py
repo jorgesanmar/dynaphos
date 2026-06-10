@@ -25,15 +25,6 @@ def package_file(name: str) -> Path:
     if resource.is_file():
         with as_file(resource) as path:
             return Path(path).resolve()
-
-    # Source-tree compatibility while the historical config directory remains.
-    project_root = Path(__file__).resolve().parents[1]
-    if name == "fixture_cat":
-        source_fallback = project_root / "examples" / "cat.jpg"
-    else:
-        source_fallback = project_root / "config" / Path(relative).name
-    if source_fallback.exists():
-        return source_fallback.resolve()
     raise FileNotFoundError(f"Packaged DynaPhos resource is missing: {relative}")
 
 

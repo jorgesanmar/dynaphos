@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from dynaphos.simulator import _coordinate_based_raster_groups
+from dynaphos.simulation.simulator import _coordinate_based_raster_groups
 from dynaphos.strategies.base import StimulusCommand, StrategyContext, StrategyInput
 
 

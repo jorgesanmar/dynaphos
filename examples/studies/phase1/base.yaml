@@ -14,8 +14,10 @@ strategy:
   name: direct
 simulation:
   phosphene_mode: safety_centers
-  preview_seconds: 0
+  preview_seconds: 10
   cooldown_seconds: 300
+metadata:
+  experiment_block: amplitude_grid_preprocessing
 output:
   root: ../../../results/safety/simulation_pipeline/amplitude_grid_preprocessing
   run_id: phase1

@@ -1,0 +1,141 @@
+# run settings
+run:
+  resolution: [256,256] #[width,height] in pixels
+  view_angle: 2 #in degrees, horizontal view angle
+  origin: [0,0]
+  min_angle: 0.001 #in degrees, minimal eccentricity
+  fps: 15
+
+  gpu: 0 #if using cuda, enter gpu nr here (e.g. 0)
+  print_stats: False #print simulator values for sanity check
+  seed: 42
+  dtype: float32
+  use_gaussian_lut: False # Whether to approximate Gaussian activation with a
+                          # look-up table.
+  batch_size: 0  # Set to zero when simulator is not used for computational optimization
+
+# display specs to accurately diplay sizes in dva
+display:
+  screen_resolution: [2500,1600] #width & height in pixels
+  #screen_size: [294,166] #width & height in mm
+  screen_diagonal: 15.1 #inches
+  dist_to_screen: 600 # eyes to screen in mm
+
+# for sampling from images/video
+sampling:
+  sampling_method: receptive_fields #receptive_fields or center
+  RF_size: 0.5 # millimeters of cortical surface (when sampling receptive fields)
+  stimulus_scale: 0.6e-4 # Only used when the sample_stimulus method is called with 'rescale=True'. The default behaviour
+                       # is no scaling (i.e., the stim amplitude equals the intensity of the sampled image).
+
+# settings for electrode coords to visual field coords
+cortex_model:
+  model: dipole
+  k: 17.3
+  a: 0.75
+  b: 120
+  alpha: 0.95
+  dropout_rate: 0.0
+  noise_scale: 0.2
+
+# habituation and other temporal dynamics
+temporal_dynamics:
+  trace_increase_rate: 13.95528162 # how much the trace increases when there is input, per second
+  activation_decay_per_second: 0.00012340980408667956 # The decay of tissue activation per second
+  trace_decay_per_second: 0.99949191 # The decay of the memory trace, per second
+
+# current strength effect on size (Bosking et al., 2017),
+size:
+  size_equation: sqrt #which equation to use for current->size computations. sqrt or sigmoid
+  MD: 0.7  # predicted maximum diameter of activated cortex in mm
+  I_half: 40 # mu-A
+  slope_size: 0.08 # slope of size saturation curve in mm/mu-A
+  current_spread: 675.e-6 #A/mm2
+  radius_to_sigma: 0.5 #circle to gaussian factor, sigma = r/2
+
+# sigmoid on activation
+brightness_saturation:
+  cps_half: 1.057631326853325e-07 # calibrated on fig. 6A FernÃ¡ndez et al., (2021)
+  slope_brightness: 19152642.500946816 # calibrated on fig. 6A/B FernÃ¡ndez et al., (2021)
+
+# Stimulation threshold
+thresholding:
+  use_threshold: True
+  rheobase: 23.9e-6 # The minimal current (Ampere) for infinite stimulation duration. Is used as the constant leak current.
+  activation_threshold: 9.141886000943878e-08 # Threshold of tissue activation for the perception of phosphenes
+  activation_threshold_sd: 6.715877869833961e-08 # Standard deviation of the tissue activation threshold (for random initialization)
+
+# Pulse width (pw), frequency (freq) default values, in case they aren't specified in the input
+default_stim:
+  relative_stim_duration: 1 # range: [0-1]. stim_duration = rel_stim_dur * frame_duration
+  pw_default: 170.e-6 #Seconds
+  freq_default: 300 #Hertz
+
+# Gabor filters
+gabor:
+  gabor_filtering: False
+  gamma: 1.5
+
+#Safety measures
+safety:
+  enable_charge_guard: false
+  cumulative_charge_limit_uC:  10000  # total session budget per electrode (microC)
+  charge_warn_only: true               # true=warn; false=raise RuntimeError
+  charge_log_every: 60  # log every n frames
+  metrics_save_every_n_frames: 5  # persist heavy electrode-wise outputs every N frames
+  electrode_surface_area_cm2: 3.5e-5
+  charge_window_s: 5.0
+
+# Impedance settings for power calculation
+impedance:
+  Rtis: 9900.0
+  Cdl: 113.4e-9
+  Rct: 2.2e6
+  sigma_w: 2.5e6
+
+# Raster
+raster:
+    enabled: True
+    pattern: random
+    num_groups: 5
+    rate_hz: 4
+    reshuffle_interval_s: 5.0  # in seconds
+
+# Bioheat parameters for thermal effects
+bioheat:
+  model: 2d_pennes
+  domain_xy_mm: 60.0
+  brain_depth_mm: 15.0
+  skull_thickness_mm: 5.0
+  scalp_thickness_mm: 3.0
+  voxel_size_mm: 0.5
+  # Separate source depths keep electrode Joule heat local while letting IC heat
+  # represent package-scale 3D heat spreading in this 2D approximation.
+  electrode_source_thickness_mm: 0.08
+  ic_source_thickness_mm: 1.7
+  device_constant_power_mw: 0.0
+  driver_efficiency: 0.5
+  top_heat_transfer_W_m2_K: 5.0
+  T_b: 37.0
+
+  brain:
+    rho: 1041.0
+    c: 3640.0
+    k: 0.528
+    perfusion: 0.0097
+    q_met: 10383.0
+  skull:
+    rho: 1990.0
+    c: 1300.0
+    k: 0.650
+    perfusion: 0.00099
+    q_met: 26.0
+  scalp:
+    rho: 1100.0
+    c: 3150.0
+    k: 0.342
+    perfusion: 0.0022
+    q_met: 1100.0
+  blood:
+    rho: 1060.0
+    c: 3840.0

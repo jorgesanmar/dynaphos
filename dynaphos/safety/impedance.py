@@ -7,8 +7,8 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-from dynaphos.simulator import State
-from dynaphos.utils import print_stats
+from dynaphos.simulation.simulator import State
+from dynaphos.simulation.utils import print_stats
 
 
 class Impedance(State):

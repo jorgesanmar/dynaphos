@@ -1,5 +1,9 @@
 experiment: base.yaml
 matrix:
+  $role:
+    - label: additivity_validation
+      patch:
+        metadata.analysis_role: additivity_validation
   electrode_array.builtin: [coords_400um, coords_800um, coords_1200um]
   protocol:
     - label: amp_120uA__5mW

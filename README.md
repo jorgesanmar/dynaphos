@@ -33,18 +33,17 @@ The run writes:
 ```text
 results/minimal_example/
   manifest.yaml
+  metrics.npz
   report.html
   report.json
   summary.csv
-  metrics.npz
-  safety_metrics.npz
   figures/
 ```
 
 `report.html` is the main human-readable result. `report.json` and
 `summary.csv` provide machine-readable evaluations, while `metrics.npz`
-contains detailed arrays. `safety_metrics.npz` is retained for compatibility
-with existing analysis scripts.
+contains the canonical detailed arrays. Completed runs use only
+`manifest.yaml` and `metrics.npz` as their persisted analysis contract.
 
 Reports use the terms **within configured limits**, **configured limits
 exceeded**, and **incomplete evaluation**. They are research simulation
@@ -55,9 +54,14 @@ outputs, not clinical safety determinations.
 ```text
 dynaphos validate experiment.yaml
 dynaphos run experiment.yaml
-dynaphos sweep sweep.yaml
+dynaphos sweep sweep.yaml --resume
 dynaphos report results/my_run
 dynaphos strategies list
+dynaphos render image --input stimulus.png
+dynaphos render video --input stimulus.mp4
+dynaphos preprocess compare --input stimulus.mp4
+dynaphos electrodes plot
+dynaphos study phase1 results/safety/simulation_pipeline/amplitude_grid_preprocessing
 ```
 
 ## Python API
@@ -78,14 +82,17 @@ print(result.report.status)
 - [Understanding safety reports](docs/reports.md)
 - [Python API](docs/python-api.md)
 - [Reproducing the phase 1-3 studies](docs/studies.md)
+- [Package organization](docs/architecture.md)
+- [Migrating to 0.2.0](docs/migration-0.2.md)
 - [Scientific methodology and assumptions](methodology.md)
 
-## Existing Workflows
+## Repository Organization
 
-The phase-specific scripts under `tools/safety/` remain available for one
-compatibility release, but are deprecated in favor of the study definitions
-under `examples/studies/`. Existing numerical modules and raw NPZ outputs remain
-supported during this migration.
+Reusable code is organized by domain under `dynaphos/`: experiment execution,
+simulation, media, electrodes, safety evaluation, reporting, studies, and
+stimulation strategies. The `tools/` directory contains standalone research
+experiments that are not part of the supported Python API. Phase comparison
+workflows live in `dynaphos.studies`, not in `tools/`.
 
 ## Tests
 
@@ -93,11 +100,6 @@ supported during this migration.
 pytest
 ```
 
-## Citation
-
-van der Grinten, M. et al. (2024). *Towards biologically plausible phosphene
-simulation for the differentiable optimization of visual cortical prostheses*.
-eLife, 13, e85812. https://doi.org/10.7554/eLife.85812
 
 ## License
 

@@ -4,10 +4,10 @@ import time
 import cv2
 import numpy as np
 
-from dynaphos.image_processing import sobel_processor, canny_processor
-from dynaphos.simulator import GaussianSimulator
-from dynaphos.utils import load_params, load_coordinates_from_yaml, Map
-from dynaphos.cortex_models import \
+from dynaphos.media.preprocessing import canny_processor, sobel_processor
+from dynaphos.simulation import GaussianSimulator
+from dynaphos.simulation.utils import Map, load_coordinates_from_yaml, load_params
+from dynaphos.simulation.cortex import \
     get_visual_field_coordinates_from_cortex_full
 
 FILTER = 'canny'  # choose canny or sobel
@@ -18,7 +18,7 @@ def main(params: dict, in_video: int):
     coordinates_cortex = load_coordinates_from_yaml(
         '../config/grid_coords_dipole_valid.yaml', n_coordinates=100)
     coordinates_cortex = Map(*coordinates_cortex)
-    coordinates_visual_field = get_visual_field_coordinates_from_cortex_full(
+    coordinates_visual_field, _ = get_visual_field_coordinates_from_cortex_full(
         params['cortex_model'], coordinates_cortex)
     simulator = GaussianSimulator(params, coordinates_visual_field)
     resolution = params['run']['resolution']

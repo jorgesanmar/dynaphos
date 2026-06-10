@@ -1,10 +1,19 @@
 experiment: base.yaml
 matrix:
   strategy.name: [checkerboard, pseudo_random]
-  strategy.options:
+  $groups:
     - label: groups_3
-      value: {groups: 3}
+      patch:
+        strategy.options: {groups: 3}
+        metadata.expected_duty_fraction: 0.3333333333333333
+        metadata.expected_raster_cycle_rate_hz: 5.0
     - label: groups_4
-      value: {groups: 4}
+      patch:
+        strategy.options: {groups: 4}
+        metadata.expected_duty_fraction: 0.25
+        metadata.expected_raster_cycle_rate_hz: 3.75
     - label: groups_5
-      value: {groups: 5}
+      patch:
+        strategy.options: {groups: 5}
+        metadata.expected_duty_fraction: 0.2
+        metadata.expected_raster_cycle_rate_hz: 3.0

@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import tempfile
 import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +22,16 @@ from dynaphos.config import (
     set_config_value,
 )
 from dynaphos.experiment.results import ExperimentResult
+from dynaphos.experiment.manifest import (
+    SCHEMA_VERSION,
+    complete_manifest,
+    fail_manifest,
+    start_manifest,
+)
+from dynaphos.experiment.manifest import load_manifest as load_run_manifest
 from dynaphos.paths import package_file
 from dynaphos.reporting import write_report_bundle
-from dynaphos.safety import runner as legacy_runner
+from dynaphos.experiment import execution
 from dynaphos.strategies import load_strategy
 
 
@@ -78,13 +84,10 @@ def _prepare_run_directory(config: ExperimentConfig) -> Path:
         known_outputs = {
             "figures",
             "manifest.yaml",
-            "run_manifest.yaml",
             "metrics.npz",
-            "safety_metrics.npz",
             "report.html",
             "report.json",
             "summary.csv",
-            "summary.txt",
             "device_power_over_time.png",
             "thermal_response_over_time.png",
         }
@@ -196,10 +199,16 @@ def _manifest(
         if config.source_path is not None
         else Path.cwd()
     )
+    strategy_name = str(config.strategy.name or config.strategy.import_path or "custom")
+    normalized_raster_mode = {
+        "direct": "none",
+        "pseudo_random": "random",
+    }.get(strategy_name, strategy_name)
+    metadata = dict(config.metadata)
+    block = str(metadata.get("experiment_block", metadata.get("block", "")))
     return {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "run_id": config.output.run_id,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "dynaphos_version": _version(),
         "git_revision": _git_revision(source_root),
         "runtime_device": str(device),
@@ -218,8 +227,13 @@ def _manifest(
         "pulse_width_us": float(config.protocol.pulse_width_us),
         "frequency_hz": float(config.protocol.frequency_hz),
         "internal_circuit_power_mw": float(config.protocol.internal_circuit_power_mW),
-        "raster_mode": str(config.strategy.name or config.strategy.import_path),
-        "raster_mode_normalized": str(config.strategy.name or "custom"),
+        "raster_mode": strategy_name,
+        "raster_mode_normalized": normalized_raster_mode,
+        "raster_groups": int(config.strategy.options.get("groups", 1)),
+        "electrode_heat_enabled": bool(config.safety.electrode_heat_enabled),
+        "track_electrical": bool(config.safety.track_electrical),
+        "block": block,
+        "metadata": metadata,
         "strategy": {
             "name": config.strategy.name,
             "import_path": config.strategy.import_path,
@@ -229,12 +243,7 @@ def _manifest(
     }
 
 
-def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(manifest, handle, sort_keys=False)
-
-
-def _collect_legacy_figures(run_dir: Path) -> None:
+def _collect_figures(run_dir: Path) -> None:
     figures_dir = run_dir / "figures"
     figures_dir.mkdir(exist_ok=True)
     for path in run_dir.glob("*.png"):
@@ -258,7 +267,7 @@ def run_experiment(config: ExperimentConfig | str | Path) -> ExperimentResult:
     )
     params, params_path = _build_params(resolved, safety_path)
     strategy = load_strategy(resolved.strategy)
-    device = legacy_runner.configure_runtime_device(
+    device = execution.configure_runtime_device(
         params,
         force_cpu=bool(resolved.simulation.force_cpu),
     )
@@ -271,16 +280,14 @@ def run_experiment(config: ExperimentConfig | str | Path) -> ExperimentResult:
         input_path=input_path,
         device=device,
     )
-    manifest["status"] = "running"
     manifest_path = run_dir / "manifest.yaml"
-    _write_manifest(manifest_path, manifest)
-    _write_manifest(run_dir / "run_manifest.yaml", manifest)
+    start_manifest(manifest_path, manifest)
 
     try:
-        # Raster selection belongs to the strategy in the new API. The
-        # simulator's legacy raster path stays disabled to avoid two masks.
+        # Raster selection belongs to the strategy, so the simulator's
+        # internal raster mask stays disabled to avoid applying two masks.
         with _video_input(input_path, fps=float(params["run"]["fps"])) as simulation_input:
-            legacy_runner.run_one_mode(
+            execution.run_one_mode(
                 params=params,
                 coords_yaml=coords_path,
                 video_path=simulation_input,
@@ -294,7 +301,6 @@ def run_experiment(config: ExperimentConfig | str | Path) -> ExperimentResult:
                 max_frames=int(resolved.simulation.max_frames),
                 internal_circuit_power_mw=float(resolved.protocol.internal_circuit_power_mW),
                 preview_seconds=float(resolved.simulation.preview_seconds),
-                snapshot_interval_s=5.0,
                 save_every_n_frames=1,
                 enable_cem43=bool(resolved.simulation.enable_cem43),
                 device=device,
@@ -311,22 +317,18 @@ def run_experiment(config: ExperimentConfig | str | Path) -> ExperimentResult:
                 preprocessing_options=resolved.input.preprocessing_options,
             )
     except Exception as exc:
-        manifest.update(
-            {
-                "status": "failed",
-                "completed_at_utc": datetime.now(timezone.utc).isoformat(),
-                "error": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc(),
-            }
+        fail_manifest(
+            manifest_path,
+            manifest,
+            error=exc,
+            traceback_text=traceback.format_exc(),
         )
-        _write_manifest(manifest_path, manifest)
-        _write_manifest(run_dir / "run_manifest.yaml", manifest)
         raise
 
-    legacy_metrics = run_dir / "safety_metrics.npz"
     metrics_path = run_dir / "metrics.npz"
-    shutil.copy2(legacy_metrics, metrics_path)
-    _collect_legacy_figures(run_dir)
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"Experiment did not write canonical metrics: {metrics_path}")
+    _collect_figures(run_dir)
     report = write_report_bundle(
         run_dir,
         metrics_path=metrics_path,
@@ -334,15 +336,11 @@ def run_experiment(config: ExperimentConfig | str | Path) -> ExperimentResult:
         manifest=manifest,
         write_figures=bool(resolved.output.write_figures),
     )
-    manifest.update(
-        {
-            "status": "completed",
-            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "report_status": report.status,
-        }
+    complete_manifest(
+        manifest_path,
+        manifest,
+        report_status=report.status,
     )
-    _write_manifest(manifest_path, manifest)
-    _write_manifest(run_dir / "run_manifest.yaml", manifest)
     return ExperimentResult(
         run_dir=run_dir,
         manifest_path=manifest_path,
@@ -365,7 +363,22 @@ def _variant_run_id(base_run_id: str, variant: dict[str, Any], index: int) -> st
     return f"{base_run_id}__{index:03d}__{'__'.join(labels)}"
 
 
-def run_sweep(config: SweepConfig | str | Path) -> list[ExperimentResult]:
+def _completed_run(run_dir: Path) -> bool:
+    manifest_path = run_dir / "manifest.yaml"
+    metrics_path = run_dir / "metrics.npz"
+    if not manifest_path.exists() or not metrics_path.exists():
+        return False
+    try:
+        return load_run_manifest(manifest_path).get("status") == "completed"
+    except (OSError, TypeError, ValueError, yaml.YAMLError):
+        return False
+
+
+def run_sweep(
+    config: SweepConfig | str | Path,
+    *,
+    resume: bool = False,
+) -> list[ExperimentResult]:
     sweep = config if isinstance(config, SweepConfig) else load_sweep(config)
     source = Path(sweep.experiment).resolve()
     base_values = load_yaml(source)
@@ -393,6 +406,12 @@ def run_sweep(config: SweepConfig | str | Path) -> list[ExperimentResult]:
         if sweep.output_root is not None:
             output["root"] = str(sweep.output_root)
         experiment = ExperimentConfig.from_dict(values, path="experiment").resolve_paths(source)
+        run_dir = (experiment.output.root / experiment.output.run_id).resolve()
+        if resume and _completed_run(run_dir):
+            print(f"Skipping completed run: {run_dir}")
+            continue
+        if resume and run_dir.exists():
+            experiment.output.overwrite = True
         try:
             results.append(run_experiment(experiment))
         except Exception as exc:

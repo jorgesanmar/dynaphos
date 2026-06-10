@@ -1,4 +1,7 @@
 from dynaphos.media.inputs import resolve_input
-from dynaphos.media.preprocessing import prepare_stimulus_frame
+from dynaphos.media.preprocessing import image_preprocessing
 
-__all__ = ["prepare_stimulus_frame", "resolve_input"]
+__all__ = [
+    "image_preprocessing",
+    "resolve_input",
+]

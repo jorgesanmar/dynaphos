@@ -18,6 +18,12 @@ simulation:
   phosphene_mode: safety_centers
   preview_seconds: 0
   cooldown_seconds: 300
+metadata:
+  experiment_block: raster_protocols
+  analysis_role: worst_case_screen
+  matched_phase1_run_id: phase1__020__protocol-amp_120uA__builtin-coords_400um__input-canny
+  expected_duty_fraction: 0.25
+  expected_raster_cycle_rate_hz: 3.75
 output:
   root: ../../../results/safety/simulation_pipeline/raster_protocols
   run_id: phase3

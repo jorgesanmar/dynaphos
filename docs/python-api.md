@@ -31,14 +31,29 @@ validation.
 ```python
 from dynaphos import load_sweep, run_sweep
 
-results = run_sweep(load_sweep("sweep.yaml"))
+results = run_sweep(load_sweep("sweep.yaml"), resume=True)
+```
+
+## Read completed runs
+
+```python
+from dynaphos.experiment import discover_completed_runs, load_metrics
+
+for run in discover_completed_runs("results/my_study"):
+    metrics = load_metrics(run.metrics_path)
+    print(run.run_dir, metrics["time_s"].shape)
 ```
 
 ## Stable extension imports
 
+- `dynaphos.experiment`
 - `dynaphos.strategies`
 - `dynaphos.simulation`
-- `dynaphos.safety.electrical`
-- `dynaphos.safety.thermal`
-- `dynaphos.reporting`
 - `dynaphos.media`
+- `dynaphos.electrodes`
+- `dynaphos.safety`
+- `dynaphos.reporting`
+- `dynaphos.studies`
+
+The removed pre-0.2 root-module imports are listed in the
+[migration guide](migration-0.2.md).
