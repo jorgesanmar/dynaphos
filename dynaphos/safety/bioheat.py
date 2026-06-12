@@ -171,6 +171,10 @@ class Bioheat2D:
             device=self.device,
         )
         self.inv_rhoc = torch.tensor(1.0 / (rho * c), dtype=torch.float32, device=self.device)
+        # Cache the float32-rounded scalars so update() never syncs the device
+        # to recompute them. Equal to float(self.alpha.item()) by construction.
+        self.alpha_f = float(self.alpha.item())
+        self.beta_f = float(self.beta.item())
 
         self.device_constant_power_W = float(
             bh.get("device_constant_power_mw", bh.get("internal_circuit_power_mw", 13.0))
@@ -293,17 +297,15 @@ class Bioheat2D:
                 f"got {power.numel()} for {self.n_electrodes} electrodes."
             )
         power = torch.clamp(power, min=0.0)
-        self.last_electrode_power_W = float(power.sum().detach().cpu().item())
+        # Write-only diagnostics: keep on-device to avoid a per-call host sync.
+        self.last_electrode_power_W = power.sum()
         self.last_total_power_W = self.last_electrode_power_W + max(self.internal_circuit_power_W, 0.0)
 
-        power_density = torch.zeros_like(self.dT)
-        if torch.any(power > 0.0):
-            source_power = torch.zeros(self.H * self.W, dtype=torch.float32, device=self.device)
-            source_power.scatter_add_(0, self.electrode_flat_idx, power)
-            power_density = (
-                power_density
-                + source_power.reshape(self.H, self.W) / self.electrode_voxel_volume_m3
-            )
+        # Always scatter: with all-zero power this is a no-op that yields the
+        # same zero power_density, but avoids the per-frame torch.any host sync.
+        source_power = torch.zeros(self.H * self.W, dtype=torch.float32, device=self.device)
+        source_power.scatter_add_(0, self.electrode_flat_idx, power)
+        power_density = source_power.reshape(self.H, self.W) / self.electrode_voxel_volume_m3
 
         if self.internal_circuit_power_W > 0.0 and self.source_volume_m3 > 0.0:
             self.ic_power_density_W_m3 = self.internal_circuit_power_W / self.source_volume_m3
@@ -312,8 +314,8 @@ class Bioheat2D:
             self.ic_power_density_W_m3 = 0.0
 
         source_term = power_density * self.inv_rhoc
-        alpha = float(self.alpha.item())
-        beta = float(self.beta.item())
+        alpha = self.alpha_f
+        beta = self.beta_f
         dt_diffusion = (self.voxel_size_m ** 2) / (4.0 * alpha + 1e-30)
         dt_sub_max = 0.45 * dt_diffusion
         if beta > 0.0:

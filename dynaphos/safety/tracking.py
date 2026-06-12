@@ -312,37 +312,13 @@ class SafetyTracker:
             torch.log10(charge_density_uc_cm2[positive_mask])
         )
 
+        # Detect every violation on-device first, then pull all flags and the
+        # scalar sums across in a single host sync instead of one per check.
+        # The output tensors above are untouched; only the warning checks change.
         over_phase = charge_per_phase_nC > self.charge_per_phase_limit_nC
-        if torch.any(over_phase):
-            idx = torch.nonzero(over_phase, as_tuple=False).view(-1).tolist()
-            self._raise_or_warn(
-                f"[SafetyTracker] Charge/phase exceeded on electrodes {idx}; "
-                f"limit={self.charge_per_phase_limit_nC:.3f} nC."
-            )
-
         over_density = charge_density_uc_cm2 > self.charge_density_limit_uc_cm2
-        if torch.any(over_density):
-            idx = torch.nonzero(over_density, as_tuple=False).view(-1).tolist()
-            self._raise_or_warn(
-                f"[SafetyTracker] Charge density exceeded on electrodes {idx}; "
-                f"limit={self.charge_density_limit_uc_cm2:.3f} uC/cm^2."
-            )
-
         over_shannon = self.last_shannon_k > self.shannon_k_limit
-        if torch.any(over_shannon):
-            idx = torch.nonzero(over_shannon, as_tuple=False).view(-1).tolist()
-            self._raise_or_warn(
-                f"[SafetyTracker] Shannon k exceeded on electrodes {idx}; "
-                f"limit={self.shannon_k_limit:.3f}."
-            )
-
-        active_count = int((per_elec_charge_rate > 0).sum().item())
-        self.last_active_pct = 100.0 * active_count / max(self.num_electrodes, 1)
-        if self.last_active_pct > self.max_active_pct:
-            self._raise_or_warn(
-                f"[SafetyTracker] Active electrode percentage {self.last_active_pct:.2f}% "
-                f"exceeds limit {self.max_active_pct:.2f}%."
-            )
+        active_mask = per_elec_charge_rate > 0
 
         # Charge-per-phase is reported above as a single phase. Accumulated
         # charge tracks delivered absolute charge for biphasic pulses.
@@ -351,29 +327,77 @@ class SafetyTracker:
         self.protocol_charge_per_electrode_nC = self.protocol_charge_per_electrode_nC + delta_charge_nC
 
         over_window_per_elec = self.window_charge_per_electrode_nC > self.acc_limit_per_electrode_nC
-        if torch.any(over_window_per_elec):
+        over_protocol_per_elec = self.protocol_charge_per_electrode_nC > self.protocol_charge_limit_per_electrode_nC
+
+        (
+            any_phase,
+            any_density,
+            any_shannon,
+            active_count_f,
+            any_window,
+            total_window_nC,
+            any_protocol,
+            protocol_total_nC,
+        ) = torch.stack([
+            over_phase.any().float(),
+            over_density.any().float(),
+            over_shannon.any().float(),
+            active_mask.sum().float(),
+            over_window_per_elec.any().float(),
+            self.window_charge_per_electrode_nC.sum().float(),
+            over_protocol_per_elec.any().float(),
+            self.protocol_charge_per_electrode_nC.sum().float(),
+        ]).detach().cpu().tolist()
+        active_count = int(active_count_f)
+
+        if any_phase:
+            idx = torch.nonzero(over_phase, as_tuple=False).view(-1).tolist()
+            self._raise_or_warn(
+                f"[SafetyTracker] Charge/phase exceeded on electrodes {idx}; "
+                f"limit={self.charge_per_phase_limit_nC:.3f} nC."
+            )
+
+        if any_density:
+            idx = torch.nonzero(over_density, as_tuple=False).view(-1).tolist()
+            self._raise_or_warn(
+                f"[SafetyTracker] Charge density exceeded on electrodes {idx}; "
+                f"limit={self.charge_density_limit_uc_cm2:.3f} uC/cm^2."
+            )
+
+        if any_shannon:
+            idx = torch.nonzero(over_shannon, as_tuple=False).view(-1).tolist()
+            self._raise_or_warn(
+                f"[SafetyTracker] Shannon k exceeded on electrodes {idx}; "
+                f"limit={self.shannon_k_limit:.3f}."
+            )
+
+        self.last_active_pct = 100.0 * active_count / max(self.num_electrodes, 1)
+        if self.last_active_pct > self.max_active_pct:
+            self._raise_or_warn(
+                f"[SafetyTracker] Active electrode percentage {self.last_active_pct:.2f}% "
+                f"exceeds limit {self.max_active_pct:.2f}%."
+            )
+
+        if any_window:
             idx = torch.nonzero(over_window_per_elec, as_tuple=False).view(-1).tolist()
             self._raise_or_warn(
                 f"[SafetyTracker] {self.charge_window_s:.2f}s accumulated charge per electrode exceeded on electrodes {idx}; "
                 f"limit={self.acc_limit_per_electrode_nC:.3f} nC."
             )
 
-        total_window_nC = float(self.window_charge_per_electrode_nC.sum().item())
         if total_window_nC > self.acc_limit_total_nC:
             self._raise_or_warn(
                 f"[SafetyTracker] {self.charge_window_s:.2f}s total accumulated charge exceeded; "
                 f"total={total_window_nC:.3f} nC, limit={self.acc_limit_total_nC:.3f} nC."
             )
 
-        over_protocol_per_elec = self.protocol_charge_per_electrode_nC > self.protocol_charge_limit_per_electrode_nC
-        if torch.any(over_protocol_per_elec):
+        if any_protocol:
             idx = torch.nonzero(over_protocol_per_elec, as_tuple=False).view(-1).tolist()
             self._raise_or_warn(
                 f"[SafetyTracker] Protocol cumulative charge exceeded on electrodes {idx}; "
                 f"limit={self.protocol_charge_limit_per_electrode_nC:.3f} nC."
             )
 
-        protocol_total_nC = float(self.protocol_charge_per_electrode_nC.sum().item())
         if protocol_total_nC > self.protocol_charge_limit_total_nC:
             self._raise_or_warn(
                 f"[SafetyTracker] Protocol total accumulated charge exceeded; "

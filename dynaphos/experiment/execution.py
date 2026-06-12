@@ -1208,6 +1208,51 @@ def aggregate_metric_tensor(metric: torch.Tensor, inv_map_t: torch.Tensor, n_ele
     return out
 
 
+def aggregate_metric_batch(
+    metrics: list[torch.Tensor],
+    inv_map_t: torch.Tensor,
+    n_elec: int,
+) -> torch.Tensor:
+    """Aggregate K per-phosphene metrics into compact electrodes at once.
+
+    Equivalent to stacking ``aggregate_metric_tensor`` over ``metrics`` but uses
+    a single batched ``scatter_add_`` instead of K separate ones. Returns a
+    ``[K, n_elec]`` float32 tensor; row order matches the input list.
+    """
+    device = inv_map_t.device
+    src = torch.stack(
+        [m.reshape(-1).to(device=device, dtype=torch.float32) for m in metrics],
+        dim=0,
+    )
+    out = torch.zeros((src.shape[0], int(n_elec)), dtype=torch.float32, device=device)
+    out.scatter_add_(1, inv_map_t.reshape(1, -1).expand(src.shape[0], -1), src)
+    return out
+
+
+def expand_metric_batch(
+    compact: torch.Tensor,
+    compact_to_reference_t: torch.Tensor,
+    reference_count: int,
+    *,
+    fill_value: float = 0.0,
+) -> torch.Tensor:
+    """Expand a ``[K, n_compact]`` stack to ``[K, reference_count]`` at once.
+
+    Batched counterpart of ``expand_metric_to_reference_tensor`` (one
+    ``scatter_`` instead of K).
+    """
+    compact = compact.to(compact_to_reference_t.device)
+    k = int(compact.shape[0])
+    out = torch.full(
+        (k, int(reference_count)),
+        float(fill_value),
+        dtype=compact.dtype,
+        device=compact.device,
+    )
+    out.scatter_(1, compact_to_reference_t.reshape(1, -1).expand(k, -1), compact)
+    return out
+
+
 def raster_groups_to_electrodes(
     sim: GaussianSimulator,
     inv_map_t: torch.Tensor,
@@ -2102,15 +2147,26 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             for grid_name, grid_state in state["grid_heat_states"].items():
                 dT_map = grid_state["prev_dT_map"]
                 grid_max_value = dT_map.max()
-                ic_mask = grid_state["bio"].ic_footprint_mask.to(device=dT_map.device, dtype=torch.bool)
-                if torch.any(ic_mask):
+                # The IC footprint mask is constant; cache it and the mean weight
+                # once instead of re-deriving (and syncing) them every frame.
+                ic_mask = grid_state.get("_ic_mask_bool")
+                if ic_mask is None:
+                    ic_mask = grid_state["bio"].ic_footprint_mask.to(device=dT_map.device, dtype=torch.bool)
+                    has_ic = bool(torch.any(ic_mask).item())
+                    grid_state["_ic_mask_bool"] = ic_mask
+                    grid_state["_ic_has"] = has_ic
+                    grid_state["_ic_weight"] = (
+                        int(torch.count_nonzero(ic_mask).item()) if has_ic else int(dT_map.numel())
+                    )
+                if grid_state["_ic_has"]:
                     grid_mean_value = dT_map[ic_mask].mean()
-                    grid_mean_weight = int(torch.count_nonzero(ic_mask).item())
                 else:
                     grid_mean_value = dT_map.mean()
-                    grid_mean_weight = int(dT_map.numel())
-                state["grid_max_dT"][grid_name].append(tensor_scalar_to_float(grid_max_value))
-                state["grid_mean_dT"][grid_name].append(tensor_scalar_to_float(grid_mean_value))
+                grid_mean_weight = grid_state["_ic_weight"]
+                # Append on-device 0-d tensors; tensor_list_to_numpy does one
+                # host transfer per series after the loop instead of per frame.
+                state["grid_max_dT"][grid_name].append(grid_max_value)
+                state["grid_mean_dT"][grid_name].append(grid_mean_value)
 
                 grid_max_dT.append(grid_max_value)
                 if enable_cem43:
@@ -2126,11 +2182,11 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             if not grid_max_dT:
                 raise RuntimeError("No bioheat grids were configured for the current mode.")
 
-            state["max_dT"].append(tensor_scalar_to_float(torch.stack(grid_max_dT).max()))
-            state["mean_dT"].append(tensor_scalar_to_float(weighted_mean_sum / max(weighted_mean_count, 1)))
-            state["area_gt1_mm2"].append(tensor_scalar_to_float(area_gt1_total))
-            state["area_gt2_mm2"].append(tensor_scalar_to_float(area_gt2_total))
-            state["area_gt3_mm2"].append(tensor_scalar_to_float(area_gt3_total))
+            state["max_dT"].append(torch.stack(grid_max_dT).max())
+            state["mean_dT"].append(weighted_mean_sum / max(weighted_mean_count, 1))
+            state["area_gt1_mm2"].append(area_gt1_total)
+            state["area_gt2_mm2"].append(area_gt2_total)
+            state["area_gt3_mm2"].append(area_gt3_total)
             if enable_cem43:
                 state["max_cem43"].append(tensor_scalar_to_float(torch.stack(grid_max_cem43).max()))
                 state["p99_cem43"].append(
@@ -2189,35 +2245,98 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
     frame_idx = 0
     thermal_frame_idx = 0
 
+    # Optional per-segment benchmarking, enabled with DYNAPHOS_PROF=1. Adds a
+    # CUDA sync at each checkpoint so GPU stage times reflect real compute, not
+    # async kernel-launch time. Zero overhead when disabled.
+    import os as _os, time as _time
+    _prof_on = bool(_os.environ.get("DYNAPHOS_PROF"))
+    _prof_cuda = _prof_on and torch.device(device).type == "cuda"
+    _PROF: dict[str, float] = {}
+    _PROF_N = {"stim": 0, "cooldown": 0}
+    _ts = [0.0]
+
+    def _psync():
+        if _prof_cuda:
+            torch.cuda.synchronize()
+
+    def _ckpt_start():
+        if _prof_on:
+            _psync()
+            _ts[0] = _time.perf_counter()
+
+    def _ckpt(key: str):
+        if _prof_on:
+            _psync()
+            now = _time.perf_counter()
+            _PROF[key] = _PROF.get(key, 0.0) + (now - _ts[0])
+            _ts[0] = now
+
+    # 1C: decode + preprocess run on a producer thread so CPU frame I/O and the
+    # DoG/Canny filtering overlap GPU compute. Frames are delivered strictly in
+    # order through a bounded queue, so the per-frame `gray` consumed by the main
+    # loop is identical to serial decoding.
+    import queue as _queue_mod, threading as _threading
+    _frame_queue: "_queue_mod.Queue" = _queue_mod.Queue(maxsize=4)
+    _decode_stop = _threading.Event()
+    _SENTINEL = None
+
+    def _decode_worker():
+        produced = 0
+        try:
+            while not _decode_stop.is_set():
+                if max_frames > 0 and produced >= int(max_frames):
+                    break
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                produced += 1
+                if input_stage == "original":
+                    _input_frame, gray = prepare_stimulus_frame(
+                        frame,
+                        input_stage="original",
+                        render_resolution_xy=target_res,
+                        preprocessing_method=preprocessing_method,
+                        dog_sigma_low=float(preprocessing_options.get("dog_sigma_low", 2.0)),
+                        dog_sigma_high=float(preprocessing_options.get("dog_sigma_high", 6.0)),
+                        canny_low=float(preprocessing_options.get("canny_low", 75.0)),
+                        canny_high=float(preprocessing_options.get("canny_high", 170.0)),
+                        use_cuda=bool(preprocessing_options.get("use_cuda", False)),
+                    )
+                else:
+                    gray = prepare_frame(frame, target_res)
+                    if binarize_input:
+                        gray = restore_binary_preprocessed_frame(gray)
+                while not _decode_stop.is_set():
+                    try:
+                        _frame_queue.put(gray, timeout=0.25)
+                        break
+                    except _queue_mod.Full:
+                        continue
+        finally:
+            try:
+                _frame_queue.put(_SENTINEL, timeout=0.5)
+            except Exception:
+                pass
+
+    _decoder_thread = _threading.Thread(target=_decode_worker, name="dynaphos-decode", daemon=True)
+    _decoder_thread.start()
+
+    _loop_wall0 = _time.perf_counter()
+
     try:
         while True:
-            if max_frames > 0 and frame_idx >= int(max_frames):
-                break
-
-            ok, frame = cap.read()
-            if not ok:
+            _q_wait0 = _time.perf_counter()
+            gray = _frame_queue.get()
+            if gray is _SENTINEL:
                 break
 
             frame_idx += 1
             thermal_frame_idx = frame_idx
-
-            if input_stage == "original":
-                _input_frame, gray = prepare_stimulus_frame(
-                    frame,
-                    input_stage="original",
-                    render_resolution_xy=target_res,
-                    preprocessing_method=preprocessing_method,
-                    dog_sigma_low=float(preprocessing_options.get("dog_sigma_low", 2.0)),
-                    dog_sigma_high=float(preprocessing_options.get("dog_sigma_high", 6.0)),
-                    canny_low=float(preprocessing_options.get("canny_low", 75.0)),
-                    canny_high=float(preprocessing_options.get("canny_high", 170.0)),
-                    use_cuda=bool(preprocessing_options.get("use_cuda", False)),
-                )
-            else:
-                gray = prepare_frame(frame, target_res)
-                if binarize_input:
-                    gray = restore_binary_preprocessed_frame(gray)
+            _PROF_N["stim"] += 1
+            if _prof_on:
+                _ts[0] = _q_wait0
             stim_raw = sim.sample_stimulus(gray, rescale=True).reshape(-1).to(device)
+            _ckpt("decode+preprocess(DoG)")
 
             stim = apply_appearance_threshold(stim_raw, fixed_firing_threshold_a)
             pulse_width_command = None
@@ -2263,6 +2382,7 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 pulse_width_command = pulse_width_reference[compact_to_reference_t][inv_map_t]
                 frequency_command = frequency_reference[compact_to_reference_t][inv_map_t]
 
+            _ckpt("strategy.step")
             # The phosphene simulation is shared across IC modes, so delivered
             # current and raster state are updated only once per frame.
             sim.update(
@@ -2311,39 +2431,7 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                     state["preview_comparison_writer"].write(comparison_u8)
 
             current_time_s = frame_idx * dt
-
-            current_amplitude_compact = aggregate_metric_tensor(
-                (sim.delivered_amplitude * 1e6).reshape(-1),
-                inv_map_t,
-                n_elec_surv,
-            ).to(
-                dtype=torch.float32
-            )
-            current_amplitude_elec = expand_metric_to_reference_tensor(
-                current_amplitude_compact,
-                compact_to_reference_t,
-                n_elec,
-            )
-            current_pulse_width_compact = aggregate_metric_tensor(
-                sim.current_pulse_width.reshape(-1),
-                inv_map_t,
-                n_elec_surv,
-            ).to(dtype=torch.float32)
-            current_frequency_compact = aggregate_metric_tensor(
-                sim.current_frequency.reshape(-1),
-                inv_map_t,
-                n_elec_surv,
-            ).to(dtype=torch.float32)
-            current_pulse_width_elec = expand_metric_to_reference_tensor(
-                current_pulse_width_compact,
-                compact_to_reference_t,
-                n_elec,
-            )
-            current_frequency_elec = expand_metric_to_reference_tensor(
-                current_frequency_compact,
-                compact_to_reference_t,
-                n_elec,
-            )
+            _ckpt("phosphene_sim+electrical_safety")
 
             # Per-electrode load power is the Bioheat2D electrode heat input.
             _instant_power, frame_power = compute_frame_power(
@@ -2354,54 +2442,47 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 relative_stim_duration,
             )
             fp_phos = frame_power.reshape(-1).to(device)
-            frame_power_compact = aggregate_metric_tensor(fp_phos, inv_map_t, n_elec_surv).to(dtype=torch.float32)
-            frame_power_elec = expand_metric_to_reference_tensor(
-                frame_power_compact,
-                compact_to_reference_t,
-                n_elec,
+
+            # Fused bookkeeping: aggregate the always-on per-phosphene metrics to
+            # compact electrodes and expand to the reference array using one
+            # batched scatter per direction instead of a pair per metric.
+            base_compact = aggregate_metric_batch(
+                [
+                    (sim.delivered_amplitude * 1e6).reshape(-1),
+                    sim.current_pulse_width.reshape(-1),
+                    sim.current_frequency.reshape(-1),
+                    fp_phos,
+                ],
+                inv_map_t,
+                n_elec_surv,
             )
+            base_elec = expand_metric_batch(base_compact, compact_to_reference_t, n_elec)
+            (
+                current_amplitude_compact,
+                current_pulse_width_compact,
+                current_frequency_compact,
+                frame_power_compact,
+            ) = base_compact
+            (
+                current_amplitude_elec,
+                current_pulse_width_elec,
+                current_frequency_elec,
+                frame_power_elec,
+            ) = base_elec
             if not electrode_heat_enabled:
                 frame_power_elec = torch.zeros_like(frame_power_elec)
             if track_electrical:
                 # SafetyTracker stores per-phosphene values; aggregate them
                 # back to physical electrodes for the general safety pipeline.
-                q_phase_compact = aggregate_metric_tensor(
-                    safety_tracker.last_charge_per_phase_nC,
+                q_compact = aggregate_metric_batch(
+                    [
+                        safety_tracker.last_charge_per_phase_nC,
+                        safety_tracker.window_charge_per_electrode_nC,
+                        safety_tracker.protocol_charge_per_electrode_nC,
+                    ],
                     inv_map_t,
                     n_elec_surv,
-                ).to(dtype=torch.float32)
-                q_window_compact = aggregate_metric_tensor(
-                    safety_tracker.window_charge_per_electrode_nC,
-                    inv_map_t,
-                    n_elec_surv,
-                ).to(dtype=torch.float32)
-                q_protocol_compact = aggregate_metric_tensor(
-                    safety_tracker.protocol_charge_per_electrode_nC,
-                    inv_map_t,
-                    n_elec_surv,
-                ).to(dtype=torch.float32)
-                q_phase_elec = expand_metric_to_reference_tensor(
-                    q_phase_compact,
-                    compact_to_reference_t,
-                    n_elec,
                 )
-                q_window_elec = expand_metric_to_reference_tensor(
-                    q_window_compact,
-                    compact_to_reference_t,
-                    n_elec,
-                )
-                q_protocol_elec = expand_metric_to_reference_tensor(
-                    q_protocol_compact,
-                    compact_to_reference_t,
-                    n_elec,
-                )
-                final_protocol_charge_per_electrode_nC = q_protocol_elec
-
-                charge_density_elec = q_phase_elec / 1e3 / electrode_area_cm2
-                shannon_elec = torch.full_like(charge_density_elec, -torch.inf)
-                valid = (q_phase_elec > 0) & (charge_density_elec > 0)
-                shannon_elec[valid] = torch.log10(q_phase_elec[valid] / 1e3) + torch.log10(charge_density_elec[valid])
-
                 charge_rate_compact_nC_s = (
                     2.0
                     * current_amplitude_compact
@@ -2410,11 +2491,19 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                     * relative_stim_duration
                     * 1e3
                 )
-                charge_rate_elec_nC_s = expand_metric_to_reference_tensor(
-                    charge_rate_compact_nC_s,
+                q_elec = expand_metric_batch(
+                    torch.cat([q_compact, charge_rate_compact_nC_s.reshape(1, -1)], dim=0),
                     compact_to_reference_t,
                     n_elec,
                 )
+                q_phase_elec, q_window_elec, q_protocol_elec, charge_rate_elec_nC_s = q_elec
+                final_protocol_charge_per_electrode_nC = q_protocol_elec
+
+                charge_density_elec = q_phase_elec / 1e3 / electrode_area_cm2
+                shannon_elec = torch.full_like(charge_density_elec, -torch.inf)
+                valid = (q_phase_elec > 0) & (charge_density_elec > 0)
+                shannon_elec[valid] = torch.log10(q_phase_elec[valid] / 1e3) + torch.log10(charge_density_elec[valid])
+
                 active_count_frame = torch.count_nonzero(current_amplitude_elec > 0.0).to(dtype=torch.float32)
                 active_electrode_count.append(tensor_scalar_to_float(active_count_frame))
 
@@ -2435,29 +2524,38 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 state["electrode_load_power_W"].append(state_electrode_load_power_W)
                 state["device_power_time_s"].append(float(current_time_s))
 
+            _ckpt("metric_bookkeeping")
             update_bioheat_from_electrode_power(frame_power_elec, dt)
+            _ckpt("bioheat(thermal)")
 
             if track_electrical:
                 total_window_charge_nC = q_window_elec.sum()
+                total_window_charge_value = float(total_window_charge_nC.detach().cpu().item())
                 window_start_s = max(0.0, current_time_s - float(safety_tracker.charge_window_s))
+                end_time_value = float(current_time_s)
+                limit_per_electrode = float(safety_tracker.acc_limit_per_electrode_nC)
                 over_window = torch.nonzero(
-                    q_window_elec > float(safety_tracker.acc_limit_per_electrode_nC),
+                    q_window_elec > limit_per_electrode,
                     as_tuple=False,
                 ).reshape(-1)
-                for idx_t in over_window.detach().cpu().tolist():
-                    idx = int(idx_t)
+                # Pull all over-limit indices and their charges in two transfers
+                # instead of one host sync per electrode.
+                over_window_idx = over_window.detach().cpu().tolist()
+                if over_window_idx:
+                    over_window_charge = q_window_elec[over_window].detach().cpu().tolist()
+                    for idx, charge in zip(over_window_idx, over_window_charge):
+                        window_exceedance_time_start_s.append(window_start_s)
+                        window_exceedance_time_end_s.append(end_time_value)
+                        window_exceedance_scope.append("electrode")
+                        window_exceedance_electrode_id.append(int(electrode_ids[idx]) if idx < len(electrode_ids) else idx)
+                        window_exceedance_charge_nC.append(float(charge))
+                        window_exceedance_limit_nC.append(limit_per_electrode)
+                if total_window_charge_value > float(safety_tracker.acc_limit_total_nC):
                     window_exceedance_time_start_s.append(window_start_s)
-                    window_exceedance_time_end_s.append(float(current_time_s))
-                    window_exceedance_scope.append("electrode")
-                    window_exceedance_electrode_id.append(int(electrode_ids[idx]) if idx < len(electrode_ids) else idx)
-                    window_exceedance_charge_nC.append(float(q_window_elec[idx].detach().cpu().item()))
-                    window_exceedance_limit_nC.append(float(safety_tracker.acc_limit_per_electrode_nC))
-                if float(total_window_charge_nC.detach().cpu().item()) > float(safety_tracker.acc_limit_total_nC):
-                    window_exceedance_time_start_s.append(window_start_s)
-                    window_exceedance_time_end_s.append(float(current_time_s))
+                    window_exceedance_time_end_s.append(end_time_value)
                     window_exceedance_scope.append("total")
                     window_exceedance_electrode_id.append(-1)
-                    window_exceedance_charge_nC.append(float(total_window_charge_nC.detach().cpu().item()))
+                    window_exceedance_charge_nC.append(total_window_charge_value)
                     window_exceedance_limit_nC.append(float(safety_tracker.acc_limit_total_nC))
 
                 raster_active_group.append(int(sim.current_raster_group) if sim.raster_enabled else -1)
@@ -2479,8 +2577,10 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                     raster_group_assignments.append(tensor_row_to_numpy(raster_assignment, dtype=np.int32))
                     last_raster_assignment_version = raster_assignment_version
 
+            _ckpt("window/raster_logging")
             snapshot_entry = heatmap_snapshot_lookup.get(frame_idx)
             record_thermal_metrics_and_snapshots(snapshot_entry, current_time_s)
+            _ckpt("record_thermal_metrics")
 
             if track_electrical:
                 amplitude_per_electrode_uA.append(tensor_row_to_numpy(current_amplitude_elec))
@@ -2489,11 +2589,12 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 shannon_k_per_electrode.append(tensor_row_to_numpy(shannon_elec))
                 charge_per_second_per_electrode_nC_s.append(tensor_row_to_numpy(charge_rate_elec_nC_s))
                 window_charge_per_electrode_nC.append(tensor_row_to_numpy(q_window_elec))
-                window_charge_total_nC.append(tensor_scalar_to_float(total_window_charge_nC))
+                window_charge_total_nC.append(total_window_charge_value)
                 power_per_electrode_W.append(tensor_row_to_numpy(frame_power_elec))
                 pulse_width_per_electrode_s.append(tensor_row_to_numpy(current_pulse_width_elec))
                 pulse_frequency_per_electrode_hz.append(tensor_row_to_numpy(current_frequency_elec))
             time_s.append(current_time_s)
+            _ckpt("append/to_numpy")
 
             if frame_idx == 1 or frame_idx % 10 == 0:
                 elapsed_s = max(time.perf_counter() - progress_started_at, 1e-9)
@@ -2510,6 +2611,11 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                         f"{raster_label}: frame {frame_idx} | elapsed {elapsed_s:7.1f}s | "
                         f"{frame_rate:5.2f} frames/s"
                     )
+
+        if _prof_on:
+            _psync()
+            _PROF["__stim_loop_wall"] = _time.perf_counter() - _loop_wall0
+        _cooldown_wall0 = _time.perf_counter()
 
         if cooldown_max_frames > 0:
             cooldown_start_frame = thermal_frame_idx
@@ -2562,6 +2668,15 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             if cooldown_stop_reason == "not_started":
                 cooldown_stop_reason = "time_limit"
     finally:
+        # Stop the decode worker and drain the queue so a blocked put() unblocks,
+        # then join before releasing the capture it owns.
+        _decode_stop.set()
+        try:
+            while True:
+                _frame_queue.get_nowait()
+        except _queue_mod.Empty:
+            pass
+        _decoder_thread.join(timeout=5.0)
         cap.release()
         for state in mode_states.values():
             if state["preview_phosphene_writer"] is not None:
@@ -2574,6 +2689,11 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
 
     if frame_idx == 0:
         raise RuntimeError("No frames were read from the input video.")
+
+    if _prof_on:
+        _PROF["cooldown(thermal-only)"] = _time.perf_counter() - _cooldown_wall0
+        _PROF_N["cooldown"] = int(cooldown_thermal_frames)
+    _serialize_wall0 = _time.perf_counter()
 
     common_metrics = {
         "time_s": np.asarray(time_s, dtype=np.float32),
@@ -2766,6 +2886,38 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             internal_circuit_power_mw=state["internal_circuit_power_mw"],
             electrode_heat_enabled=electrode_heat_enabled,
         )
+
+    if _prof_on:
+        _PROF["serialize+write_metrics"] = _time.perf_counter() - _serialize_wall0
+        n_stim = max(_PROF_N["stim"], 1)
+        n_cool = max(_PROF_N["cooldown"], 1)
+        per_frame_keys = [
+            "decode+preprocess(DoG)", "strategy.step",
+            "phosphene_sim+electrical_safety", "metric_bookkeeping",
+            "bioheat(thermal)", "window/raster_logging",
+            "record_thermal_metrics", "append/to_numpy",
+        ]
+        stim_wall = _PROF.get("__stim_loop_wall", 0.0)
+        cool_wall = _PROF.get("cooldown(thermal-only)", 0.0)
+        ser_wall = _PROF.get("serialize+write_metrics", 0.0)
+        print("\n" + "=" * 72)
+        print(f"[DYNAPHOS_PROF] per-segment timing  "
+              f"(stim frames={_PROF_N['stim']}, cooldown frames={_PROF_N['cooldown']})")
+        print("=" * 72)
+        print(f"{'-- STIMULATION LOOP (per-frame stages) --':45s} "
+              f"{'ms/frame':>10} {'total s':>10}")
+        for key in per_frame_keys:
+            secs = _PROF.get(key, 0.0)
+            print(f"  {key:43s} {secs/n_stim*1e3:10.3f} {secs:10.2f}")
+        print(f"  {'(stim loop wall total)':43s} {stim_wall/n_stim*1e3:10.3f} {stim_wall:10.2f}")
+        print("-" * 72)
+        print(f"  {'COOLDOWN (thermal-only, ' + str(_PROF_N['cooldown']) + ' frames)':43s} "
+              f"{cool_wall/n_cool*1e3:10.3f} {cool_wall:10.2f}")
+        print(f"  {'SERIALIZE + write metrics.npz':43s} {'':>10} {ser_wall:10.2f}")
+        print("=" * 72)
+        print(f"  {'run_one_mode total (stim+cooldown+serialize)':43s} "
+              f"{'':>10} {stim_wall + cool_wall + ser_wall:10.2f}")
+        print("=" * 72)
     return
 
 
