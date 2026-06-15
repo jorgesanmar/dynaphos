@@ -1,0 +1,50 @@
+experiment: base.yaml
+matrix:
+  $condition:
+    - label: coords_400um__canny__amp_60uA
+      patch:
+        electrode_array.builtin: coords_400um
+        metadata.analysis_role: transfer_panel
+        metadata.matched_phase1_run_id: phase1__011__protocol-amp_60uA__builtin-coords_400um__input-canny
+        protocol:
+          amplitude_uA: 60
+          appearance_threshold_uA: 30
+          pulse_width_us: 170
+          frequency_hz: 300
+          relative_stim_duration: 1.0
+          internal_circuit_power_mW: 0
+    - label: coords_400um__dog__amp_120uA
+      patch:
+        input:
+          path: ../../../videos/SANPO/SANPOdog25min.mp4
+          stage: preprocessed
+          preprocessing_method: dog
+        electrode_array.builtin: coords_400um
+        metadata.analysis_role: transfer_panel
+        metadata.matched_phase1_run_id: phase1__019__protocol-amp_120uA__builtin-coords_400um__input-dog
+    - label: coords_400um__gt__amp_120uA
+      patch:
+        input:
+          path: ../../../videos/SANPO/SANPOgt25min.mp4
+          stage: preprocessed
+          preprocessing_method: groundtruth
+        electrode_array.builtin: coords_400um
+        metadata.analysis_role: transfer_panel
+        metadata.matched_phase1_run_id: phase1__021__protocol-amp_120uA__builtin-coords_400um__input-groundtruth
+    - label: coords_800um__canny__amp_120uA
+      patch:
+        electrode_array.builtin: coords_800um
+        metadata.analysis_role: transfer_panel
+        metadata.matched_phase1_run_id: phase1__023__protocol-amp_120uA__builtin-coords_800um__input-canny
+    - label: coords_1200um__canny__amp_120uA
+      patch:
+        electrode_array.builtin: coords_1200um
+        metadata.analysis_role: transfer_panel
+        metadata.matched_phase1_run_id: phase1__026__protocol-amp_120uA__builtin-coords_1200um__input-canny
+  strategy.name: [checkerboard, pseudo_random]
+  $groups:
+    - label: groups_3
+      patch:
+        strategy.options: {groups: 3}
+        metadata.expected_duty_fraction: 0.3333333333333333
+        metadata.expected_raster_cycle_rate_hz: 5.0

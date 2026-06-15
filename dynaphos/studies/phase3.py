@@ -19,6 +19,8 @@ from dynaphos.studies.common import resolve_path as resolve_repo_path
 from dynaphos.studies.phase1 import (
     contrasting_cell_text_color,
     normalize_preprocessing_label,
+    peak_value_and_time,
+    write_peak_temperature_heatmaps,
 )
 
 
@@ -36,6 +38,18 @@ RASTER_MODE_LABELS = {
     "random": "Pseudo-random",
 }
 RASTER_GROUP_MARKERS = {3: "^", 4: "s", 5: "p"}
+RASTER_GROUP_COLORS = {
+    "checkerboard": {
+        3: "#9ECAE1",
+        4: "#4292C6",
+        5: "#08519C",
+    },
+    "random": {
+        3: "#A1D99B",
+        4: "#41AB5D",
+        5: "#006D2C",
+    },
+}
 PHASE3_COMPARATIVE_PLOT_STEMS = {
     "charge_temperature_tradeoff",
     "duty_fraction_comparison",
@@ -44,7 +58,8 @@ PHASE3_COMPARATIVE_PLOT_STEMS = {
     "raster_effect_budget_table",
     "total_protocol_charge_reduction_fraction",
     "worst_case_group_trends",
-    "worst_case_temperature_evolution",
+    "worst_case_focal_temperature_evolution",
+    "worst_case_mean_temperature_evolution",
 }
 PLOT_SUFFIXES = {".png", ".pdf", ".svg"}
 
@@ -75,7 +90,9 @@ class SafetyRun:
     max_window_charge_total_nC: float
     max_window_charge_per_electrode_nC: float
     peak_mean_dT_C: float
+    peak_mean_time_s: float
     peak_focal_dT_C: float
+    peak_focal_time_s: float
     peak_active_fraction: float
     observed_cycle_rate_hz: float
 
@@ -99,6 +116,10 @@ def load_manifest(path: Path) -> dict:
 
 def path_identity(value: str | Path) -> str:
     return str(value).replace("\\", "/").strip().casefold()
+
+
+def coordinate_identity(value: str | Path) -> str:
+    return Path(str(value)).stem.removeprefix("coords_").casefold()
 
 
 def load_safety_run(npz_path: Path, manifest: dict) -> SafetyRun:
@@ -136,6 +157,16 @@ def load_safety_run(npz_path: Path, manifest: dict) -> SafetyRun:
             if "raster_rate_hz" in data.files
             else 0.0
         )
+        raster_mode = str(manifest.get("raster_mode_normalized", manifest.get("raster_mode", "none")))
+        raster_groups = int(manifest.get("raster_groups", 1) or 1)
+        if raster_mode != "none" and observed_cycle_rate <= 0.0 and "time_s" in data.files:
+            frame_times = np.asarray(data["time_s"], dtype=np.float64).reshape(-1)
+            positive_steps = np.diff(frame_times)
+            positive_steps = positive_steps[np.isfinite(positive_steps) & (positive_steps > 0.0)]
+            if positive_steps.size:
+                observed_cycle_rate = 1.0 / (float(np.median(positive_steps)) * raster_groups)
+        peak_mean_dT_C, peak_mean_time_s, _ = peak_value_and_time(data, "mean_dT")
+        peak_focal_dT_C, peak_focal_time_s, _ = peak_value_and_time(data, "max_dT")
         return SafetyRun(
             npz_path=npz_path,
             manifest_path=npz_path.parent / "manifest.yaml",
@@ -151,8 +182,8 @@ def load_safety_run(npz_path: Path, manifest: dict) -> SafetyRun:
             frequency_hz=float(manifest.get("frequency_hz", math.nan)),
             pulse_width_us=float(manifest.get("pulse_width_us", math.nan)),
             internal_circuit_power_mw=float(manifest.get("internal_circuit_power_mw", math.nan)),
-            raster_mode=str(manifest.get("raster_mode_normalized", manifest.get("raster_mode", "none"))),
-            raster_groups=int(manifest.get("raster_groups", 1) or 1),
+            raster_mode=raster_mode,
+            raster_groups=raster_groups,
             duration_s=duration_s,
             video_end_s=video_end_s,
             analysis_role=str(metadata.get("analysis_role", "")),
@@ -168,8 +199,10 @@ def load_safety_run(npz_path: Path, manifest: dict) -> SafetyRun:
                 if "window_charge_per_electrode_nC" in data.files
                 else []
             ),
-            peak_mean_dT_C=finite_max(data["mean_dT"] if "mean_dT" in data.files else []),
-            peak_focal_dT_C=finite_max(data["max_dT"] if "max_dT" in data.files else []),
+            peak_mean_dT_C=peak_mean_dT_C,
+            peak_mean_time_s=peak_mean_time_s,
+            peak_focal_dT_C=peak_focal_dT_C,
+            peak_focal_time_s=peak_focal_time_s,
             peak_active_fraction=peak_active / electrode_count,
             observed_cycle_rate_hz=observed_cycle_rate,
         )
@@ -207,7 +240,7 @@ def baseline_mismatch_reasons(raster: SafetyRun, baseline: SafetyRun) -> list[st
     reasons: list[str] = []
     comparisons = (
         ("video", path_identity(raster.video), path_identity(baseline.video)),
-        ("coords_yaml", path_identity(raster.coords_yaml), path_identity(baseline.coords_yaml)),
+        ("coords_yaml", coordinate_identity(raster.coords_yaml), coordinate_identity(baseline.coords_yaml)),
         ("preprocessing", raster.preprocessing, baseline.preprocessing),
         ("amplitude_uA", raster.amplitude_uA, baseline.amplitude_uA),
         ("appearance_threshold_uA", raster.appearance_threshold_uA, baseline.appearance_threshold_uA),
@@ -265,6 +298,14 @@ def build_raster_effect_rows(
             "expected_cycle_rate_hz": raster.expected_cycle_rate_hz,
             "observed_cycle_rate_hz": raster.observed_cycle_rate_hz,
             "peak_active_fraction": raster.peak_active_fraction,
+            "raster_peak_mean_time_s": raster.peak_mean_time_s,
+            "raster_peak_focal_time_s": raster.peak_focal_time_s,
+            "baseline_peak_mean_time_s": (
+                baseline.peak_mean_time_s if baseline is not None else math.nan
+            ),
+            "baseline_peak_focal_time_s": (
+                baseline.peak_focal_time_s if baseline is not None else math.nan
+            ),
             "baseline_match_valid": valid,
             "status": "valid" if valid else "baseline_mismatch",
             "mismatch_fields": ";".join(reasons),
@@ -317,10 +358,12 @@ def remove_obsolete_phase3_plots(output_root: str | Path) -> list[Path]:
     root = resolve_repo_path(output_root)
     if not root.exists():
         return []
+    peak_heatmap_root = root / "peak_temperature_heatmaps"
     removed: list[Path] = []
     for path in root.rglob("*"):
         if (
             path.is_file()
+            and peak_heatmap_root not in path.parents
             and path.suffix.casefold() in PLOT_SUFFIXES
             and path.stem.casefold() not in PHASE3_COMPARATIVE_PLOT_STEMS
         ):
@@ -363,6 +406,48 @@ def raster_legend_handles(*, include_baseline: bool = False) -> list[Line2D]:
         )
         for groups in (3, 4, 5)
     )
+    return handles
+
+
+def raster_protocol_color(mode: str, groups: int) -> str:
+    return RASTER_GROUP_COLORS.get(str(mode), {}).get(
+        int(groups),
+        RASTER_MODE_COLORS.get(str(mode), "#6B7280"),
+    )
+
+
+def raster_protocol_legend_handles(
+    runs: Iterable[SafetyRun],
+    *,
+    include_baseline: bool = False,
+) -> list[Line2D]:
+    handles: list[Line2D] = []
+    if include_baseline:
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=RASTER_MODE_COLORS["none"],
+                linewidth=2.2,
+                label=RASTER_MODE_LABELS["none"],
+            )
+        )
+    protocols = sorted(
+        {(run.raster_mode, int(run.raster_groups)) for run in runs},
+        key=lambda item: (item[0], item[1]),
+    )
+    for mode, groups in protocols:
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=raster_protocol_color(mode, groups),
+                marker=RASTER_GROUP_MARKERS.get(groups, "o"),
+                linewidth=1.8,
+                markersize=6,
+                label=f"{RASTER_MODE_LABELS.get(mode, mode)}: {groups} groups",
+            )
+        )
     return handles
 
 
@@ -508,11 +593,16 @@ def save_figure(fig: plt.Figure, path: Path, *, overwrite: bool) -> Path:
     return path
 
 
-def load_mean_temperature_series(run: SafetyRun, *, max_points: int = 1800) -> tuple[np.ndarray, np.ndarray]:
+def load_temperature_series(
+    run: SafetyRun,
+    key: str,
+    *,
+    max_points: int = 1800,
+) -> tuple[np.ndarray, np.ndarray]:
     with np.load(run.npz_path, allow_pickle=True) as data:
-        if "mean_dT" not in data.files:
+        if key not in data.files:
             return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
-        temperature = np.asarray(data["mean_dT"], dtype=np.float64).reshape(-1)
+        temperature = np.asarray(data[key], dtype=np.float64).reshape(-1)
         time_s = np.arange(temperature.size, dtype=np.float64)
         for key in ("thermal_time_s", "time_s"):
             if key not in data.files:
@@ -536,6 +626,9 @@ def plot_worst_case_temperature_evolution(
     phase1_runs: dict[str, SafetyRun],
     path: Path,
     *,
+    series_key: str = "mean_dT",
+    title: str = "Worst-case mean temperature evolution at 0 mW IC power",
+    ylabel: str = "Spatial mean temperature rise (C)",
     overwrite: bool,
 ) -> Path:
     screen = sorted(
@@ -558,7 +651,7 @@ def plot_worst_case_temperature_evolution(
         raise RuntimeError(f"Missing worst-case phase 1 baseline: {baseline_id}")
 
     fig, ax = plt.subplots(figsize=(9.2, 5.5))
-    baseline_time, baseline_temperature = load_mean_temperature_series(baseline)
+    baseline_time, baseline_temperature = load_temperature_series(baseline, series_key)
     ax.plot(
         baseline_time,
         baseline_temperature,
@@ -567,12 +660,12 @@ def plot_worst_case_temperature_evolution(
         zorder=4,
     )
     for run in screen:
-        time_min, temperature = load_mean_temperature_series(run)
+        time_min, temperature = load_temperature_series(run, series_key)
         ax.plot(
             time_min,
             temperature,
-            color=RASTER_MODE_COLORS[run.raster_mode],
-            marker=RASTER_GROUP_MARKERS[run.raster_groups],
+            color=raster_protocol_color(run.raster_mode, run.raster_groups),
+            marker=RASTER_GROUP_MARKERS.get(run.raster_groups, "o"),
             markevery=max(1, time_min.size // 18),
             markersize=5.0,
             linewidth=1.45,
@@ -586,20 +679,20 @@ def plot_worst_case_temperature_evolution(
             alpha=0.85,
         )
     ax.set_xlabel("Time (min)")
-    ax.set_ylabel("Spatial mean temperature rise (C)")
-    ax.set_title("Worst-case mean temperature evolution at 0 mW IC power")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
     ax.grid(alpha=0.25)
     ax.legend(
         handles=[
-            *raster_legend_handles(include_baseline=True),
+            *raster_protocol_legend_handles(screen, include_baseline=True),
             Line2D([0], [0], color="#4B5563", linestyle="--", label="Video end"),
         ],
         frameon=False,
-        ncol=2,
+        ncol=3,
         loc="upper center",
         bbox_to_anchor=(0.5, -0.17),
     )
-    fig.subplots_adjust(bottom=0.27)
+    fig.subplots_adjust(bottom=0.32)
     return save_figure(fig, path, overwrite=overwrite)
 
 
@@ -612,6 +705,15 @@ def condition_order(rows: list[dict[str, object]]) -> list[str]:
     return list(dict.fromkeys(str(row["matched_phase1_run_id"]) for row in rows))
 
 
+def condition_display_label(row: dict[str, object]) -> str:
+    preprocessing = {
+        "dog": "DoG",
+        "canny": "Canny",
+        "gt": "Hand segmented",
+    }.get(str(row["preprocessing"]), str(row["preprocessing"]))
+    return f"{row['grid']} | {preprocessing} | {float(row['amplitude_uA']):g} uA"
+
+
 def plot_reduction_heatmaps(
     rows: list[dict[str, object]],
     output_root: Path,
@@ -620,6 +722,10 @@ def plot_reduction_heatmaps(
     overwrite: bool,
 ) -> list[Path]:
     conditions = condition_order(rows)
+    condition_labels = {
+        str(row["matched_phase1_run_id"]): condition_display_label(row)
+        for row in rows
+    }
     protocols = sorted({protocol_label(row) for row in rows}, key=lambda value: (int(value.split("-")[1]), value))
     paths: list[Path] = []
     for metric, title in (
@@ -649,8 +755,22 @@ def plot_reduction_heatmaps(
                         ),
                         fontsize=8,
                     )
+                else:
+                    ax.text(
+                        x,
+                        y,
+                        "not run",
+                        ha="center",
+                        va="center",
+                        color="#6B7280",
+                        fontsize=7,
+                    )
         ax.set_xticks(range(len(protocols)), protocols, fontsize=10)
-        ax.set_yticks(range(len(conditions)), conditions, fontsize=10)
+        ax.set_yticks(
+            range(len(conditions)),
+            [condition_labels[condition] for condition in conditions],
+            fontsize=9,
+        )
         ax.set_title(title)
         fig.colorbar(image, ax=ax, label="Reduction Fraction")
         paths.append(save_figure(fig, output_root / f"{metric}.{image_format}", overwrite=overwrite))
@@ -676,8 +796,15 @@ def plot_duty_comparison(rows: list[dict[str, object]], path: Path, *, overwrite
     ax.set_ylabel("Observed Total-Charge Ratio")
     handles = raster_legend_handles()
     handles.append(Line2D([0], [0], color="#555555", linestyle="--", label="Ideal"))
-    ax.legend(handles=handles, frameon=False, ncol=2)
+    ax.legend(
+        handles=handles,
+        frameon=False,
+        ncol=3,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+    )
     ax.grid(alpha=0.25)
+    fig.subplots_adjust(bottom=0.28)
     return save_figure(fig, path, overwrite=overwrite)
 
 
@@ -746,7 +873,14 @@ def plot_charge_temperature_tradeoff(rows: list[dict[str, object]], path: Path, 
     ax.set_xlabel("Total-charge ratio vs matched raster-off case")
     ax.set_ylabel("Peak mean-temperature ratio vs matched raster-off case")
     ax.grid(alpha=0.25)
-    ax.legend(handles=raster_legend_handles(), frameon=False, ncol=2)
+    ax.legend(
+        handles=raster_legend_handles(),
+        frameon=False,
+        ncol=3,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+    )
+    fig.subplots_adjust(bottom=0.28)
     return save_figure(fig, path, overwrite=overwrite)
 
 
@@ -835,7 +969,29 @@ def write_raster_effect_outputs(
         plot_worst_case_temperature_evolution(
             raster_runs,
             phase1_runs,
-            out_dir / f"worst_case_temperature_evolution.{image_format}",
+            out_dir / f"worst_case_mean_temperature_evolution.{image_format}",
+            series_key="mean_dT",
+            title="Worst-case mean temperature evolution at 0 mW IC power",
+            ylabel="Spatial mean temperature rise (C)",
+            overwrite=overwrite,
+        )
+    )
+    written.append(
+        plot_worst_case_temperature_evolution(
+            raster_runs,
+            phase1_runs,
+            out_dir / f"worst_case_focal_temperature_evolution.{image_format}",
+            series_key="max_dT",
+            title="Worst-case max focal temperature evolution at 0 mW IC power",
+            ylabel="Max focal temperature rise (C)",
+            overwrite=overwrite,
+        )
+    )
+    written.extend(
+        write_peak_temperature_heatmaps(
+            raster_runs,
+            out_dir,
+            image_format=image_format,
             overwrite=overwrite,
         )
     )

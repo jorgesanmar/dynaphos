@@ -21,4 +21,5 @@ metadata:
 output:
   root: ../../../results/safety/simulation_pipeline/amplitude_grid_preprocessing
   run_id: phase1
-  write_figures: false
+  write_figures: true
+  overwrite: true

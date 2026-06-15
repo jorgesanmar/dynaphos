@@ -23,7 +23,9 @@ from dynaphos.studies.phase1 import (
     contrasting_cell_text_color,
     display_preprocessing_label,
     normalize_preprocessing_label,
+    peak_value_and_time,
     video_end_time_minutes,
+    write_peak_temperature_heatmaps,
 )
 
 
@@ -51,7 +53,9 @@ class IcPowerRecord:
     electrode_heat_enabled: bool
     reported_total_power_mw: float
     max_focal_dT_C: float
+    max_focal_time_s: float
     max_mean_dT_C: float
+    max_mean_time_s: float
 
 
 @dataclass(frozen=True)
@@ -166,8 +170,8 @@ def discover_ic_power_records(
         if not np.isfinite(power):
             continue
         with np.load(npz_path, allow_pickle=True) as data:
-            max_focal = finite_max(np.asarray(data["max_dT"])) if "max_dT" in data.files else math.nan
-            max_mean = finite_max(np.asarray(data["mean_dT"])) if "mean_dT" in data.files else math.nan
+            max_focal, max_focal_time_s, _ = peak_value_and_time(data, "max_dT")
+            max_mean, max_mean_time_s, _ = peak_value_and_time(data, "mean_dT")
             total_power = (
                 float(np.asarray(data["internal_circuit_power_total_mW"]).reshape(-1)[0])
                 if "internal_circuit_power_total_mW" in data.files
@@ -189,7 +193,9 @@ def discover_ic_power_records(
                 electrode_heat_enabled=bool(manifest.get("electrode_heat_enabled", True)),
                 reported_total_power_mw=total_power,
                 max_focal_dT_C=max_focal,
+                max_focal_time_s=max_focal_time_s,
                 max_mean_dT_C=max_mean,
+                max_mean_time_s=max_mean_time_s,
             )
         )
     return sorted(records, key=record_sort_key)
@@ -267,7 +273,9 @@ def write_temperature_summary_csv(records: list[IcPowerRecord], output_root: str
                 "configured_power_per_ic_mw",
                 "reported_bilateral_total_power_mw",
                 "max_focal_dT_C",
+                "max_focal_time_s",
                 "max_mean_dT_C",
+                "max_mean_time_s",
                 "npz_path",
             ],
         )
@@ -285,7 +293,9 @@ def write_temperature_summary_csv(records: list[IcPowerRecord], output_root: str
                     "configured_power_per_ic_mw": record.ic_power_mw,
                     "reported_bilateral_total_power_mw": record.reported_total_power_mw,
                     "max_focal_dT_C": record.max_focal_dT_C,
+                    "max_focal_time_s": record.max_focal_time_s,
                     "max_mean_dT_C": record.max_mean_dT_C,
+                    "max_mean_time_s": record.max_mean_time_s,
                     "npz_path": str(record.npz_path),
                 }
             )
@@ -367,8 +377,20 @@ def plot_temperature_evolution_by_preprocessing(
             ax.set_xlabel("Time (min)")
             add_limit_line(ax, limits.get("temperature_increase_C", math.nan))
             style_axes(ax)
-            if ax.get_legend_handles_labels()[0]:
-                ax.legend(title="IC power", frameon=False, fontsize=8, title_fontsize=8)
+        handles, labels = axes[1].get_legend_handles_labels()
+        if handles:
+            fig.legend(
+                handles,
+                labels,
+                title="IC power",
+                frameon=False,
+                fontsize=8,
+                title_fontsize=8,
+                ncol=min(7, len(handles)),
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.01),
+            )
+            fig.subplots_adjust(bottom=0.22)
         fig.suptitle(
             f"Temperature evolution - {grid}, {display_preprocessing_label(preprocessing)}, {amplitude_uA:g} uA"
         )
@@ -647,8 +669,20 @@ def plot_joule_heating_offsets(
         for ax in axes:
             ax.set_xlabel("Time (min)")
             style_axes(ax)
-            if ax.get_legend_handles_labels()[0]:
-                ax.legend(title="IC power", frameon=False, fontsize=8, title_fontsize=8)
+        handles, labels = axes[1].get_legend_handles_labels()
+        if handles:
+            fig.legend(
+                handles,
+                labels,
+                title="IC power",
+                frameon=False,
+                fontsize=8,
+                title_fontsize=8,
+                ncol=min(7, len(handles)),
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.01),
+            )
+            fig.subplots_adjust(bottom=0.22)
         fig.suptitle(
             f"Electrode Joule-heating offset - {grid}, "
             f"{display_preprocessing_label(preprocessing)}, {amplitude_uA:g} uA"
@@ -975,26 +1009,122 @@ def plot_phase1_budget(
     overwrite: bool,
 ) -> Path:
     out_dir = resolve_repo_path(output_root)
+
+    def grid_sort_value(value: object) -> tuple[float, str]:
+        label = str(value)
+        digits = "".join(character for character in label if character.isdigit() or character == ".")
+        try:
+            return float(digits), label
+        except ValueError:
+            return math.inf, label
+
+    def preprocessing_sort_value(value: object) -> tuple[int, str]:
+        normalized = normalize_preprocessing_label(value)
+        try:
+            return PREPROCESSING_ORDER.index(normalized), normalized
+        except ValueError:
+            return len(PREPROCESSING_ORDER), normalized
+
     ordered = sorted(
         rows,
         key=lambda row: (
-            not np.isfinite(float(row["recommended_max_ic_power_mW"])),
-            float(row["recommended_max_ic_power_mW"])
-            if np.isfinite(float(row["recommended_max_ic_power_mW"]))
-            else math.inf,
+            grid_sort_value(row["grid"]),
+            float(row["amplitude_uA"]),
+            preprocessing_sort_value(row["preprocessing"]),
         ),
     )
     values = np.asarray([float(row["recommended_max_ic_power_mW"]) for row in ordered], dtype=np.float64)
-    labels = [str(row["run_id"]) for row in ordered]
-    fig, ax = plt.subplots(figsize=(10.0, max(4.5, 0.28 * len(rows) + 1.8)))
-    y = np.arange(len(rows))
-    ax.barh(y, np.nan_to_num(values, nan=0.0), color="#1F4E79")
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=7)
-    ax.invert_yaxis()
-    ax.set_xlabel("Recommended Maximum IC Power per IC / Hemisphere (mW)")
+    x = np.arange(len(ordered), dtype=np.float64)
+    preprocessing_colors = {
+        preprocessing: plt.get_cmap("tab10")(index)
+        for index, preprocessing in enumerate(PREPROCESSING_ORDER)
+    }
+    colors = [
+        preprocessing_colors.get(
+            normalize_preprocessing_label(row["preprocessing"]),
+            "#6B7280",
+        )
+        for row in ordered
+    ]
+
+    fig, ax = plt.subplots(figsize=(max(11.0, 0.48 * len(rows) + 3.0), 6.4))
+    valid = np.isfinite(values)
+    ax.bar(x[valid], values[valid], color=np.asarray(colors, dtype=object)[valid].tolist(), width=0.78)
+    if np.any(~valid):
+        ax.scatter(x[~valid], np.zeros(np.count_nonzero(~valid)), marker="x", color="#6B7280", zorder=4)
+    ax.set_xticks(x)
+    short_preprocessing_labels = {
+        "dog": "DoG",
+        "canny": "Canny",
+        "gt": "Hand\nseg.",
+    }
+    ax.set_xticklabels(
+        [
+            short_preprocessing_labels.get(
+                normalize_preprocessing_label(row["preprocessing"]),
+                display_preprocessing_label(row["preprocessing"]),
+            )
+            for row in ordered
+        ],
+        fontsize=7,
+    )
+    ax.set_ylabel("Recommended Maximum IC Power per IC / Hemisphere (mW)")
     ax.set_title("Phase 1 mean-temperature IC power budget (10% derating)")
+
+    amplitude_groups: list[tuple[int, int, str]] = []
+    grid_groups: list[tuple[int, int, str]] = []
+    start = 0
+    while start < len(ordered):
+        grid = str(ordered[start]["grid"])
+        amplitude = float(ordered[start]["amplitude_uA"])
+        end = start + 1
+        while (
+            end < len(ordered)
+            and str(ordered[end]["grid"]) == grid
+            and np.isclose(float(ordered[end]["amplitude_uA"]), amplitude)
+        ):
+            end += 1
+        amplitude_groups.append((start, end, f"{amplitude:g} µA"))
+        start = end
+    start = 0
+    while start < len(ordered):
+        grid = str(ordered[start]["grid"])
+        end = start + 1
+        while end < len(ordered) and str(ordered[end]["grid"]) == grid:
+            end += 1
+        grid_groups.append((start, end, grid))
+        start = end
+
+    for start, end, label in amplitude_groups:
+        center = 0.5 * (start + end - 1)
+        ax.text(
+            center,
+            -0.12,
+            label,
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=9,
+        )
+        if end < len(ordered):
+            ax.axvline(end - 0.5, color="#D7DBE0", linewidth=0.8)
+    for start, end, label in grid_groups:
+        center = 0.5 * (start + end - 1)
+        ax.text(
+            center,
+            -0.22,
+            label,
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=10,
+            fontweight="bold",
+        )
+        if end < len(ordered):
+            ax.axvline(end - 0.5, color="#6B7280", linewidth=1.4)
+
     style_axes(ax)
+    fig.subplots_adjust(bottom=0.28, left=0.08, right=0.98, top=0.90)
     path = out_dir / f"phase1_ic_power_budget.{image_format}"
     save_figure(fig, path, overwrite=overwrite)
     return path
@@ -1133,6 +1263,14 @@ def write_ic_power_temperature_visuals(
             image_format=image_format,
             overwrite=overwrite,
             safety_yaml=safety_yaml,
+        )
+    )
+    written.extend(
+        write_peak_temperature_heatmaps(
+            records,
+            out_dir,
+            image_format=image_format,
+            overwrite=overwrite,
         )
     )
     written.append(

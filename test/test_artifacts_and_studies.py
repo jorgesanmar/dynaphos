@@ -9,11 +9,18 @@ import yaml
 from dynaphos.experiment.artifacts import discover_completed_runs, open_run
 from dynaphos.experiment.manifest import load_manifest
 from dynaphos.experiment.metrics import load_metrics
-from dynaphos.studies.phase1 import discover_records, run_phase1_analysis
+from dynaphos.studies.phase1 import (
+    discover_records,
+    hemisphere_grid_sort_key,
+    mean_metric_series,
+    run_phase1_analysis,
+)
 from dynaphos.studies.phase2 import discover_ic_power_records, run_phase2_analysis
 from dynaphos.studies.phase3 import (
+    coordinate_identity,
     discover_phase1_runs,
     discover_raster_runs,
+    raster_protocol_color,
     run_phase3_analysis,
 )
 
@@ -81,6 +88,26 @@ def write_run(
             "cooldown_start_s": np.asarray(1.0),
         }
         metrics.update(metrics_overrides or {})
+        thermal_time = np.asarray(metrics["thermal_time_s"], dtype=np.float32).reshape(-1)
+        focal_series = np.asarray(metrics["max_dT"], dtype=np.float32).reshape(-1)
+        mean_series = np.asarray(metrics["mean_dT"], dtype=np.float32).reshape(-1)
+        focal_index = int(np.nanargmax(focal_series))
+        mean_index = int(np.nanargmax(mean_series))
+        focal_map = np.full((2, 2), 0.5 * focal_series[focal_index], dtype=np.float32)
+        focal_map[1, 1] = focal_series[focal_index]
+        mean_map = np.full((2, 2), mean_series[mean_index], dtype=np.float32)
+        metrics.update(
+            {
+                "peak_heatmap_grid_names": np.asarray(["800um"]),
+                "peak_focal_time_s": np.asarray(thermal_time[focal_index]),
+                "peak_focal_dT_C": np.asarray(focal_series[focal_index]),
+                "dT_peak_focal_800um": focal_map,
+                "peak_mean_time_s": np.asarray(thermal_time[mean_index]),
+                "peak_mean_dT_C": np.asarray(mean_series[mean_index]),
+                "dT_peak_mean_800um": mean_map,
+                "extent_mm_800um": np.asarray([-1.0, 1.0, -1.0, 1.0]),
+            }
+        )
         np.savez(run_dir / "metrics.npz", **metrics)
     return run_dir
 
@@ -91,6 +118,43 @@ def test_discovery_skips_failed_runs(tmp_path: Path) -> None:
     with pytest.warns(RuntimeWarning, match="status"):
         runs = discover_completed_runs(tmp_path)
     assert [run.run_dir for run in runs] == [completed]
+
+
+def test_delivered_stimulation_mean_uses_active_electrodes_only() -> None:
+    data = {
+        "time_s": np.asarray([0.0, 1.0], dtype=np.float32),
+        "amplitude_per_electrode_uA": np.asarray(
+            [[60.0, 0.0], [60.0, 30.0]],
+            dtype=np.float32,
+        ),
+        "charge_per_second_per_electrode_nC_s": np.asarray(
+            [[600.0, 0.0], [600.0, 300.0]],
+            dtype=np.float32,
+        ),
+        "charge_per_second_mean_per_electrode_nC_s": np.asarray(
+            [300.0, 450.0],
+            dtype=np.float32,
+        ),
+    }
+
+    amplitude = mean_metric_series(data, "amplitude")
+    charge_rate = mean_metric_series(data, "charge_rate")
+
+    assert amplitude is not None
+    assert charge_rate is not None
+    assert amplitude[1] == pytest.approx([60.0, 45.0])
+    assert charge_rate[1] == pytest.approx([600.0, 450.0])
+
+
+def test_visual_ordering_and_raster_group_colors() -> None:
+    grids = ["right", "left"]
+    assert sorted(grids, key=hemisphere_grid_sort_key) == ["left", "right"]
+    assert coordinate_identity("C:/old/repo/coords_800um.yaml") == coordinate_identity(
+        "C:/new/worktree/coords_800um.yaml"
+    )
+    assert raster_protocol_color("checkerboard", 3) != raster_protocol_color("checkerboard", 4)
+    assert raster_protocol_color("random", 4) != raster_protocol_color("random", 5)
+    assert raster_protocol_color("checkerboard", 4) != raster_protocol_color("random", 4)
 
 
 def test_completed_manifest_without_metrics_is_an_error(tmp_path: Path) -> None:
@@ -183,6 +247,7 @@ def test_phase1_analysis_writes_synthetic_outputs(tmp_path: Path) -> None:
     written = run_phase1_analysis(root, output)
 
     assert output / "matrix_summary.csv" in written
+    assert output / "peak_temperature_heatmaps" / "baseline.png" in written
     assert any(path.suffix == ".png" for path in written)
 
 
@@ -241,6 +306,7 @@ def test_phase2_analysis_writes_synthetic_outputs(tmp_path: Path) -> None:
 
     assert output / "ic_power_linearity_summary.csv" in written
     assert output / "phase1_ic_power_budget.csv" in written
+    assert output / "peak_temperature_heatmaps" / "fit-0.png" in written
     assert any(path.suffix == ".png" for path in written)
 
 
@@ -293,4 +359,12 @@ def test_phase3_analysis_writes_synthetic_outputs(tmp_path: Path) -> None:
 
     assert output / "raster_effect_summary.csv" in written
     assert output / "raster_effect_summary.yaml" in written
+    assert (
+        output
+        / "peak_temperature_heatmaps"
+        / "worst_case_screen-checkerboard.png"
+        in written
+    )
+    assert output / "worst_case_mean_temperature_evolution.png" in written
+    assert output / "worst_case_focal_temperature_evolution.png" in written
     assert any(path.suffix == ".png" for path in written)

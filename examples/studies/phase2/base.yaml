@@ -25,4 +25,5 @@ metadata:
 output:
   root: ../../../results/safety/simulation_pipeline/ic_power
   run_id: phase2_ic_only
-  write_figures: false
+  write_figures: true
+  overwrite: true

@@ -13,8 +13,8 @@ from dynaphos.simulation.utils import print_stats
 
 class Impedance(State):
     """
-    Stores per-electrode REAL impedance (Ohms) used for load-power diagnostics:
-        P = I^2 * Re(Z)
+    Stores the uniform tissue resistance (Ohms) used for electrode load power:
+        P = I^2 * Rtis
     """
     def __init__(self, params: dict, shape: Tuple[int, ...],
                  rng: Optional[np.random.Generator] = None,
@@ -23,48 +23,17 @@ class Impedance(State):
 
         imp = self.params.get('impedance', {})
         self.Rtis = float(imp.get('Rtis', 9.9e3))
-        self.Cdl  = float(imp.get('Cdl', 113.4e-9))
-        self.Rct  = float(imp.get('Rct', 2.2e6))
-        self.sigma_w = float(imp.get('sigma_w', 2.5e6))
+        if not np.isfinite(self.Rtis) or self.Rtis <= 0.0:
+            raise ValueError("impedance.Rtis must be a finite positive resistance.")
 
-        self.cv = float(imp.get('real_impedance_cv', 0.10))  # coefficient of variation
-        seed = int(imp.get('seed', self.params['run']['seed']))
-        self.rng = np.random.default_rng(seed) if rng is None else rng
+        # Keep rng in the public signature for compatibility with existing callers.
+        _ = rng
+        self.state = torch.full(self.shape, self.Rtis, **self.data_kwargs)
 
-        freq = float(self.params['default_stim']['freq_default'])
-
-        # Base real impedance (scalar) from Randles model
-        z_real = self.calculate_randles_real(freq)
-
-        # Per-electrode variability (multiplicative), truncated to avoid extreme outliers
-        # factor ~ N(1, cv) truncated to [1-2cv, 1+2cv]
-        lo = 1.0 - 2.0 * self.cv
-        hi = 1.0 + 2.0 * self.cv
-        factors = self.rng.normal(loc=1.0, scale=self.cv, size=shape)
-        factors = np.clip(factors, lo, hi)
-
-        z_vals = z_real * factors  # per-electrode real impedances
-        self.state = self.to_tensor(z_vals).clip(1.0, None)  # keep >= 1 ohm for safety
-
-        print_stats(f"Re(Z) @ {freq}Hz (Ohms)", self.state, self.verbose)
-
-    def calculate_randles_real(self, freq: float) -> float:
-        """
-        Randles model:
-            Z = Rtis + Rct/(1 + j*omega*Rct*Cdl) + sigma_w / sqrt(j*omega)
-        Return real part: Re(Z)
-        """
-        omega = 2.0 * np.pi * freq
-        j = 1j
-
-        z_faradaic = self.Rct / (1.0 + j * omega * self.Rct * self.Cdl)
-        z_warburg  = self.sigma_w / (np.sqrt(j * omega))
-        z_total = self.Rtis + z_faradaic + z_warburg
-
-        return float(np.real(z_total))
+        print_stats("Uniform Rtis (Ohms)", self.state, self.verbose)
 
     def update(self, x: torch.Tensor):
-        # Static in this version; could be made frequency-dependent later.
+        # Tissue resistance is static and identical for every electrode.
         pass
 
 

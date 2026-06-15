@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import shutil
 import subprocess
 import tempfile
 import traceback
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,66 @@ from dynaphos.experiment import execution
 from dynaphos.strategies import load_strategy
 
 
+STIMULATION_CACHE_SCHEMA = 1
+
+
+def _display_number(value: Any) -> str:
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _run_header_lines(manifest: dict[str, Any]) -> tuple[str, ...]:
+    resolved_config = manifest.get("resolved_config", {})
+    input_config = resolved_config.get("input", {})
+    protocol_config = resolved_config.get("protocol", {})
+    block = str(manifest.get("block", "")).strip()
+    run_fields = [
+        f"id={manifest.get('run_id', 'unknown')}",
+        f"device={manifest.get('runtime_device', 'unknown')}",
+    ]
+    if block:
+        run_fields.insert(1, f"block={block}")
+
+    strategy = manifest.get("strategy", {})
+    strategy_name = (
+        strategy.get("name")
+        or strategy.get("import_path")
+        or manifest.get("raster_mode")
+        or "unknown"
+    )
+    setup_fields = [
+        f"electrodes={Path(str(manifest.get('coords_yaml', 'unknown'))).stem}",
+        f"strategy={strategy_name}",
+        f"electrical={'on' if manifest.get('track_electrical', True) else 'off'}",
+        f"electrode_heat={'on' if manifest.get('electrode_heat_enabled', True) else 'off'}",
+    ]
+
+    return (
+        f"Run | {' | '.join(run_fields)}",
+        f"Input | {manifest.get('input', 'unknown')}",
+        "Processing | "
+        f"stage={input_config.get('stage', 'unknown')} | "
+        f"preprocessing={manifest.get('preprocessing_method', 'unknown')}",
+        "Protocol | "
+        f"amplitude={_display_number(manifest.get('amplitude_uA', 'unknown'))} uA | "
+        f"threshold={_display_number(manifest.get('appearance_threshold_uA', 'unknown'))} uA | "
+        f"pulse_width={_display_number(manifest.get('pulse_width_us', 'unknown'))} us | "
+        f"frequency={_display_number(manifest.get('frequency_hz', 'unknown'))} Hz | "
+        f"relative_duration="
+        f"{_display_number(100.0 * float(protocol_config.get('relative_stim_duration', 1.0)))}% | "
+        f"IC_power={_display_number(manifest.get('internal_circuit_power_mw', 'unknown'))} mW",
+        f"Setup | {' | '.join(setup_fields)}",
+        f"Output | {manifest.get('output_directory', 'unknown')}",
+    )
+
+
+def _print_run_header(manifest: dict[str, Any]) -> None:
+    for line in _run_header_lines(manifest):
+        print(line, flush=True)
+
+
 def _version() -> str:
     try:
         from importlib.metadata import version
@@ -59,12 +121,80 @@ def _git_revision(path: Path) -> str | None:
         return None
 
 
-def _sha256(path: Path) -> str:
+@lru_cache(maxsize=128)
+def _sha256_for_file(
+    path_text: str,
+    size: int,
+    modified_ns: int,
+) -> str:
+    _ = size, modified_ns
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with open(path_text, "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256(path: Path) -> str:
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    return _sha256_for_file(
+        str(resolved),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+    )
+
+
+def _stimulation_cache_path(
+    config: ExperimentConfig,
+    *,
+    input_path: Path,
+    coords_path: Path,
+    params: dict[str, Any],
+) -> Path | None:
+    experiment_block = str(
+        config.metadata.get("experiment_block", config.metadata.get("block", ""))
+    )
+    if experiment_block not in {
+        "amplitude_grid_preprocessing",
+        "ic_power",
+        "raster_protocols",
+    }:
+        return None
+    if config.simulation.phosphene_mode != "safety_centers":
+        return None
+    if config.strategy.name not in {
+        "direct",
+        "none",
+        "checkerboard",
+        "pseudo_random",
+        "pseudo-random",
+        "random",
+    }:
+        return None
+    if not config.safety.track_electrical and not config.safety.electrode_heat_enabled:
+        return None
+
+    sampling_params = copy.deepcopy(params)
+    sampling_params.setdefault("sampling", {})["stimulus_scale"] = 1.0
+    sampling_params.pop("bioheat", None)
+    sampling_params.pop("safety", None)
+    sampling_params.pop("thresholding", None)
+    payload = {
+        "schema": STIMULATION_CACHE_SCHEMA,
+        "input_sha256": _sha256(input_path),
+        "coords_sha256": _sha256(coords_path),
+        "input_stage": config.input.stage,
+        "preprocessing_method": config.input.preprocessing_method,
+        "preprocessing_options": config.input.preprocessing_options,
+        "max_frames": int(config.simulation.max_frames),
+        "phosphene_mode": config.simulation.phosphene_mode,
+        "sampling_params": sampling_params,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+    return config.output.root.parent / ".stimulation_cache" / f"{digest}.npy"
 
 
 def _resolve_config(config: ExperimentConfig | str | Path) -> ExperimentConfig:
@@ -266,6 +396,12 @@ def run_experiment(config: ExperimentConfig | str | Path) -> ExperimentResult:
         else resolved.safety.limits.resolve()
     )
     params, params_path = _build_params(resolved, safety_path)
+    stimulation_cache_path = _stimulation_cache_path(
+        resolved,
+        input_path=input_path,
+        coords_path=coords_path,
+        params=params,
+    )
     strategy = load_strategy(resolved.strategy)
     device = execution.configure_runtime_device(
         params,
@@ -282,6 +418,7 @@ def run_experiment(config: ExperimentConfig | str | Path) -> ExperimentResult:
     )
     manifest_path = run_dir / "manifest.yaml"
     start_manifest(manifest_path, manifest)
+    _print_run_header(manifest)
 
     try:
         # Raster selection belongs to the strategy, so the simulator's
@@ -315,6 +452,7 @@ def run_experiment(config: ExperimentConfig | str | Path) -> ExperimentResult:
                 strategy=strategy,
                 input_stage=resolved.input.stage,
                 preprocessing_options=resolved.input.preprocessing_options,
+                stimulation_cache_path=stimulation_cache_path,
             )
     except Exception as exc:
         fail_manifest(
@@ -384,7 +522,8 @@ def run_sweep(
     base_values = load_yaml(source)
     results: list[ExperimentResult] = []
     errors: list[Exception] = []
-    for index, variant in enumerate(sweep.variants(), start=1):
+    variants = sweep.variants()
+    for index, variant in enumerate(variants, start=1):
         values = copy.deepcopy(base_values)
         for dotted_path, value in variant.items():
             if isinstance(value, dict) and "patch" in value:
@@ -412,6 +551,10 @@ def run_sweep(
             continue
         if resume and run_dir.exists():
             experiment.output.overwrite = True
+        print(
+            f"\nSweep run {index}/{len(variants)} | id={experiment.output.run_id}",
+            flush=True,
+        )
         try:
             results.append(run_experiment(experiment))
         except Exception as exc:

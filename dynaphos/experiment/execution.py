@@ -13,6 +13,7 @@ High-level flow:
 """
 
 import argparse
+import math
 import shutil
 import sys
 import time
@@ -1646,6 +1647,18 @@ def save_mode_outputs(
         "electrode_heat_enabled": np.asarray(bool(electrode_heat_enabled)),
         "internal_circuit_footprint_pixels": np.asarray(footprint_pixels, dtype=np.float32),
         "internal_circuit_power_density_W_m3": np.asarray(power_density_w_m3, dtype=np.float32),
+        "stimulation_cache_hit": common_metrics.get(
+            "stimulation_cache_hit",
+            np.asarray(False),
+        ),
+        "stimulation_cache_path": common_metrics.get(
+            "stimulation_cache_path",
+            np.asarray(""),
+        ),
+        "ic_only_fast_path": common_metrics.get(
+            "ic_only_fast_path",
+            np.asarray(False),
+        ),
     }
     electrical_payload_keys = (
         "amplitude_per_electrode_uA",
@@ -1757,6 +1770,31 @@ def save_mode_outputs(
         for grid_name, snapshots in thermal_snapshots.get("cem43_grids", {}).items():
             suffix = sanitize_path_part(grid_name)
             save_payload[f"cem43_heatmaps_{suffix}"] = np.asarray(snapshots, dtype=np.float32)
+        peak_grid_names = sorted(
+            {
+                *thermal_snapshots.get("peak_focal_grids", {}).keys(),
+                *thermal_snapshots.get("peak_mean_grids", {}).keys(),
+            }
+        )
+        if peak_grid_names:
+            save_payload["peak_heatmap_grid_names"] = np.asarray(peak_grid_names)
+        for peak_kind in ("focal", "mean"):
+            save_payload[f"peak_{peak_kind}_time_s"] = np.asarray(
+                thermal_snapshots.get(f"peak_{peak_kind}_time_s", np.nan),
+                dtype=np.float32,
+            )
+            save_payload[f"peak_{peak_kind}_dT_C"] = np.asarray(
+                thermal_snapshots.get(f"peak_{peak_kind}_dT_C", np.nan),
+                dtype=np.float32,
+            )
+            for grid_name, heatmap in thermal_snapshots.get(
+                f"peak_{peak_kind}_grids", {}
+            ).items():
+                suffix = sanitize_path_part(grid_name)
+                save_payload[f"dT_peak_{peak_kind}_{suffix}"] = np.asarray(
+                    heatmap,
+                    dtype=np.float32,
+                )
 
     write_metrics(out_dir / "metrics.npz", save_payload)
 
@@ -1783,7 +1821,8 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                  electrode_heat_enabled: bool = True,
                  strategy=None,
                  input_stage: str = "preprocessed",
-                 preprocessing_options: dict | None = None):
+                 preprocessing_options: dict | None = None,
+                 stimulation_cache_path: Path | None = None):
     if not mode_out_dirs:
         raise ValueError("run_one_mode requires at least one IC mode output directory.")
     if set(mode_out_dirs) != set(preview_out_dirs):
@@ -1951,6 +1990,52 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
         raise ValueError("input_stage must be either 'original' or 'preprocessed'.")
     preprocessing_options = dict(preprocessing_options or {})
     binarize_input = should_binarize_preprocessed_input(preprocessing_method)
+    cache_path = Path(stimulation_cache_path) if stimulation_cache_path is not None else None
+    cache_metadata_path = cache_path.with_suffix(".yaml") if cache_path is not None else None
+    cached_stimulation: np.ndarray | None = None
+    cache_writer: np.memmap | None = None
+    cache_temp_path: Path | None = None
+    stimulation_cache_hit = False
+    if (
+        cache_path is not None
+        and cache_metadata_path is not None
+        and cache_path.exists()
+        and cache_metadata_path.exists()
+    ):
+        try:
+            metadata = load_yaml(cache_metadata_path)
+            candidate = np.load(cache_path, mmap_mode="r")
+            expected_frames = int(metadata.get("frame_count", 0))
+            expected_phosphenes = int(metadata.get("phosphene_count", 0))
+            if (
+                candidate.ndim == 2
+                and expected_frames == int(candidate.shape[0])
+                and expected_phosphenes == int(candidate.shape[1])
+                and expected_phosphenes == int(sim.num_phosphenes)
+                and expected_frames >= int(video_frame_limit)
+                and np.isclose(float(metadata.get("fps", math.nan)), video_fps)
+            ):
+                cached_stimulation = candidate
+                stimulation_cache_hit = True
+                print(f"Using stimulation cache: {cache_path}")
+        except (OSError, TypeError, ValueError, yaml.YAMLError):
+            cached_stimulation = None
+            stimulation_cache_hit = False
+    if (
+        cache_path is not None
+        and not stimulation_cache_hit
+        and video_frame_limit > 0
+    ):
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_temp_path = cache_path.with_name(f"{cache_path.stem}.tmp.npy")
+        cache_temp_path.unlink(missing_ok=True)
+        cache_writer = np.lib.format.open_memmap(
+            cache_temp_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(int(video_frame_limit), int(sim.num_phosphenes)),
+        )
+        print(f"Building stimulation cache: {cache_path}")
     preview_max_frames = max(0, int(round(float(preview_seconds) * fps)))
     if phosphene_mode != "visual":
         if preview_max_frames > 0:
@@ -2035,6 +2120,13 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
         f"stimulation update every video frame ({dt:.3f}s); "
         f"cooldown batch up to {configured_thermal_update_interval} frame(s)"
     )
+    ic_only_fast_path = bool(
+        not track_electrical
+        and not electrode_heat_enabled
+        and stimulus_scale_effective <= 0.0
+    )
+    if ic_only_fast_path:
+        print("IC-only fast path: skipping video decode and phosphene simulation.")
     mode_states = {}
     for ic_heat_mode, out_dir in mode_out_dirs.items():
         mode_params = yaml.safe_load(yaml.safe_dump(simulation_params))
@@ -2083,6 +2175,12 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             "grid_mean_dT": {grid_name: [] for grid_name in grid_heat_states},
             "max_dT": [],
             "mean_dT": [],
+            "peak_focal_dT_C": -np.inf,
+            "peak_focal_time_s": np.nan,
+            "peak_focal_grids": {},
+            "peak_mean_dT_C": -np.inf,
+            "peak_mean_time_s": np.nan,
+            "peak_mean_grids": {},
             "area_gt1_mm2": [],
             "area_gt2_mm2": [],
             "area_gt3_mm2": [],
@@ -2182,8 +2280,33 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             if not grid_max_dT:
                 raise RuntimeError("No bioheat grids were configured for the current mode.")
 
-            state["max_dT"].append(torch.stack(grid_max_dT).max())
-            state["mean_dT"].append(weighted_mean_sum / max(weighted_mean_count, 1))
+            aggregate_max_dT = torch.stack(grid_max_dT).max()
+            aggregate_mean_dT = weighted_mean_sum / max(weighted_mean_count, 1)
+            state["max_dT"].append(aggregate_max_dT)
+            state["mean_dT"].append(aggregate_mean_dT)
+
+            peak_values = (
+                torch.stack((aggregate_max_dT, aggregate_mean_dT))
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            focal_value = float(peak_values[0])
+            mean_value = float(peak_values[1])
+            if focal_value > float(state["peak_focal_dT_C"]):
+                state["peak_focal_dT_C"] = focal_value
+                state["peak_focal_time_s"] = float(sample_time_s)
+                state["peak_focal_grids"] = {
+                    grid_name: grid_state["prev_dT_map"]
+                    for grid_name, grid_state in state["grid_heat_states"].items()
+                }
+            if mean_value > float(state["peak_mean_dT_C"]):
+                state["peak_mean_dT_C"] = mean_value
+                state["peak_mean_time_s"] = float(sample_time_s)
+                state["peak_mean_grids"] = {
+                    grid_name: grid_state["prev_dT_map"]
+                    for grid_name, grid_state in state["grid_heat_states"].items()
+                }
             state["area_gt1_mm2"].append(area_gt1_total)
             state["area_gt2_mm2"].append(area_gt2_total)
             state["area_gt3_mm2"].append(area_gt3_total)
@@ -2283,6 +2406,30 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
     def _decode_worker():
         produced = 0
         try:
+            if ic_only_fast_path:
+                while produced < int(video_frame_limit) and not _decode_stop.is_set():
+                    produced += 1
+                    while not _decode_stop.is_set():
+                        try:
+                            _frame_queue.put(produced - 1, timeout=0.25)
+                            break
+                        except _queue_mod.Full:
+                            continue
+                return
+            if cached_stimulation is not None:
+                while produced < int(video_frame_limit) and not _decode_stop.is_set():
+                    row = np.asarray(
+                        cached_stimulation[produced],
+                        dtype=np.float32,
+                    ).copy()
+                    produced += 1
+                    while not _decode_stop.is_set():
+                        try:
+                            _frame_queue.put(row, timeout=0.25)
+                            break
+                        except _queue_mod.Full:
+                            continue
+                return
             while not _decode_stop.is_set():
                 if max_frames > 0 and produced >= int(max_frames):
                     break
@@ -2320,14 +2467,19 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
 
     _decoder_thread = _threading.Thread(target=_decode_worker, name="dynaphos-decode", daemon=True)
     _decoder_thread.start()
+    zero_power_elec_fast = torch.zeros(
+        n_elec,
+        dtype=torch.float32,
+        device=device,
+    )
 
     _loop_wall0 = _time.perf_counter()
 
     try:
         while True:
             _q_wait0 = _time.perf_counter()
-            gray = _frame_queue.get()
-            if gray is _SENTINEL:
+            frame_data = _frame_queue.get()
+            if frame_data is _SENTINEL:
                 break
 
             frame_idx += 1
@@ -2335,7 +2487,54 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
             _PROF_N["stim"] += 1
             if _prof_on:
                 _ts[0] = _q_wait0
-            stim_raw = sim.sample_stimulus(gray, rescale=True).reshape(-1).to(device)
+
+            if ic_only_fast_path:
+                current_time_s = frame_idx * dt
+                for state in mode_states.values():
+                    state_internal_circuit_power_W = sum(
+                        float(grid_state["device_constant_power_W"])
+                        for grid_state in state["grid_heat_states"].values()
+                        if state["ic_enabled"]
+                    )
+                    state["internal_circuit_power_W"].append(
+                        state_internal_circuit_power_W
+                    )
+                    state["electrode_load_power_W"].append(0.0)
+                    state["device_power_time_s"].append(float(current_time_s))
+                update_bioheat_from_electrode_power(zero_power_elec_fast, dt)
+                snapshot_entry = heatmap_snapshot_lookup.get(frame_idx)
+                record_thermal_metrics_and_snapshots(snapshot_entry, current_time_s)
+                time_s.append(current_time_s)
+                if frame_idx == 1 or frame_idx % 100 == 0:
+                    elapsed_s = max(time.perf_counter() - progress_started_at, 1e-9)
+                    progress_pct = (
+                        100.0 * float(frame_idx) / float(video_frame_limit)
+                        if video_frame_limit > 0
+                        else 0.0
+                    )
+                    write_progress_line(
+                        f"{raster_label}: IC-only thermal frame "
+                        f"{frame_idx}/{video_frame_limit} ({progress_pct:5.1f}%) | "
+                        f"elapsed {elapsed_s:7.1f}s"
+                    )
+                continue
+
+            if cached_stimulation is not None:
+                gray = np.empty((0, 0), dtype=np.uint8)
+                normalized_stim = torch.as_tensor(
+                    frame_data,
+                    dtype=torch.float32,
+                    device=device,
+                ).reshape(-1)
+                stim_raw = normalized_stim * float(stimulus_scale_effective)
+            else:
+                gray = np.asarray(frame_data)
+                stim_raw = sim.sample_stimulus(gray, rescale=True).reshape(-1).to(device)
+                if cache_writer is not None and stimulus_scale_effective > 0.0:
+                    cache_writer[frame_idx - 1] = (
+                        stim_raw.detach().cpu().numpy()
+                        / float(stimulus_scale_effective)
+                    ).astype(np.float32, copy=False)
             _ckpt("decode+preprocess(DoG)")
 
             stim = apply_appearance_threshold(stim_raw, fixed_firing_threshold_a)
@@ -2687,6 +2886,29 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
     if frame_idx > 0:
         finish_progress_line()
 
+    if cache_writer is not None and cache_temp_path is not None and cache_path is not None:
+        cache_writer.flush()
+        cache_writer = None
+        if frame_idx == int(video_frame_limit):
+            cache_temp_path.replace(cache_path)
+            if cache_metadata_path is not None:
+                cache_metadata_path.write_text(
+                    yaml.safe_dump(
+                        {
+                            "schema_version": 1,
+                            "frame_count": int(frame_idx),
+                            "phosphene_count": int(sim.num_phosphenes),
+                            "fps": float(video_fps),
+                            "dtype": "float32",
+                        },
+                        sort_keys=False,
+                    ),
+                    encoding="utf-8",
+                )
+            print(f"Wrote stimulation cache: {cache_path}")
+        else:
+            cache_temp_path.unlink(missing_ok=True)
+
     if frame_idx == 0:
         raise RuntimeError("No frames were read from the input video.")
 
@@ -2730,6 +2952,11 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
         "pulse_width_s": np.asarray(pulse_width_s, dtype=np.float32),
         "relative_stim_duration": np.asarray(relative_stim_duration, dtype=np.float32),
         "electrode_surface_area_cm2": np.asarray(electrode_area_cm2, dtype=np.float32),
+        "stimulation_cache_hit": np.asarray(stimulation_cache_hit),
+        "stimulation_cache_path": np.asarray(
+            "" if cache_path is None else str(cache_path)
+        ),
+        "ic_only_fast_path": np.asarray(ic_only_fast_path),
     }
     if track_electrical:
         common_metrics.update(
@@ -2836,6 +3063,18 @@ def run_one_mode(*, params: dict, coords_yaml: Path, video_path: Path,
                 grid_name: np.asarray(snapshot_stack, dtype=np.float32)
                 for grid_name, snapshot_stack in state["snapshot_grids"].items()
                 if snapshot_stack
+            },
+            "peak_focal_time_s": float(state["peak_focal_time_s"]),
+            "peak_focal_dT_C": float(state["peak_focal_dT_C"]),
+            "peak_focal_grids": {
+                grid_name: heatmap.detach().cpu().numpy().astype(np.float32)
+                for grid_name, heatmap in state["peak_focal_grids"].items()
+            },
+            "peak_mean_time_s": float(state["peak_mean_time_s"]),
+            "peak_mean_dT_C": float(state["peak_mean_dT_C"]),
+            "peak_mean_grids": {
+                grid_name: heatmap.detach().cpu().numpy().astype(np.float32)
+                for grid_name, heatmap in state["peak_mean_grids"].items()
             },
         }
         if enable_cem43:

@@ -25,7 +25,27 @@ class MetricEvaluation:
     status: str
     peak_time_s: float | None = None
     electrode_id: int | None = None
+    window_duration_s: float | None = None
     rationale: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        for key in ("observed", "limit", "ratio_to_limit", "peak_time_s", "window_duration_s"):
+            value = payload[key]
+            payload[key] = None if value is None else round(float(value), 2)
+        payload["observed_with_unit"] = format_value_with_unit(self.observed, self.unit)
+        payload["ratio_band"] = ratio_band(self.ratio_to_limit)
+        return payload
+
+
+@dataclass(frozen=True)
+class ReportVisualization:
+    name: str
+    label: str
+    path: str
+    media_type: str
+    metric_name: str | None = None
+    description: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -38,6 +58,7 @@ class SafetyReport:
     metrics: tuple[MetricEvaluation, ...]
     limitations: tuple[str, ...]
     metrics_path: str
+    visualizations: tuple[ReportVisualization, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,7 +67,27 @@ class SafetyReport:
             "metrics": [metric.to_dict() for metric in self.metrics],
             "limitations": list(self.limitations),
             "metrics_path": self.metrics_path,
+            "visualizations": [
+                visualization.to_dict() for visualization in self.visualizations
+            ],
         }
+
+
+def format_value_with_unit(value: float | None, unit: str) -> str | None:
+    if value is None:
+        return None
+    suffix = f" {unit}" if unit else ""
+    return f"{value:.2f}{suffix}"
+
+
+def ratio_band(value: float | None) -> str:
+    if value is None or not np.isfinite(value):
+        return "not_evaluated"
+    if value > 1.0:
+        return "exceeds"
+    if value >= 0.8:
+        return "approaching"
+    return "within"
 
 
 def _finite_max(values: np.ndarray) -> tuple[float | None, tuple[int, ...] | None]:
@@ -71,9 +112,10 @@ def _evaluate(
     time_s: np.ndarray | None,
     electrode_ids: np.ndarray | None,
     rationale: str,
+    window_duration_s: float | None = None,
     transform=None,
 ) -> MetricEvaluation:
-    if values is None or limit is None or not np.isfinite(limit) or limit <= 0.0:
+    if values is None:
         return MetricEvaluation(
             name=name,
             label=label,
@@ -82,6 +124,7 @@ def _evaluate(
             ratio_to_limit=None,
             unit=unit,
             status=NOT_EVALUATED,
+            window_duration_s=window_duration_s,
             rationale=rationale,
         )
 
@@ -91,15 +134,15 @@ def _evaluate(
             name=name,
             label=label,
             observed=None,
-            limit=float(limit),
+            limit=None if limit is None or not np.isfinite(limit) else float(limit),
             ratio_to_limit=None,
             unit=unit,
             status=NOT_EVALUATED,
+            window_duration_s=window_duration_s,
             rationale=rationale,
         )
     if transform is not None:
         observed = float(transform(observed))
-    ratio = observed / float(limit)
     time_index = index[0] if len(index) >= 1 else None
     electrode_index = index[1] if len(index) >= 2 else None
     peak_time = (
@@ -114,16 +157,25 @@ def _evaluate(
         and electrode_index < len(electrode_ids)
         else None
     )
+    valid_limit = limit is not None and np.isfinite(limit) and limit > 0.0
+    ratio = observed / float(limit) if valid_limit else None
     return MetricEvaluation(
         name=name,
         label=label,
         observed=observed,
-        limit=float(limit),
+        limit=float(limit) if valid_limit else None,
         ratio_to_limit=ratio,
         unit=unit,
-        status=EXCEEDS_LIMIT if ratio > 1.0 else WITHIN_LIMIT,
+        status=(
+            EXCEEDS_LIMIT
+            if ratio is not None and ratio > 1.0
+            else WITHIN_LIMIT
+            if ratio is not None
+            else NOT_EVALUATED
+        ),
         peak_time_s=peak_time,
         electrode_id=electrode_id,
+        window_duration_s=window_duration_s,
         rationale=rationale,
     )
 
@@ -141,6 +193,13 @@ def evaluate_metrics(
     time_s = data.get("time_s")
     thermal_time_s = data.get("thermal_time_s")
     electrode_ids = data.get("electrode_ids")
+    charge_window_s = (
+        float(np.asarray(data["charge_window_s"]).reshape(-1)[0])
+        if "charge_window_s" in data and np.asarray(data["charge_window_s"]).size
+        else None
+    )
+    if charge_window_s is not None and not np.isfinite(charge_window_s):
+        charge_window_s = None
     amplitude = data.get("amplitude_per_electrode_uA")
     if amplitude is not None and amplitude.ndim == 2:
         active_percentage = (
@@ -187,10 +246,11 @@ def evaluate_metrics(
             "Current amplitude",
             amplitude,
             limits.get("amplitude_uA"),
-            "uA",
+            "µA",
             time_s,
             electrode_ids,
             "Configured maximum stimulation amplitude.",
+            None,
             None,
         ),
         (
@@ -198,11 +258,12 @@ def evaluate_metrics(
             "Pulse width",
             pulse_width,
             limits.get("pulse_width_us"),
-            "us",
+            "µs",
             time_s if pulse_width is not None and np.asarray(pulse_width).ndim == 2 else None,
             electrode_ids,
             "Configured maximum phase pulse width.",
             lambda value: value * 1e6,
+            None,
         ),
         (
             "frequency",
@@ -213,6 +274,7 @@ def evaluate_metrics(
             time_s if pulse_frequency is not None and np.asarray(pulse_frequency).ndim == 2 else None,
             electrode_ids,
             "Configured maximum stimulation frequency.",
+            None,
             None,
         ),
         (
@@ -225,16 +287,18 @@ def evaluate_metrics(
             electrode_ids,
             "Configured per-electrode charge-per-phase boundary.",
             None,
+            None,
         ),
         (
             "charge_density",
             "Charge density",
             data.get("charge_density_per_electrode_uc_cm2"),
             limits.get("charge_density_uc_cm2"),
-            "uC/cm2",
+            "µC/cm²",
             time_s,
             electrode_ids,
             "Configured per-electrode charge-density boundary.",
+            None,
             None,
         ),
         (
@@ -247,16 +311,18 @@ def evaluate_metrics(
             electrode_ids,
             "Configured Shannon-model reference boundary.",
             None,
+            None,
         ),
         (
             "current_density",
             "Current density",
             current_density,
             limits.get("current_density_A_cm2"),
-            "A/cm2",
+            "A/cm²",
             time_s,
             electrode_ids,
             "Configured current-density boundary.",
+            None,
             None,
         ),
         (
@@ -269,6 +335,7 @@ def evaluate_metrics(
             electrode_ids,
             "Configured rolling-window charge boundary for one electrode.",
             None,
+            charge_window_s,
         ),
         (
             "window_charge_total",
@@ -280,6 +347,7 @@ def evaluate_metrics(
             None,
             "Configured rolling-window charge boundary for the full array.",
             None,
+            charge_window_s,
         ),
         (
             "session_charge",
@@ -290,6 +358,7 @@ def evaluate_metrics(
             None,
             None,
             "Configured total session charge boundary.",
+            None,
             None,
         ),
         (
@@ -302,6 +371,7 @@ def evaluate_metrics(
             None,
             "Configured maximum fraction of electrodes active simultaneously.",
             None,
+            None,
         ),
         (
             "power_per_electrode",
@@ -312,6 +382,7 @@ def evaluate_metrics(
             time_s,
             electrode_ids,
             "Configured thermal power boundary for one electrode.",
+            None,
             None,
         ),
         (
@@ -324,27 +395,42 @@ def evaluate_metrics(
             None,
             "Configured total thermal power budget.",
             None,
+            None,
         ),
         (
             "temperature",
             "Focal temperature rise",
             data.get("max_dT"),
             limits.get("temperature_increase_C"),
-            "degC",
+            "°C",
             thermal_time_s,
             None,
             "Configured maximum modeled tissue temperature increase.",
             None,
+            None,
+        ),
+        (
+            "mean_temperature",
+            "Mean temperature rise",
+            data.get("mean_dT"),
+            limits.get("temperature_increase_C"),
+            "°C",
+            thermal_time_s,
+            None,
+            "Configured maximum modeled spatial mean tissue temperature increase.",
+            None,
+            None,
         ),
         (
             "cem43",
-            "Thermal dose",
+            "CEM43",
             data.get("max_cem43"),
             limits.get("cem43_min"),
             "min",
             thermal_time_s,
             None,
-            "Configured cumulative equivalent minutes at 43 degC.",
+            "Configured cumulative equivalent minutes at 43 °C.",
+            None,
             None,
         ),
     )
@@ -358,6 +444,7 @@ def evaluate_metrics(
             time_s=metric_time,
             electrode_ids=metric_electrodes,
             rationale=rationale,
+            window_duration_s=window_duration_s,
             transform=transform,
         )
         for (
@@ -370,6 +457,7 @@ def evaluate_metrics(
             metric_electrodes,
             rationale,
             transform,
+            window_duration_s,
         ) in metric_specs
     )
 

@@ -8,7 +8,7 @@ from dynaphos.experiment.execution import (
     resolve_thermal_update_interval_frames,
 )
 from dynaphos.safety.bioheat import Bioheat2D, Bioheat3D
-from dynaphos.safety.impedance import compute_device_power, compute_frame_power
+from dynaphos.safety.impedance import Impedance, compute_device_power, compute_frame_power
 from dynaphos.safety.tracking import SafetyTracker
 from dynaphos.simulation.simulator import apply_appearance_threshold
 
@@ -71,6 +71,29 @@ def test_compute_frame_power_uses_impedance_and_duty_cycle() -> None:
     )
     assert torch.equal(instant, torch.tensor([12.0]))
     assert torch.equal(frame, torch.tensor([6.0]))
+
+
+def test_impedance_uses_uniform_tissue_resistance_for_all_electrodes() -> None:
+    impedance = Impedance(
+        params={
+            "run": {"dtype": "float64", "gpu": None, "seed": 7},
+            "default_stim": {"freq_default": 300.0},
+            "impedance": {
+                "Rtis": 9900.0,
+                "Rct": 2.2e6,
+                "Cdl": 113.4e-9,
+                "sigma_w": 2.5e6,
+                "real_impedance_cv": 0.9,
+            },
+        },
+        shape=(4,),
+        rng=np.random.default_rng(123),
+    )
+
+    assert torch.equal(
+        impedance.get(),
+        torch.full((4,), 9900.0, dtype=torch.float64),
+    )
 
 
 def test_compute_device_power_excludes_electrode_heat() -> None:

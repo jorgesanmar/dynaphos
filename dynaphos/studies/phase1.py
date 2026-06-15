@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -162,6 +163,30 @@ def max_value(data: np.lib.npyio.NpzFile, key: str, default: float = 0.0) -> flo
     return float(np.max(finite))
 
 
+def peak_value_and_time(
+    data: np.lib.npyio.NpzFile | Mapping[str, Any],
+    key: str,
+) -> tuple[float, float, int]:
+    values = get_data_array(data, key, dtype=np.float64)
+    if values is None or values.size == 0:
+        return math.nan, math.nan, -1
+    series = values.reshape(-1)
+    finite_indices = np.flatnonzero(np.isfinite(series))
+    if finite_indices.size == 0:
+        return math.nan, math.nan, -1
+    peak_index = int(finite_indices[int(np.argmax(series[finite_indices]))])
+    peak_time_s = math.nan
+    for time_key in ("thermal_time_s", "time_s"):
+        times = get_data_array(data, time_key, dtype=np.float64)
+        if times is None:
+            continue
+        time_values = times.reshape(-1)
+        if time_values.size == series.size and np.isfinite(time_values[peak_index]):
+            peak_time_s = float(time_values[peak_index])
+            break
+    return float(series[peak_index]), peak_time_s, peak_index
+
+
 def metric_or_peak(data: np.lib.npyio.NpzFile, scalar_key: str, series_key: str, default: float = 0.0) -> float:
     value = scalar(data, scalar_key, math.nan)
     if np.isfinite(value):
@@ -274,8 +299,8 @@ def collect_metrics(npz_path: Path, limits: dict[str, float]) -> tuple[dict[str,
         mean_shannon_series = mean_metric_series(data, "shannon", max_points=MAX_SERIES_POINTS)
         mean_shannon = finite_nanmean(mean_shannon_series[1]) if mean_shannon_series is not None else math.nan
         charge_rate_per_electrode, charge_rate_total = mean_charge_rate_values(data)
-        max_mean_dT = max_value(data, "mean_dT", math.nan)
-        max_max_dT = max_value(data, "max_dT", math.nan)
+        max_mean_dT, max_mean_dT_time_s, _ = peak_value_and_time(data, "mean_dT")
+        max_max_dT, max_focal_dT_time_s, _ = peak_value_and_time(data, "max_dT")
         cem43 = max_value(data, "max_cem43", 0.0)
 
     ratios = {
@@ -301,7 +326,9 @@ def collect_metrics(npz_path: Path, limits: dict[str, float]) -> tuple[dict[str,
         "max_window_charge_total_nC": window_charge_total,
         "max_dT_C": max_dT,
         "max_mean_dT_C": max_mean_dT,
+        "max_mean_dT_time_s": max_mean_dT_time_s,
         "max_max_dT_C": max_max_dT,
+        "max_focal_dT_time_s": max_focal_dT_time_s,
         "max_cem43_min": cem43,
         "mean_shannon_k": mean_shannon,
         "mean_charge_per_second_per_electrode_uC_s": charge_rate_per_electrode,
@@ -858,40 +885,79 @@ def charge_rate_from_amplitude(
     )
 
 
+METRIC_DIRECT_KEYS = {
+    "amplitude": ("amplitude_per_electrode_uA", "current_amplitude_per_electrode_uA"),
+    "charge_phase": ("charge_per_phase_per_electrode_nC", "charge_per_phase_nC"),
+    "charge_density": ("charge_density_per_electrode_uc_cm2",),
+    "shannon": ("shannon_k_per_electrode",),
+    "charge_rate": ("charge_per_second_per_electrode_nC_s",),
+}
+
+
+def full_metric_rows(
+    data: np.lib.npyio.NpzFile | Mapping[str, Any],
+    metric: str,
+) -> np.ndarray | None:
+    direct = first_matrix(data, METRIC_DIRECT_KEYS.get(metric, ()))
+    if direct is not None:
+        return direct
+
+    amplitude = amplitude_matrix(data)
+    if amplitude is None or metric == "amplitude":
+        return amplitude
+    charge_phase = charge_phase_from_amplitude(data, amplitude)
+    if metric == "charge_phase":
+        return charge_phase
+    if metric == "charge_density":
+        return charge_density_from_phase(data, charge_phase)
+    if metric == "shannon":
+        return shannon_from_phase(data, charge_phase)
+    if metric == "charge_rate":
+        return charge_rate_from_amplitude(data, amplitude)
+    return None
+
+
+def active_electrode_mean_series(
+    data: np.lib.npyio.NpzFile | Mapping[str, Any],
+    metric: str,
+    *,
+    max_points: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    rows = full_metric_rows(data, metric)
+    if rows is None:
+        return None
+
+    values = np.asarray(rows, dtype=np.float64)
+    amplitude = amplitude_matrix(data)
+    if amplitude is not None and amplitude.shape == values.shape:
+        active = np.isfinite(amplitude) & (amplitude > 0.0)
+    elif metric == "shannon":
+        active = np.isfinite(values)
+    else:
+        active = np.isfinite(values) & (values > 0.0)
+    valid = np.isfinite(values) & active
+    count = np.sum(valid, axis=1)
+    mean = np.divide(
+        np.sum(np.where(valid, values, 0.0), axis=1),
+        count,
+        out=np.full(values.shape[0], np.nan, dtype=np.float64),
+        where=count > 0,
+    )
+    x = time_axis_for_length(data, values.shape[0], prefer_electrode=True)
+    return downsample_xy(x, mean, max_points=max_points)
+
+
 def metric_rows(
     data: np.lib.npyio.NpzFile | Mapping[str, Any],
     metric: str,
     *,
     max_points: int = MAX_CLOUD_POINTS,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    direct_keys = {
-        "amplitude": ("amplitude_per_electrode_uA", "current_amplitude_per_electrode_uA"),
-        "charge_phase": ("charge_per_phase_per_electrode_nC", "charge_per_phase_nC"),
-        "charge_density": ("charge_density_per_electrode_uc_cm2",),
-        "shannon": ("shannon_k_per_electrode",),
-        "charge_rate": ("charge_per_second_per_electrode_nC_s",),
-    }
-    direct = first_matrix(data, direct_keys.get(metric, ()))
-    if direct is not None:
-        x_full = time_axis_for_length(data, direct.shape[0], prefer_electrode=True)
+    rows = full_metric_rows(data, metric)
+    if rows is not None:
+        x_full = time_axis_for_length(data, rows.shape[0], prefer_electrode=True)
         reducer = "sample" if metric == "amplitude" else "mean"
-        return downsample_time_rows(x_full, direct, max_points=max_points, reducer=reducer)
-
-    amp = amplitude_matrix(data)
-    if amp is None or metric == "amplitude":
-        return None
-
-    x_full = time_axis_for_length(data, amp.shape[0], prefer_electrode=True)
-    x, amp_rows = downsample_time_rows(x_full, amp, max_points=max_points)
-    charge_phase = charge_phase_from_amplitude(data, amp_rows)
-    if metric == "charge_phase":
-        return x, charge_phase
-    if metric == "charge_density":
-        return x, charge_density_from_phase(data, charge_phase)
-    if metric == "shannon":
-        return x, shannon_from_phase(data, charge_phase)
-    if metric == "charge_rate":
-        return x, charge_rate_from_amplitude(data, amp_rows)
+        return downsample_time_rows(x_full, rows, max_points=max_points, reducer=reducer)
     return None
 
 
@@ -983,6 +1049,15 @@ def mean_metric_series(
     *,
     max_points: int = MAX_SERIES_POINTS,
 ) -> tuple[np.ndarray, np.ndarray] | None:
+    if metric in METRIC_DIRECT_KEYS:
+        active_mean = active_electrode_mean_series(
+            data,
+            metric,
+            max_points=max_points,
+        )
+        if active_mean is not None:
+            return active_mean
+
     mean_keys = {
         "charge_phase": ("charge_per_phase_mean_nC",),
         "charge_density": ("charge_density_mean_uc_cm2",),
@@ -1363,7 +1438,7 @@ def plot_protocol_activated_electrodes(
             style_axes(ax)
         else:
             add_no_data(ax, "No electrode counts")
-        ax.set_title("Activated Electrodes Over Time", pad=42)
+        ax.set_title("Activated Electrodes Over Time")
         ax.set_xlabel(TIME_AXIS_LABEL)
         ax.set_ylabel("Electrodes")
         save_figure(fig, out_path, overwrite=overwrite)
@@ -1550,7 +1625,7 @@ def plot_electrode_charge_heatmap(
         ax.set_title(title)
         return None
 
-    marker_size = float(np.clip(1800.0 / max(values_mC.size, 1), 6.0, 30.0))
+    marker_size = float(np.clip(6000.0 / max(values_mC.size, 1), 1.5, 18.0))
     image = ax.scatter(
         x[finite],
         y[finite],
@@ -1684,6 +1759,250 @@ def extent_for_grid(
         if values.size >= 4 and np.all(np.isfinite(values[:4])):
             return [float(values[0]), float(values[1]), float(values[2]), float(values[3])]
     return None
+
+
+def peak_heatmap_grid_names(
+    data: np.lib.npyio.NpzFile | Mapping[str, Any],
+) -> list[str]:
+    names: list[str] = []
+    stored_names = get_data_array(data, "peak_heatmap_grid_names")
+    if stored_names is not None:
+        for raw_name in stored_names.reshape(-1):
+            name = (
+                raw_name.decode("utf-8", errors="replace")
+                if isinstance(raw_name, bytes)
+                else str(raw_name)
+            )
+            if name and name not in names:
+                names.append(name)
+    for grid_name, _ in thermal_snapshot_keys(data):
+        if grid_name not in names:
+            names.append(grid_name)
+    if names:
+        return names
+    for key in data_files(data):
+        for prefix in ("dT_peak_focal_", "dT_peak_mean_"):
+            if key.startswith(prefix):
+                name = key.removeprefix(prefix)
+                if name and name not in names:
+                    names.append(name)
+    return names
+
+
+def hemisphere_grid_sort_key(grid_name: str) -> tuple[int, str]:
+    normalized = str(grid_name).strip().casefold()
+    if "left" in normalized:
+        return 0, normalized
+    if "right" in normalized:
+        return 1, normalized
+    return 2, normalized
+
+
+def peak_heatmap_for_grid(
+    data: np.lib.npyio.NpzFile | Mapping[str, Any],
+    grid_name: str,
+    peak_kind: str,
+    peak_time_s: float,
+) -> tuple[np.ndarray | None, float, bool]:
+    suffix = sanitize_path_part(grid_name)
+    exact = get_data_array(data, f"dT_peak_{peak_kind}_{suffix}", dtype=np.float32)
+    if exact is not None and exact.ndim == 2 and exact.size:
+        return (
+            np.asarray(exact, dtype=np.float32),
+            scalar_from_data(data, f"peak_{peak_kind}_time_s", peak_time_s),
+            True,
+        )
+
+    stack = get_data_array(data, f"dT_heatmaps_{suffix}", dtype=np.float32)
+    if stack is None or stack.ndim != 3 or stack.shape[0] == 0:
+        return None, math.nan, False
+    times = get_data_array(data, "heatmap_times_s", dtype=np.float64)
+    snapshot_times = times.reshape(-1) if times is not None else np.asarray([])
+    if (
+        snapshot_times.size == stack.shape[0]
+        and np.isfinite(peak_time_s)
+        and np.any(np.isfinite(snapshot_times))
+    ):
+        finite_indices = np.flatnonzero(np.isfinite(snapshot_times))
+        nearest = int(np.argmin(np.abs(snapshot_times[finite_indices] - peak_time_s)))
+        index = int(finite_indices[nearest])
+        map_time_s = float(snapshot_times[index])
+    else:
+        reducer = finite_nanmax if peak_kind == "focal" else finite_nanmean
+        values = np.asarray(
+            [reducer(heatmap, default=math.nan) for heatmap in stack],
+            dtype=np.float64,
+        )
+        finite_indices = np.flatnonzero(np.isfinite(values))
+        index = (
+            int(finite_indices[int(np.argmax(values[finite_indices]))])
+            if finite_indices.size
+            else 0
+        )
+        map_time_s = (
+            float(snapshot_times[index])
+            if snapshot_times.size > index and np.isfinite(snapshot_times[index])
+            else math.nan
+        )
+    return np.asarray(stack[index], dtype=np.float32), map_time_s, False
+
+
+def format_peak_time(time_s: float) -> str:
+    if not np.isfinite(time_s):
+        return "time unavailable"
+    return f"{time_s / 60.0:.2f} min ({time_s:.1f} s)"
+
+
+def plot_peak_temperature_heatmaps(
+    npz_path: str | Path,
+    output_path: str | Path,
+    *,
+    title: str,
+    overwrite: bool,
+) -> Path | None:
+    source = Path(npz_path)
+    destination = Path(output_path)
+    with np.load(source, allow_pickle=True) as data:
+        grid_names = sorted(
+            peak_heatmap_grid_names(data),
+            key=hemisphere_grid_sort_key,
+        )
+        if not grid_names:
+            return None
+
+        peaks = {}
+        for peak_kind, series_key in (("focal", "max_dT"), ("mean", "mean_dT")):
+            value, time_s, _ = peak_value_and_time(data, series_key)
+            if not np.isfinite(value):
+                value = scalar_from_data(data, f"peak_{peak_kind}_dT_C")
+            if not np.isfinite(time_s):
+                time_s = scalar_from_data(data, f"peak_{peak_kind}_time_s")
+            peaks[peak_kind] = (value, time_s)
+
+        panels: dict[tuple[str, str], tuple[np.ndarray, float, bool]] = {}
+        for grid_name in grid_names:
+            for peak_kind in ("focal", "mean"):
+                heatmap, map_time_s, exact = peak_heatmap_for_grid(
+                    data,
+                    grid_name,
+                    peak_kind,
+                    peaks[peak_kind][1],
+                )
+                if heatmap is not None:
+                    panels[(grid_name, peak_kind)] = (heatmap, map_time_s, exact)
+        if not panels:
+            return None
+
+        extents = {
+            grid_name: extent_for_grid(data, grid_name)
+            for grid_name in grid_names
+        }
+
+    vmax = finite_nanmax(
+        np.concatenate([panel[0].reshape(-1) for panel in panels.values()]),
+        default=1.0,
+    )
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        vmax = 1.0
+
+    fig, axes = plt.subplots(
+        2,
+        len(grid_names),
+        figsize=(max(5.6, 5.2 * len(grid_names)), 8.2),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    image = None
+    for row, peak_kind in enumerate(("focal", "mean")):
+        for col, grid_name in enumerate(grid_names):
+            ax = axes[row, col]
+            panel = panels.get((grid_name, peak_kind))
+            if panel is None:
+                add_no_data(ax, f"No {peak_kind} peak map")
+                continue
+            heatmap, map_time_s, exact = panel
+            extent = extents[grid_name]
+            displayed = downsample_image(heatmap)
+            image = ax.imshow(
+                displayed,
+                origin="lower",
+                extent=extent,
+                cmap=THERMAL_CMAP,
+                vmin=0.0,
+                vmax=vmax,
+                interpolation="nearest",
+                aspect="equal",
+            )
+            value, peak_time_s = peaks[peak_kind]
+            metric_name = "Max focal dT" if peak_kind == "focal" else "Max spatial mean dT"
+            panel_title = (
+                f"{metric_name}: {value:.4g} C\n"
+                f"Peak time: {format_peak_time(peak_time_s)}"
+            )
+            map_matches_peak = (
+                exact
+                or (
+                    np.isfinite(map_time_s)
+                    and np.isfinite(peak_time_s)
+                    and np.isclose(map_time_s, peak_time_s, rtol=0.0, atol=1e-4)
+                )
+            )
+            if not map_matches_peak:
+                panel_title += f"\nNearest saved map: {format_peak_time(map_time_s)}"
+            if row == 0:
+                panel_title = f"{grid_name}\n{panel_title}"
+            ax.set_title(panel_title, fontsize=9)
+            ax.set_xlabel("x (mm)" if extent is not None else "x pixel")
+            ax.set_ylabel("y (mm)" if extent is not None else "y pixel")
+            if peak_kind == "focal" and displayed.size:
+                finite = np.isfinite(displayed)
+                if np.any(finite):
+                    peak_row, peak_col = np.unravel_index(
+                        int(np.nanargmax(displayed)),
+                        displayed.shape,
+                    )
+                    if extent is None:
+                        marker_x, marker_y = float(peak_col), float(peak_row)
+                    else:
+                        xmin, xmax, ymin, ymax = extent
+                        marker_x = xmin + (peak_col + 0.5) * (xmax - xmin) / displayed.shape[1]
+                        marker_y = ymin + (peak_row + 0.5) * (ymax - ymin) / displayed.shape[0]
+                    ax.plot(marker_x, marker_y, marker="x", color="cyan", markersize=7, mew=1.5)
+            ax.tick_params(labelsize=8)
+
+    if image is not None:
+        cbar = fig.colorbar(image, ax=axes.reshape(-1).tolist(), fraction=0.025, pad=0.02)
+        cbar.set_label("dT (C)")
+    fig.suptitle(
+        textwrap.fill(title, width=88),
+        fontsize=11.5,
+        fontweight="bold",
+    )
+    save_figure(fig, destination, overwrite=overwrite)
+    return destination
+
+
+def write_peak_temperature_heatmaps(
+    records: Iterable[Any],
+    output_root: str | Path,
+    *,
+    image_format: str,
+    overwrite: bool,
+) -> list[Path]:
+    out_dir = Path(output_root) / "peak_temperature_heatmaps"
+    paths: list[Path] = []
+    for record in records:
+        run_id = str(record.run_id)
+        path = out_dir / f"{sanitize_path_part(run_id)}.{image_format}"
+        written = plot_peak_temperature_heatmaps(
+            record.npz_path,
+            path,
+            title=f"Peak Temperature Maps - {run_id}",
+            overwrite=overwrite,
+        )
+        if written is not None:
+            paths.append(written)
+    return paths
 
 
 def thermal_snapshot_positions(length: int) -> list[tuple[str, int]]:
@@ -2304,7 +2623,7 @@ def max_of_series_key(data: np.lib.npyio.NpzFile | Mapping[str, Any], key: str) 
 def mean_charge_rate_values(
     data: np.lib.npyio.NpzFile | Mapping[str, Any],
 ) -> tuple[float, float]:
-    per_e_series = series_from_key(data, "charge_per_second_mean_per_electrode_nC_s")
+    per_e_series = mean_metric_series(data, "charge_rate", max_points=MAX_SERIES_POINTS)
     total_series = series_from_key(data, "charge_per_second_total_nC_s")
     per_e = finite_nanmean(per_e_series[1]) if per_e_series is not None else math.nan
     total_nC_s = finite_nanmean(total_series[1]) if total_series is not None else math.nan
@@ -3461,11 +3780,13 @@ def plot_matrix_summary_grid(
             ax.set_title(f"Fixed {factor_display_name(fixed_factor)}\n{fixed_value.label}", fontsize=12)
 
     fig.suptitle(
-        f"{title_with_charge_limit(title, metric_name, unit)} - {pair_name.replace('_', ' ')}",
+        f"{title_with_charge_limit(title, metric_name, unit)}\n"
+        f"{pair_name.replace('_', ' ')}",
         fontsize=13,
         fontweight="bold",
     )
-    fig.subplots_adjust(left=0.06, right=0.90, bottom=0.22, top=0.80, wspace=0.55)
+    top = 0.72 if is_thermal_metric(metric_name) else 0.76
+    fig.subplots_adjust(left=0.06, right=0.90, bottom=0.22, top=top, wspace=0.55)
     if image is not None:
         cbar = fig.colorbar(image, ax=axes.reshape(-1).tolist(), fraction=0.025, pad=0.05)
         cbar.set_label(unit)
@@ -3536,23 +3857,17 @@ def plot_matrix_active_electrode_errorbars(
                 x[valid],
                 means_array[valid],
                 width=0.68,
-                yerr=np.vstack(
-                    [
-                        np.zeros(np.count_nonzero(valid), dtype=np.float64),
-                        np.nan_to_num(upper_errors_array[valid], nan=0.0),
-                    ]
-                ),
                 color=np.asarray(bar_colors, dtype=object)[valid].tolist(),
                 edgecolor="#111827",
                 linewidth=0.8,
-                error_kw={
-                    "ecolor": "#111827",
-                    "elinewidth": 1.4,
-                    "capsize": 5.0,
-                    "capthick": 1.2,
-                },
                 zorder=3,
             )
+            error_valid = valid & np.isfinite(upper_errors_array)
+            error_x = x[error_valid]
+            error_bottom = means_array[error_valid]
+            error_top = error_bottom + upper_errors_array[error_valid]
+            ax.vlines(error_x, error_bottom, error_top, color="#111827", linewidth=1.4, zorder=4)
+            ax.hlines(error_top, error_x - 0.08, error_x + 0.08, color="#111827", linewidth=1.2, zorder=4)
             style_axes(ax)
         else:
             add_no_data(ax, "No active electrode data")
@@ -3560,21 +3875,19 @@ def plot_matrix_active_electrode_errorbars(
         ax.set_xticklabels([value.label for value in preprocessing_values], rotation=20, ha="right")
         ax.set_ylabel("Number of Electrodes")
         ax.set_xlabel("Preprocessing")
-        ax.set_title(f"{amplitude_value.label}: bar = mean, upper error = max")
         fig.suptitle(f"Activated Electrodes - {grid_value.label}", fontsize=13, fontweight="bold")
-        fig.subplots_adjust(bottom=0.20, left=0.12, right=0.97, top=0.82)
+        fig.subplots_adjust(bottom=0.20, left=0.12, right=0.97, top=0.88)
         save_figure(fig, path, overwrite=overwrite)
 
 
-def plot_matrix_shannon_amplitude_lines(
+def plot_matrix_shannon_errorbars(
     records_by_key: Mapping[tuple[str, str, str], MatrixRecord],
     factors_by_run_id: Mapping[str, MatrixFactors],
-    values_by_run_id: Mapping[str, float],
+    mean_values_by_run_id: Mapping[str, float],
+    max_values_by_run_id: Mapping[str, float],
     output_root: Path,
     image_format: str,
     *,
-    stat_name: str,
-    title: str,
     overwrite: bool,
 ) -> None:
     amplitude_values = sorted_factor_values(factors_by_run_id, "amplitude")
@@ -3583,10 +3896,15 @@ def plot_matrix_shannon_amplitude_lines(
     if not amplitude_values or not grid_values or not preprocessing_values:
         return
 
-    path = output_root / "shannon_k" / f"{sanitize_path_part(stat_name)}_by_amplitude.{image_format}"
+    path = output_root / "shannon_k" / f"shannon_k_by_amplitude.{image_format}"
     if path.exists() and not overwrite:
         print(f"Skipping existing: {path}")
         return
+    if overwrite:
+        for stale_name in ("mean_shannon_k_by_amplitude", "max_shannon_k_by_amplitude"):
+            stale_path = output_root / "shannon_k" / f"{stale_name}.{image_format}"
+            if stale_path.exists():
+                stale_path.unlink()
 
     x = np.asarray([value.sort_value for value in amplitude_values], dtype=np.float64)
     fig, axes = plt.subplots(1, len(grid_values), figsize=(4.9 * len(grid_values), 4.4), squeeze=False, sharey=True)
@@ -3594,7 +3912,8 @@ def plot_matrix_shannon_amplitude_lines(
     for ax, grid_value in zip(axes.reshape(-1), grid_values):
         plotted = False
         for index, preprocessing_value in enumerate(preprocessing_values):
-            y = []
+            means = []
+            upper_errors = []
             for amplitude_value in amplitude_values:
                 record = matrix_record_for_values(
                     records_by_key,
@@ -3604,11 +3923,28 @@ def plot_matrix_shannon_amplitude_lines(
                         "preprocessing": preprocessing_value,
                     },
                 )
-                y.append(values_by_run_id.get(record.run_id, math.nan) if record is not None else math.nan)
-            if np.any(np.isfinite(y)):
+                mean_value = (
+                    mean_values_by_run_id.get(record.run_id, math.nan)
+                    if record is not None
+                    else math.nan
+                )
+                max_value = (
+                    max_values_by_run_id.get(record.run_id, math.nan)
+                    if record is not None
+                    else math.nan
+                )
+                means.append(mean_value)
+                upper_errors.append(
+                    max(0.0, max_value - mean_value)
+                    if np.isfinite(mean_value) and np.isfinite(max_value)
+                    else math.nan
+                )
+            means_array = np.asarray(means, dtype=np.float64)
+            upper_array = np.asarray(upper_errors, dtype=np.float64)
+            if np.any(np.isfinite(means_array)):
                 line = ax.plot(
                     x,
-                    y,
+                    means_array,
                     marker=MATRIX_MARKERS[index % len(MATRIX_MARKERS)],
                     linestyle=MATRIX_LINESTYLES[index % len(MATRIX_LINESTYLES)],
                     linewidth=1.8,
@@ -3618,6 +3954,25 @@ def plot_matrix_shannon_amplitude_lines(
                     color=LINE_COLORS[index % len(LINE_COLORS)],
                     label=preprocessing_value.label,
                 )[0]
+                error_valid = np.isfinite(means_array) & np.isfinite(upper_array)
+                error_x = x[error_valid]
+                error_bottom = means_array[error_valid]
+                error_top = error_bottom + upper_array[error_valid]
+                cap_half_width = max(float(np.ptp(x)) * 0.015, 0.5)
+                ax.vlines(
+                    error_x,
+                    error_bottom,
+                    error_top,
+                    color=LINE_COLORS[index % len(LINE_COLORS)],
+                    linewidth=1.2,
+                )
+                ax.hlines(
+                    error_top,
+                    error_x - cap_half_width,
+                    error_x + cap_half_width,
+                    color=LINE_COLORS[index % len(LINE_COLORS)],
+                    linewidth=1.2,
+                )
                 legend_handles.setdefault(preprocessing_value.label, line)
                 plotted = True
         if plotted:
@@ -3633,13 +3988,13 @@ def plot_matrix_shannon_amplitude_lines(
         fig.legend(
             list(legend_handles.values()),
             list(legend_handles.keys()),
-            loc="upper center",
+            loc="lower center",
             ncol=len(legend_handles),
             frameon=False,
-            bbox_to_anchor=(0.5, 0.93),
+            bbox_to_anchor=(0.5, 0.01),
         )
-    fig.suptitle(title, fontsize=13, fontweight="bold")
-    fig.tight_layout(rect=[0, 0.01, 1, 0.84])
+    fig.suptitle("Shannon K by Amplitude (mean with upper error to maximum)", fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.14, 1, 0.91])
     save_figure(fig, path, overwrite=overwrite)
 
 
@@ -3755,24 +4110,13 @@ def plot_matrix_pairwise_comparisons(
     )
     shannon_mean = matrix_summary_values(selected_by_run.values(), summary_shannon_mean)
     shannon_max = matrix_summary_values(selected_by_run.values(), summary_shannon_max)
-    plot_matrix_shannon_amplitude_lines(
+    plot_matrix_shannon_errorbars(
         records_by_key,
         factors_by_run_id,
         shannon_mean,
-        output_root,
-        image_format,
-        stat_name="mean_shannon_k",
-        title="Mean Shannon K by Amplitude",
-        overwrite=overwrite,
-    )
-    plot_matrix_shannon_amplitude_lines(
-        records_by_key,
-        factors_by_run_id,
         shannon_max,
         output_root,
         image_format,
-        stat_name="max_shannon_k",
-        title="Max Shannon K by Amplitude",
         overwrite=overwrite,
     )
 
@@ -4261,6 +4605,12 @@ def plot_comparative_suites(
             continue
         plot_block_comparative_suite(records, block, comparison_root, image_format, overwrite=overwrite)
     plot_amplitude_grid_double_comparisons(records, comparison_root, image_format, overwrite=overwrite)
+    write_peak_temperature_heatmaps(
+        records,
+        comparison_root,
+        image_format=image_format,
+        overwrite=overwrite,
+    )
 
 
 def plot_overall_safety(records: list[MatrixRecord], output_root: Path, image_format: str, *, overwrite: bool) -> None:

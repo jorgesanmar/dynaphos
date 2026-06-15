@@ -86,12 +86,9 @@ safety:
   electrode_surface_area_cm2: 3.5e-5
   charge_window_s: 5.0
 
-# Impedance settings for power calculation
+# Uniform tissue resistance used for every electrode in power calculations
 impedance:
   Rtis: 9900.0
-  Cdl: 113.4e-9
-  Rct: 2.2e6
-  sigma_w: 2.5e6
 
 # Raster
 raster:
@@ -108,7 +105,7 @@ bioheat:
   brain_depth_mm: 15.0
   skull_thickness_mm: 5.0
   scalp_thickness_mm: 3.0
-  voxel_size_mm: 0.5
+  voxel_size_mm: 0.08
   # Separate source depths keep electrode Joule heat local while letting IC heat
   # represent package-scale 3D heat spreading in this 2D approximation.
   electrode_source_thickness_mm: 0.08

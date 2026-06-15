@@ -86,12 +86,9 @@ safety:
   electrode_surface_area_cm2: 3.5e-5
   charge_window_s: 5.0
 
-# Impedance settings for power calculation
+# Uniform tissue resistance used for every electrode in power calculations
 impedance:
   Rtis: 9900.0
-  Cdl: 113.4e-9
-  Rct: 2.2e6
-  sigma_w: 2.5e6
 
 # Raster
 raster:

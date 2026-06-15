@@ -439,9 +439,9 @@ def manifest_text(manifest: dict[str, Any], data: dict[str, np.ndarray], npz_pat
 
     title = f"{block} / {run_id}"
     subtitle = (
-        f"{source} | {grid} | amp {format_number(amp, ' uA')} | "
-        f"threshold {format_number(threshold, ' uA')} | "
-        f"{format_number(freq, ' Hz')} / {format_number(pulse_width, ' us')} | "
+        f"{source} | {grid} | amp {format_number(amp, ' µA')} | "
+        f"threshold {format_number(threshold, ' µA')} | "
+        f"{format_number(freq, ' Hz')} / {format_number(pulse_width, ' µs')} | "
         f"raster {raster} | IC {format_number(ic_power, ' mW')}"
     )
     return title, subtitle
@@ -468,7 +468,7 @@ def plot_current_panel(
     )
     ax.set_title("Delivered Current", fontsize=11)
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Current (uA)")
+    ax.set_ylabel("Current (µA)")
     style_axes(ax)
     return max_current, mean_active, active_count_from_current
 
@@ -525,7 +525,7 @@ def plot_charge_panel(ax: plt.Axes, data: dict[str, np.ndarray]) -> None:
     ax.set_title("Total Charge Rate", fontsize=11)
     if plotted:
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("Total charge rate (uC/s)")
+        ax.set_ylabel("Total charge rate (µC/s)")
         ax.legend(
             fontsize=8,
             frameon=False,
@@ -576,7 +576,7 @@ def plot_hotspot_area_panel(ax: plt.Axes, data: dict[str, np.ndarray]) -> None:
     ax.set_title("Hotspot Area", fontsize=11)
     if plotted:
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("Area (mm2)")
+        ax.set_ylabel("Area (mm²)")
         ax.legend(fontsize=8, frameon=False, loc="best")
         style_axes(ax)
     else:
@@ -649,11 +649,11 @@ def summary_text(
     peak_active = safe_nanmax(active_count) if active_count is not None else safe_nanmax(series_1d(data, "active_count"))
 
     return (
-        f"peak current {format_number(peak_current, ' uA')} | "
+        f"peak current {format_number(peak_current, ' µA')} | "
         f"peak phase charge {format_number(peak_phase_charge, ' nC')} | "
         f"peak Shannon k {format_number(peak_shannon)} | "
         f"peak max ΔT {format_number(peak_dt, ' °C')} | "
-        f"peak area >1 °C {format_number(peak_area, ' mm2')} | "
+        f"peak area >1 °C {format_number(peak_area, ' mm²')} | "
         f"peak active electrodes {format_number(peak_active, precision=0)}"
     )
 

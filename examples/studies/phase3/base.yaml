@@ -27,4 +27,5 @@ metadata:
 output:
   root: ../../../results/safety/simulation_pipeline/raster_protocols
   run_id: phase3
-  write_figures: false
+  write_figures: true
+  overwrite: true

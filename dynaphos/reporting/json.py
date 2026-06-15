@@ -8,5 +8,8 @@ from typing import Any
 def write_json(path: str | Path, payload: dict[str, Any]) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(payload, indent=2, sort_keys=False, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     return output
